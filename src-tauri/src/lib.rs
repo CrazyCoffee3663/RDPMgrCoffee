@@ -5,6 +5,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Manager, State};
 
 #[cfg(windows)]
@@ -17,6 +18,7 @@ const CREATE_NO_WINDOW: u32 = 0x08000000;
 static BW_EXE: OnceLock<PathBuf> = OnceLock::new();
 static BW_DATA: OnceLock<PathBuf> = OnceLock::new();
 static FREERDP_EXE: OnceLock<PathBuf> = OnceLock::new();
+static PUTTY_EXE: OnceLock<PathBuf> = OnceLock::new();
 
 fn bw_exe() -> PathBuf {
     BW_EXE.get().cloned().unwrap_or_else(|| PathBuf::from("bw.exe"))
@@ -27,6 +29,13 @@ fn freerdp_exe() -> PathBuf {
         .get()
         .cloned()
         .unwrap_or_else(|| PathBuf::from("wfreerdp.exe"))
+}
+
+fn putty_exe() -> PathBuf {
+    PUTTY_EXE
+        .get()
+        .cloned()
+        .unwrap_or_else(|| PathBuf::from("putty.exe"))
 }
 
 // Убираем префикс \\?\, с которым некоторые программы работают плохо
@@ -45,6 +54,18 @@ fn locate(app: &AppHandle, rel: &str) -> PathBuf {
         }
     }
     clean(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources").join(rel))
+}
+
+// Удаляем забытые файлы с паролями, если программа раньше завершилась аварийно
+fn cleanup_stale_pwfiles() {
+    if let Ok(rd) = std::fs::read_dir(std::env::temp_dir()) {
+        for e in rd.flatten() {
+            let n = e.file_name().to_string_lossy().to_string();
+            if n.starts_with("connmgr-") && n.ends_with(".pw") {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    }
 }
 
 #[derive(Default)]
@@ -144,6 +165,16 @@ fn hostport(uri: &str) -> String {
     rest.split('/').next().unwrap_or("").trim().to_string()
 }
 
+// "host:22" -> ("host", Some("22"))
+fn split_port(hp: &str) -> (String, Option<String>) {
+    if let Some((h, p)) = hp.rsplit_once(':') {
+        if !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()) {
+            return (h.to_string(), Some(p.to_string()));
+        }
+    }
+    (hp.to_string(), None)
+}
+
 // "домен\логин" -> (домен, логин); иначе домен берётся из запасного поля
 fn split_user(raw: &str, fallback_domain: &str) -> (String, String) {
     match raw.trim().split_once('\\') {
@@ -215,27 +246,11 @@ fn find_gateway(session: &str, gw_name: &str) -> Result<Value, String> {
     }
 }
 
-fn launch(session: &str, id: &str) -> Result<(), String> {
-    let env = [("BW_SESSION", session)];
-    let raw = run_bw(&["get", "item", id], &env)?;
-    let item: Value =
-        serde_json::from_str(&raw).map_err(|e| format!("Ошибка разбора записи: {}", e))?;
-
+fn launch_rdp(session: &str, item: &Value) -> Result<(), String> {
     let name = text(&item["name"]);
     let uri = text(&item["login"]["uris"][0]["uri"]);
-    let scheme = uri
-        .split_once("://")
-        .map(|(s, _)| s.to_lowercase())
-        .ok_or("У записи нет адреса вида rdp://хост")?;
-    if scheme != "rdp" {
-        return Err(format!(
-            "Протокол {} пока не поддерживается, сейчас доступен только rdp",
-            scheme
-        ));
-    }
-
     let host = hostport(&uri);
-    let (domain, user) = split_user(&text(&item["login"]["username"]), &field(&item, "domain"));
+    let (domain, user) = split_user(&text(&item["login"]["username"]), &field(item, "domain"));
     let password = text(&item["login"]["password"]);
 
     let mut args: Vec<String> = vec![
@@ -256,7 +271,7 @@ fn launch(session: &str, id: &str) -> Result<(), String> {
         args.push(format!("/p:{}", password));
     }
 
-    let gw_name = field(&item, "gateway");
+    let gw_name = field(item, "gateway");
     if !gw_name.is_empty() {
         let gw = find_gateway(session, &gw_name)?;
         let gw_host = hostport(&text(&gw["login"]["uris"][0]["uri"]));
@@ -323,6 +338,122 @@ fn launch(session: &str, id: &str) -> Result<(), String> {
         let _ = child.wait();
     });
     Ok(())
+}
+
+fn launch_putty(item: &Value, scheme: &str) -> Result<(), String> {
+    let uri = text(&item["login"]["uris"][0]["uri"]);
+    let hp = hostport(&uri);
+    if hp.is_empty() {
+        return Err("В адресе записи не указан хост".to_string());
+    }
+    let user = text(&item["login"]["username"]);
+    let password = text(&item["login"]["password"]);
+
+    let mut args: Vec<String> = Vec::new();
+    let mut pw_file: Option<PathBuf> = None;
+
+    match scheme {
+        "ssh" => {
+            let (host, port) = split_port(&hp);
+            args.push("-ssh".to_string());
+            if !user.is_empty() {
+                args.push("-l".to_string());
+                args.push(user);
+            }
+            if let Some(p) = port {
+                args.push("-P".to_string());
+                args.push(p);
+            }
+            if !password.is_empty() {
+                // Пароль передаём через временный файл, чтобы он не попал в командную строку
+                let nanos = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0);
+                let path = std::env::temp_dir()
+                    .join(format!("connmgr-{}-{}.pw", std::process::id(), nanos));
+                std::fs::write(&path, password.as_bytes())
+                    .map_err(|e| format!("Не удалось создать временный файл: {}", e))?;
+                args.push("-pwfile".to_string());
+                args.push(path.to_string_lossy().to_string());
+                pw_file = Some(path);
+            }
+            args.push(host);
+        }
+        "telnet" => {
+            let (host, port) = split_port(&hp);
+            args.push("-telnet".to_string());
+            if let Some(p) = port {
+                args.push("-P".to_string());
+                args.push(p);
+            }
+            args.push(host);
+        }
+        "serial" => {
+            let sercfg = {
+                let c = field(item, "sercfg");
+                if !c.is_empty() {
+                    c
+                } else {
+                    let baud = field(item, "baud");
+                    format!("{},8,n,1,N", if baud.is_empty() { "9600".to_string() } else { baud })
+                }
+            };
+            args.push("-serial".to_string());
+            args.push(hp.clone());
+            args.push("-sercfg".to_string());
+            args.push(sercfg);
+        }
+        other => return Err(format!("Протокол {} не поддерживается", other)),
+    }
+
+    let exe = putty_exe();
+    let mut cmd = Command::new(&exe);
+    cmd.args(&args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            if let Some(p) = &pw_file {
+                let _ = std::fs::remove_file(p);
+            }
+            return Err(format!("Не удалось запустить PuTTY ({}): {}", exe.display(), e));
+        }
+    };
+
+    // PuTTY читает файл с паролем сразу при запуске, через несколько секунд он уже не нужен
+    if let Some(p) = pw_file {
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(15));
+            let _ = std::fs::remove_file(p);
+        });
+    }
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
+}
+
+fn launch(session: &str, id: &str) -> Result<(), String> {
+    let env = [("BW_SESSION", session)];
+    let raw = run_bw(&["get", "item", id], &env)?;
+    let item: Value =
+        serde_json::from_str(&raw).map_err(|e| format!("Ошибка разбора записи: {}", e))?;
+
+    let uri = text(&item["login"]["uris"][0]["uri"]);
+    let scheme = uri
+        .split_once("://")
+        .map(|(s, _)| s.to_lowercase())
+        .ok_or("У записи нет адреса вида протокол://хост")?;
+
+    match scheme.as_str() {
+        "rdp" => launch_rdp(session, &item),
+        "ssh" | "telnet" | "serial" => launch_putty(&item, &scheme),
+        other => Err(format!("Протокол {} пока не поддерживается", other)),
+    }
 }
 
 #[tauri::command]
@@ -442,11 +573,13 @@ pub fn run() {
             let handle = app.handle();
             let _ = BW_EXE.set(locate(handle, r"bw\bw.exe"));
             let _ = FREERDP_EXE.set(locate(handle, r"freerdp\wfreerdp.exe"));
+            let _ = PUTTY_EXE.set(locate(handle, r"putty\putty.exe"));
             if let Ok(dir) = handle.path().app_data_dir() {
                 let dir = clean(dir.join("bw-data"));
                 let _ = std::fs::create_dir_all(&dir);
                 let _ = BW_DATA.set(dir);
             }
+            cleanup_stale_pwfiles();
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

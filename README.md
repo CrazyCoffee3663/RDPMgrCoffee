@@ -20,6 +20,7 @@ This template should help get you started developing with Tauri, SvelteKit and T
 - freerdp/ : wfreerdp.exe 3.32.0 и все его DLL из MSYS2 UCRT64
   (pacman -S mingw-w64-ucrt-x86_64-freerdp, затем скопировать wfreerdp.exe и
   библиотеки, найденные командой ldd, см. историю проекта)
+- putty/putty.exe : PuTTY (64-bit x86), отдельный exe с официального сайта
 
 Резервная копия готового комплекта FreeRDP: C:\dev\freerdp-bundle
 

@@ -10,3 +10,4 @@ vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
 src-tauri/resources/bw/
 src-tauri/resources/freerdp/
+src-tauri/resources/putty/

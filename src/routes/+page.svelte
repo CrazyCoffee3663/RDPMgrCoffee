@@ -14,7 +14,7 @@
   type VaultData = { folders: Folder[]; items: Conn[] };
   type VaultStatus = { status: string; serverUrl: string; email: string };
 
-  const CONN_PROTOCOLS = ["rdp", "ssh", "vnc"];
+  const CONN_PROTOCOLS = ["rdp", "ssh", "telnet", "serial"];
 
   let phase: "checking" | "setup" | "locked" | "open" = "checking";
   let busy = false;

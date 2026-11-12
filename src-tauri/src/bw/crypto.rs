@@ -84,12 +84,10 @@ impl SymKey {
                     .map_err(|_| "Неверный ключ или повреждённые данные (MAC)".to_string())?;
                 aes_decrypt(&self.enc, &iv, &ct)
             }
-            "0" => {
-                if parts.len() != 2 {
-                    return Err("Повреждённые данные хранилища (EncString)".into());
-                }
-                aes_decrypt(&self.enc, &b64(parts[0])?, &b64(parts[1])?)
-            }
+            // Тип 0 — без кода целостности: подменённые данные расшифровались бы без ошибки
+            // (атака на файл кеша/хранилища). Допустим только для ключа очень старых аккаунтов,
+            // см. decrypt_user_key.
+            "0" => Err("Данные без защиты целостности (тип 0) не принимаются".into()),
             other => Err(format!("Неподдерживаемый тип шифрования: {}", other)),
         }
     }
@@ -187,12 +185,32 @@ pub fn protect_user_key(master_key: &[u8; 32], user_key: &SymKey) -> String {
     out
 }
 
+/// HMAC-SHA256 (ключ MAC ключа пользователя) — контрольная сумма файла кеша/хранилища.
+pub fn file_mac(key: &SymKey, data: &[u8]) -> String {
+    let mut m = <HmacSha256 as Mac>::new_from_slice(&key.mac).expect("hmac key");
+    m.update(b"rdpmgrcoffee-cache-v1");
+    m.update(data);
+    B64.encode(m.finalize().into_bytes())
+}
+
+/// Проверка контрольной суммы (сравнение за постоянное время).
+pub fn file_mac_ok(key: &SymKey, data: &[u8], mac: &str) -> bool {
+    let Ok(tag) = B64.decode(mac.trim()) else { return false };
+    let mut m = <HmacSha256 as Mac>::new_from_slice(&key.mac).expect("hmac key");
+    m.update(b"rdpmgrcoffee-cache-v1");
+    m.update(data);
+    m.verify_slice(&tag).is_ok()
+}
+
 /// Расшифровать защищённый ключ пользователя мастер-ключом.
 pub fn decrypt_user_key(master_key: &[u8; 32], protected: &str) -> CResult<SymKey> {
     let bytes = if protected.starts_with("0.") {
         // Очень старые аккаунты: ключ зашифрован самим мастер-ключом без MAC
-        let k = SymKey { enc: *master_key, mac: [0u8; 32] };
-        k.decrypt(protected)?
+        let parts: Vec<&str> = protected[2..].split('|').collect();
+        if parts.len() != 2 {
+            return Err("Повреждённый ключ пользователя".into());
+        }
+        aes_decrypt(master_key, &b64(parts[0])?, &b64(parts[1])?)?
     } else {
         stretch(master_key)
             .decrypt(protected)

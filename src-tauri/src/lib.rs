@@ -7,6 +7,7 @@ mod tools;
 mod transfer;
 mod terminals;
 mod rdp;
+mod rdpcert;
 mod sessions;
 
 use bw::{FolderV, ItemInput, ItemV, LoginResult, Secret, Status, Vault, VaultView};

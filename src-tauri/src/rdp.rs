@@ -326,18 +326,67 @@ fn use_kerberos(p: &ConnParams) -> bool {
     p.opt("auth").eq_ignore_ascii_case("kerberos")
 }
 
-fn build_args(p: &ConnParams, hwnd: isize, w: i32, h: i32) -> Result<Vec<String>, String> {
+/// Ключи FreeRDP, которые нельзя задать через поле «freerdp» записи: они ослабляют защиту
+/// (отключают проверку сертификата или NLA/TLS, подключают диски, пишут учётные данные в лог)
+/// или подменяют то, чем управляет программа. Запись может прийти из общей коллекции.
+const DENY_EXTRA: [&str; 24] = [
+    "cert", "drive", "drives", "home-drive", "redirect-prefer", "proxy", "log-level", "log-filters",
+    "args-from", "p", "password", "u", "d", "v", "gateway", "g", "gp", "gu", "gd", "sec", "tls",
+    "auth-pkg-list", "sspi-module", "pth",
+];
+
+/// Имя ключа FreeRDP: «/cert:ignore» → «cert», «+drives» → «drives», «-sec-nla» → «sec-nla»
+fn extra_key(a: &str) -> String {
+    a.trim_start_matches(['/', '+', '-']).split([':', '=']).next().unwrap_or("").to_ascii_lowercase()
+}
+
+fn check_extra(a: &str) -> Result<(), String> {
+    let k = extra_key(a);
+    let base = k.split('-').next().unwrap_or("");
+    if DENY_EXTRA.contains(&k.as_str()) || ["sec", "tls", "cert", "auth"].contains(&base) || k.starts_with("drive") {
+        return Err(format!(
+            "Параметр FreeRDP «{}» нельзя задать в поле «Дополнительно»: он ослабляет защиту подключения или управляется программой",
+            a
+        ));
+    }
+    Ok(())
+}
+
+/// Параметры уходят в FreeRDP построчно — перевод строки в значении добавил бы чужой ключ.
+fn no_newlines(label: &str, v: &str) -> Result<(), String> {
+    if v.contains(['\r', '\n', '\0']) {
+        return Err(format!("{} содержит перевод строки — такое подключение не запускается", label));
+    }
+    Ok(())
+}
+
+fn build_args(p: &ConnParams, hwnd: isize, w: i32, h: i32, pin: Option<&str>) -> Result<Vec<String>, String> {
+    for (label, v) in [
+        ("Адрес", &p.host),
+        ("Логин", &p.username),
+        ("Домен", &p.domain),
+        ("Пароль", &p.password),
+    ] {
+        no_newlines(label, v)?;
+    }
+    if let Some((a, u, d, pw)) = &p.gateway {
+        for (label, v) in [("Адрес шлюза", a), ("Логин шлюза", u), ("Домен шлюза", d), ("Пароль шлюза", pw)] {
+            no_newlines(label, v)?;
+        }
+    }
     let host = match p.port {
         Some(port) => format!("{}:{}", p.host, port),
         None => p.host.clone(),
     };
+    // Сертификат: отпечаток, подтверждённый пользователем (rdpcert), иначе запоминание при первом входе
     let cert = match p.opt("cert") {
-        "" => "tofu",
-        c => c,
+        "ignore" => "ignore".to_string(),
+        _ => pin.unwrap_or("").to_string(),
     };
+    let cert = if cert.is_empty() { "tofu".to_string() } else { cert };
     let mut a: Vec<String> = vec![
         format!("/v:{}", host),
-        format!("/title:{}", p.name),
+        format!("/title:{}", p.name.chars().map(|c| if c.is_control() { ' ' } else { c }).collect::<String>()),
         format!("/cert:{}", cert),
         format!("/parent-window:{}", hwnd),
         "+auto-reconnect".into(),
@@ -422,6 +471,7 @@ fn build_args(p: &ConnParams, hwnd: isize, w: i32, h: i32) -> Result<Vec<String>
     }
     // Дополнительные параметры FreeRDP для опытных пользователей
     for extra in p.opt("freerdp").split_whitespace() {
+        check_extra(extra)?;
         a.push(extra.to_string());
     }
     Ok(a)
@@ -446,7 +496,85 @@ fn log_errors(path: &PathBuf) -> String {
     joined
 }
 
+/// Проверить сертификаты RD-шлюза и сервера до запуска FreeRDP (с подтверждением пользователя).
+/// Возвращает значение /cert: для FreeRDP (None — оставить «tofu»).
+async fn cert_check(app: &AppHandle, id: u32, p: &ConnParams) -> Result<Option<String>, String> {
+    if p.opt("cert").eq_ignore_ascii_case("ignore") {
+        return Ok(None);
+    }
+    let path = app
+        .state::<crate::sessions::Sessions>()
+        .known_hosts
+        .lock()
+        .unwrap()
+        .with_file_name("known_rdp");
+    // Подтвердить отпечаток: новый — спросить, изменился — предупредить
+    let confirm = |what: String, host_id: String, fp: String| {
+        let path = path.clone();
+        async move {
+            let known = crate::rdpcert::known(&path, &host_id);
+            if known.as_deref() == Some(fp.as_str()) {
+                return Ok(());
+            }
+            let (title, msg, danger) = match &known {
+                Some(old) => (
+                    "СЕРТИФИКАТ ИЗМЕНИЛСЯ",
+                    format!(
+                        "Сертификат {} {} не совпадает с запомненным!
+
+Это бывает при замене сертификата, но может означать перехват соединения — тогда пароль попадёт злоумышленнику.
+
+Был (SHA-256):
+{}
+
+Сейчас:
+{}
+
+Доверять новому сертификату?",
+                        what, host_id, crate::rdpcert::pretty(old), crate::rdpcert::pretty(&fp)
+                    ),
+                    true,
+                ),
+                None => (
+                    "Новый сервер",
+                    format!(
+                        "Подключение к {} {} впервые.
+
+Отпечаток сертификата (SHA-256):
+{}
+
+Сверьте его с администратором сервера, если есть сомнения. Доверять этому серверу?",
+                        what, host_id, crate::rdpcert::pretty(&fp)
+                    ),
+                    false,
+                ),
+            };
+            if crate::sessions::ask(app, id, "confirm", title, &msg, danger).await.is_none() {
+                return Err("Сертификат не принят — подключение отменено".to_string());
+            }
+            crate::rdpcert::remember(&path, &host_id, &fp);
+            Ok::<(), String>(())
+        }
+    };
+    if let Some((addr, ..)) = &p.gateway {
+        // Шлюз проверяем сами; сервер за шлюзом напрямую недоступен — для него FreeRDP запомнит
+        // сертификат при первом входе (tofu)
+        let (h, port) = match addr.rsplit_once(':') {
+            Some((h, pt)) if !h.ends_with(':') && pt.parse::<u16>().is_ok() => (h.to_string(), pt.parse().unwrap()),
+            _ => (addr.clone(), 443u16),
+        };
+        let fp = crate::rdpcert::fetch(&h, port, false).await?;
+        confirm("RD-шлюза".into(), format!("{}:{}", h, port), fp).await?;
+        return Ok(None);
+    }
+    let port = p.port.unwrap_or(3389);
+    let fp = crate::rdpcert::fetch(&p.host, port, true).await?;
+    confirm("RDP-сервера".into(), format!("{}:{}", p.host, port), fp.clone()).await?;
+    Ok(Some(crate::rdpcert::freerdp_pin(&[&fp])))
+}
+
 pub async fn open(app: &AppHandle, id: u32, p: ConnParams, x: i32, y: i32, w: i32, h: i32) -> Result<(), String> {
+    let pin = cert_check(app, id, &p).await?;
     let parent = main_hwnd(app)?;
     let _ = APP.set(app.clone());
     #[cfg(not(windows))]
@@ -462,7 +590,7 @@ pub async fn open(app: &AppHandle, id: u32, p: ConnParams, x: i32, y: i32, w: i3
             win::focus(hwnd);
         })
         .await?;
-        let args = build_args(&p, hwnd, w, h)?;
+        let args = build_args(&p, hwnd, w, h, pin.as_deref())?;
 
         let log_path = std::env::temp_dir().join(format!("connmgr-rdp-{}-{}.log", std::process::id(), id));
         let log = std::fs::File::create(&log_path).map_err(|e| e.to_string())?;
@@ -656,6 +784,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn injection_and_unsafe_extras_rejected() {
+        let base = ConnParams { name: "a\nb".into(), protocol: "rdp".into(), host: "h".into(), ..Default::default() };
+        // имя с переводом строки — просто заголовок окна, без новой строки
+        let a = build_args(&base, 1, 800, 600, None).unwrap();
+        assert!(a.iter().all(|x| !x.contains('\n')));
+        for (field, val) in [("password", "x\n/drives"), ("username", "u\r\n/cert:ignore"), ("host", "h\n/proxy:http://evil")] {
+            let mut p = base.clone();
+            match field {
+                "password" => p.password = val.into(),
+                "username" => p.username = val.into(),
+                _ => p.host = val.into(),
+            }
+            assert!(build_args(&p, 1, 800, 600, None).is_err(), "{} не отклонён", field);
+        }
+        for bad in ["/cert:ignore", "+drives", "/drive:c,C:\\", "/sec:rdp", "-sec-nla", "/log-level:TRACE", "/proxy:http://x", "/tls:seclevel:0", "/p:x"] {
+            let mut p = base.clone();
+            p.opts.insert("freerdp".into(), bad.into());
+            assert!(build_args(&p, 1, 800, 600, None).is_err(), "{} пропущен", bad);
+        }
+        let mut p = base.clone();
+        p.opts.insert("freerdp".into(), "/network:lan +fonts /bpp:32".into());
+        assert!(build_args(&p, 1, 800, 600, None).is_ok());
+        let a = build_args(&base, 1, 800, 600, Some("deny,fingerprint:sha256:AB")).unwrap();
+        assert!(a.contains(&"/cert:deny,fingerprint:sha256:AB".to_string()));
+    }
+
+    #[test]
     fn args() {
         let mut p = ConnParams {
             name: "srv".into(),
@@ -669,7 +824,7 @@ mod tests {
         };
         p.opts.insert("admin".into(), "1".into());
         p.gateway = Some(("gw.corp:443".into(), "g".into(), "".into(), "gp".into()));
-        let a = build_args(&p, 1234, 1000, 700).unwrap();
+        let a = build_args(&p, 1234, 1000, 700, None).unwrap();
         assert!(a.contains(&"/v:10.0.0.5:3390".to_string()));
         assert!(a.contains(&"/parent-window:1234".to_string()));
         assert!(a.contains(&"/admin".to_string()));

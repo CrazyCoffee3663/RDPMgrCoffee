@@ -19,6 +19,7 @@ const items: any[] = [
   conn("Веб-сервер", "f1", "ssh://web01.corp.local", "deploy", [], true),
   conn("База данных", "f1", "ssh://db01.corp.local:2222", "postgres"),
   conn("Видеосервер (VNC)", "f2", "vnc://cam.corp.local", ""),
+  conn("Роутер (веб)", "f4", "https://192.168.88.1/webfig/", "admin", [["protocol", "web"]]),
   conn("Коммутатор ядра", "f4", "telnet://10.0.0.2", "admin"),
   conn("Консоль маршрутизатора", "f4", "serial://COM3", "", [["baud", "115200"]]),
   conn("ООО Ромашка — терминал", "f3", "rdp://ts.romashka.ru", "ivanov"),
@@ -65,6 +66,10 @@ const H: Record<string, Handler> = {
       ? { state, server: "", email: "", local: true }
       : { state, server: "https://vault.example.com", email: "admin@example.com", local: false },
   terminals_default_dir: () => null,
+  web_open: () => {},
+  web_place: () => {},
+  web_close: () => {},
+  web_nav: () => {},
   idle_ms: () => 0,
   import_terminals: ({ password }) => {
     if (!password) throw "TERMINALS_PASSWORD";

@@ -145,6 +145,13 @@ export const api = {
   importEncrypted: (text: string, password: string) => invoke<string>("import_encrypted", { text, password }),
   /** Сколько миллисекунд не было ввода с клавиатуры и мыши во всей системе */
   idleMs: () => invoke<number>("idle_ms"),
+  /** Веб-вкладка: встроенная страница поверх области вкладки (логические пиксели) */
+  webOpen: (label: string, url: string, x: number, y: number, w: number, h: number) =>
+    invoke<void>("web_open", { label, url, x, y, w, h }),
+  webPlace: (label: string, x: number, y: number, w: number, h: number, visible: boolean) =>
+    invoke<void>("web_place", { label, x, y, w, h, visible }),
+  webClose: (label: string) => invoke<void>("web_close", { label }),
+  webNav: (label: string, op: "back" | "forward" | "reload" | "stop") => invoke<void>("web_nav", { label, op }),
   /** Показать файл в проводнике */
   reveal: (path: string) => (inTauri ? revealItemInDir(path) : Promise.resolve()),
   /** Возвращает подсказку, если пароль положен в буфер обмена */
@@ -178,27 +185,32 @@ export function errText(e: unknown): string {
 
 // ---------- Модель подключений поверх записей Bitwarden ----------
 
-export const PROTOCOLS = ["rdp", "ssh", "telnet", "serial", "winbox", "vnc"] as const;
+export const PROTOCOLS = ["rdp", "ssh", "telnet", "serial", "winbox", "vnc", "web"] as const;
 export type Protocol = (typeof PROTOCOLS)[number];
-export const DEFAULT_PORTS: Record<Protocol, number | null> = { rdp: 3389, ssh: 22, telnet: 23, serial: null, winbox: 8291, vnc: 5900 };
-export const PROTOCOL_LABEL: Record<Protocol, string> = { rdp: "RDP", ssh: "SSH", telnet: "Telnet", serial: "COM", winbox: "MikroTik", vnc: "VNC" };
+export const DEFAULT_PORTS: Record<Protocol, number | null> = { rdp: 3389, ssh: 22, telnet: 23, serial: null, winbox: 8291, vnc: 5900, web: null };
+export const PROTOCOL_LABEL: Record<Protocol, string> = { rdp: "RDP", ssh: "SSH", telnet: "Telnet", serial: "COM", winbox: "MikroTik", vnc: "VNC", web: "WEB" };
 /** Протоколы, которые открываются во вкладке (WinBox запускается отдельной программой) */
-export const TAB_PROTOCOLS = PROTOCOLS.filter((p) => p !== "winbox");
+export const TAB_PROTOCOLS = PROTOCOLS.filter((p) => p !== "winbox" && p !== "web");
 
 /** Поля, которыми управляет редактор подключения. Остальные показываются как «дополнительные». */
 export const KNOWN_FIELDS = [
   "credential", "domain", "gateway", "sshkey", "resolution", "admin", "sound", "microphone",
-  "drives", "printers", "clipboard", "smartcard", "auth", "gwtransport", "tunnels", "jump", "mikrotik", "winboxport", "cert", "freerdp", "keepalive", "baud", "sercfg",
+  "drives", "printers", "clipboard", "smartcard", "auth", "gwtransport", "tunnels", "jump", "mikrotik", "winboxport", "protocol", "cert", "freerdp", "keepalive", "baud", "sercfg",
 ];
 
 export type ConnInfo = { protocol: Protocol; host: string; port: number | null; uri: string };
 
 export function parseConn(item: Item): ConnInfo | null {
   if (item.kind !== 1) return null;
+  // Веб-подключение: обычная ссылка http(s) с полем protocol=web (запись остаётся понятной Bitwarden)
+  const isWeb = fieldValue(item, "protocol").toLowerCase() === "web";
   for (const uri of item.uris) {
     const m = /^([a-z]+):\/\/(?:[^@/]*@)?(\[[^\]]+\]|[^:/?#]+)(?::(\d+))?/i.exec(uri.trim());
     if (!m) continue;
     const proto = m[1].toLowerCase();
+    if (isWeb && (proto === "http" || proto === "https")) {
+      return { protocol: "web", host: m[2].replace(/^\[|\]$/g, ""), port: m[3] ? Number(m[3]) : null, uri: uri.trim() };
+    }
     if ((PROTOCOLS as readonly string[]).includes(proto)) {
       return {
         protocol: proto as Protocol,
@@ -212,6 +224,10 @@ export function parseConn(item: Item): ConnInfo | null {
 }
 
 export function buildUri(protocol: Protocol, host: string, port: number | null): string {
+  if (protocol === "web") {
+    const h = host.trim();
+    return /^https?:\/\//i.test(h) ? h : `https://${h}${port ? ":" + port : ""}`;
+  }
   const h = host.includes(":") && protocol !== "serial" ? `[${host}]` : host;
   const p = port && port !== DEFAULT_PORTS[protocol] ? `:${port}` : "";
   return `${protocol}://${h.trim()}${p}`;

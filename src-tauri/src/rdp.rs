@@ -41,7 +41,7 @@ static APP: OnceLock<AppHandle> = OnceLock::new();
 pub struct Rdp {
     sessions: Mutex<HashMap<u32, RdpSession>>,
     /// Хранилище заблокировано: окна сеансов скрыты, буфер обмена закрыт
-    locked: Mutex<bool>,
+    pub locked: Mutex<bool>,
 }
 
 #[cfg(windows)]
@@ -874,6 +874,9 @@ fn sync_clipboard(app: &AppHandle) {
 /// Разблокировка — вернуть как было.
 pub fn set_locked(app: &AppHandle, locked: bool) {
     *app.state::<Rdp>().locked.lock().unwrap() = locked;
+    if locked {
+        crate::web::hide_all(app);
+    }
     let all: Vec<(isize, bool, (i32, i32, i32, i32, bool))> = app
         .state::<Rdp>()
         .sessions

@@ -28,6 +28,7 @@
   --p-serial: #a855f7;
   --p-winbox: #e11d48;
   --p-vnc: #06b6d4;
+  --p-web: #8b5cf6;
   --term-bg: #ffffff;
   color-scheme: light;
 }
@@ -251,6 +252,9 @@ button:disabled {
 }
 .proto-vnc {
   --pc: var(--p-vnc);
+}
+.proto-web {
+  --pc: var(--p-web);
 }
 
 kbd {

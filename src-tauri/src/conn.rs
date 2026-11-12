@@ -91,7 +91,7 @@ pub fn split_user(raw: &str) -> (String, String) {
     (String::new(), raw.to_string())
 }
 
-pub const PROTOCOLS: [&str; 6] = ["rdp", "ssh", "telnet", "serial", "winbox", "vnc"];
+pub const PROTOCOLS: [&str; 8] = ["rdp", "ssh", "telnet", "serial", "winbox", "vnc", "http", "https"];
 
 fn fields_map(fields: &[FieldV]) -> HashMap<String, String> {
     fields

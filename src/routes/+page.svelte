@@ -21,6 +21,7 @@
   import ExportDialog from "$lib/ExportDialog.svelte";
   import Tour from "$lib/Tour.svelte";
   import VncView from "$lib/VncView.svelte";
+  import WebTabView from "$lib/WebTabView.svelte";
   import Icon from "$lib/Icon.svelte";
 
   let sidebar = $state<ReturnType<typeof Sidebar>>();
@@ -293,6 +294,8 @@
               <RdpView tab={t} active={app.activeTab === t.key} />
             {:else if t.protocol === "vnc"}
               <VncView tab={t} active={app.activeTab === t.key} />
+            {:else if t.protocol === "web"}
+              <WebTabView tab={t} active={app.activeTab === t.key} />
             {:else}
               <TermView tab={t} active={app.activeTab === t.key} />
             {/if}

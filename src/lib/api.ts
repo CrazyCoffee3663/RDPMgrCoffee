@@ -103,8 +103,9 @@ export const api = {
     invoke<string>("generate_password", { length, upper, lower, digits, symbols }),
   copySecret: (id: string, what: string, clearAfter: number | null) =>
     invoke<void>("item_copy", { id, what, clearAfter }),
-  clipboardSet: (text: string, clearAfter: number | null = null) =>
-    invoke<void>("clipboard_set", { text, clearAfter }),
+  /** secret: не сохранять в журнале буфера Windows (Win+V) и облачном буфере */
+  clipboardSet: (text: string, clearAfter: number | null = null, secret = false) =>
+    invoke<void>("clipboard_set", { text, clearAfter, secret }),
   clipboardGet: () => invoke<string>("clipboard_get"),
 
   open: (args: OpenArgs, onData: Channel<ArrayBuffer>) => invoke<Opened>("session_open", { args, onData }),
@@ -128,11 +129,10 @@ export const api = {
   /** Показать файл в проводнике */
   reveal: (path: string) => (inTauri ? revealItemInDir(path) : Promise.resolve()),
   /** Возвращает подсказку, если пароль положен в буфер обмена */
-  toolRun: (itemId: string, command: string, args: string, pwClip: boolean) =>
-    invoke<string | null>("tool_run", { itemId, command, args, pwClip }),
+  toolRun: (itemId: string, command: string, args: string) => invoke<string | null>("tool_run", { itemId, command, args }),
   /** Выполнить инструмент с выводом в текущее окно; код выхода или null, если остановлен */
-  toolExec: (itemId: string, command: string, args: string, pwClip: boolean, onData: Channel<string>) =>
-    invoke<number | null>("tool_exec", { itemId, command, args, pwClip, onData }),
+  toolExec: (itemId: string, command: string, args: string, onData: Channel<string>) =>
+    invoke<number | null>("tool_exec", { itemId, command, args, onData }),
   toolStop: () => invoke<void>("tool_stop"),
   winboxStatus: () => invoke<{ installed: string | null; latest: string | null; path: string }>("winbox_status"),
   winboxInstall: (version: string) => invoke<void>("winbox_install", { version }),

@@ -126,12 +126,12 @@ async fn item_copy(vault: State<'_, Vault>, id: String, what: String, clear_afte
     if value.is_empty() {
         return Err("Значение пустое".into());
     }
-    clip::set(&value, clear_after)
+    clip::set(&value, clear_after, true)
 }
 
 #[tauri::command]
-fn clipboard_set(text: String, clear_after: Option<u64>) -> CmdResult<()> {
-    clip::set(&text, clear_after)
+fn clipboard_set(text: String, clear_after: Option<u64>, secret: Option<bool>) -> CmdResult<()> {
+    clip::set(&text, clear_after, secret.unwrap_or(false))
 }
 
 #[tauri::command]
@@ -342,10 +342,9 @@ async fn tool_run(
     item_id: String,
     command: String,
     args: String,
-    pw_clip: bool,
 ) -> Result<Option<String>, String> {
     let p = conn::from_vault(&vault, &item_id).await?;
-    tools::run(&tools.dir, &command, &args, &p, pw_clip)
+    tools::run(&tools.dir, &command, &args, &p)
 }
 
 /// Выполнить инструмент с выводом в окно приложения (вызывается из самого окна).
@@ -357,14 +356,17 @@ async fn tool_exec(
     item_id: String,
     command: String,
     args: String,
-    pw_clip: bool,
     on_data: tauri::ipc::Channel<String>,
 ) -> Result<Option<i32>, String> {
     let p = conn::from_vault(&vault, &item_id).await?;
-    let (args, clip) = tools::prepare(&args, &p, pw_clip);
+    let (args, clip) = tools::prepare(&args, &p);
     let exe = tools::resolve(&tools.dir, &command, &p)?;
     if clip {
-        clip::set(&p.password, Some(tools::PW_CLIP_SECS))?;
+        clip::set(&p.password, Some(tools::PW_CLIP_SECS), true)?;
+        let _ = on_data.send(format!(
+            "Пароль скопирован в буфер обмена (очистится через {} с)\n\n",
+            tools::PW_CLIP_SECS
+        ));
     }
     let label = window.label().to_string();
     let (tx, rx) = tokio::sync::oneshot::channel();

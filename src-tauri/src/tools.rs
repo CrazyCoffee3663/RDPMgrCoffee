@@ -1,6 +1,8 @@
 //! Внешние инструменты (ping, tracert, WinBox, браузер…) и установка/обновление WinBox.
 //!
-//! Подстановки в аргументах: %HOST% %PORT% %USER% %PASSWORD% %DOMAIN% %NAME% %PROTOCOL%.
+//! Подстановки в аргументах: %HOST% %PORT% %ADDR% %USER% %DOMAIN% %NAME% %PROTOCOL%.
+//! %PASSWORD% в командную строку не подставляется никогда (её видят другие программы
+//! и журналы аудита Windows): аргумент с ним отбрасывается, а пароль кладётся в буфер обмена.
 //! Логин и пароль берутся из хранилища здесь, в Rust, — интерфейс их не видит.
 
 use crate::conn::ConnParams;
@@ -62,7 +64,6 @@ pub fn expand(arg: &str, p: &ConnParams) -> String {
         .replace("%HOST%", &p.host)
         .replace("%PORT%", &port)
         .replace("%USER%", &p.username)
-        .replace("%PASSWORD%", &p.password)
         .replace("%DOMAIN%", &p.domain)
         .replace("%NAME%", &p.name)
         .replace("%PROTOCOL%", &p.protocol)
@@ -80,15 +81,14 @@ fn winbox_exe(tools: &Path) -> Option<PathBuf> {
         .find(|p| p.is_file())
 }
 
-/// Разобрать и подставить аргументы. pw_clip: аргументы с %PASSWORD% не передаются
-/// (командную строку процесса видят другие программы и журналы аудита Windows) —
+/// Разобрать и подставить аргументы. Аргументы с %PASSWORD% не передаются —
 /// возвращается true, если пароль надо положить в буфер обмена.
-pub fn prepare(args: &str, p: &ConnParams, pw_clip: bool) -> (Vec<String>, bool) {
+pub fn prepare(args: &str, p: &ConnParams) -> (Vec<String>, bool) {
     let mut dropped = false;
     let out = split_args(args)
         .into_iter()
         .filter(|a| {
-            let hide = pw_clip && a.contains("%PASSWORD%");
+            let hide = a.to_ascii_uppercase().contains("%PASSWORD%");
             dropped |= hide;
             !hide
         })
@@ -110,8 +110,8 @@ pub const PW_CLIP_SECS: u64 = 45;
 
 /// Запустить инструмент. command: путь к программе, "winbox" (встроенный) или "url" (открыть ссылку).
 /// Возвращает подсказку для пользователя, если пароль положен в буфер обмена.
-pub fn run(tools: &Path, command: &str, args: &str, p: &ConnParams, pw_clip: bool) -> Result<Option<String>, String> {
-    let (args, clip) = prepare(args, p, pw_clip);
+pub fn run(tools: &Path, command: &str, args: &str, p: &ConnParams) -> Result<Option<String>, String> {
+    let (args, clip) = prepare(args, p);
     if command.eq_ignore_ascii_case("url") {
         let url = args.first().ok_or("Не указан адрес")?;
         open_url(url)?;
@@ -120,7 +120,7 @@ pub fn run(tools: &Path, command: &str, args: &str, p: &ConnParams, pw_clip: boo
     let exe = resolve(tools, command, p)?;
     spawn_console(&exe, &args).map_err(|e| format!("Не удалось запустить {}: {}", exe.display(), e))?;
     if clip {
-        crate::clip::set(&p.password, Some(PW_CLIP_SECS))?;
+        crate::clip::set(&p.password, Some(PW_CLIP_SECS), true)?;
         return Ok(Some(format!(
             "Пароль скопирован — вставьте его (Ctrl+V). Буфер очистится через {} с",
             PW_CLIP_SECS
@@ -398,13 +398,12 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(expand("%USER%@%HOST%:%PORT%", &p), "admin@10.0.0.1:22");
-        assert_eq!(expand("%PASSWORD%", &p), "p w");
-        let (a, clip) = prepare("%ADDR% %USER% %PASSWORD%", &p, true);
+        // Пароль не подставляется ни в каком виде
+        assert_eq!(expand("%PASSWORD%", &p), "%PASSWORD%");
+        let (a, clip) = prepare("%ADDR% %USER% %PASSWORD% -p=%password% --pass:%PASSWORD%x", &p);
         assert_eq!(a, vec!["10.0.0.1", "admin"]);
         assert!(clip);
-        let (a, clip) = prepare("%ADDR% %USER% %PASSWORD%", &p, false);
-        assert_eq!(a.len(), 3);
-        assert!(!clip);
+        assert!(!a.iter().any(|x| x.contains("p w")));
         assert_eq!(
             quote_args("cmd", &["/k".into(), "ping".into(), "a b".into(), r#"x"y"#.into(), r"c:\d e\".into()]),
             r#""cmd" /k ping "a b" "x\"y" "c:\d e\\""#

@@ -161,7 +161,7 @@
   async function copyPw() {
     if (!f) return;
     const sec = app.settings.clipboardClearSeconds || null;
-    if (f.password !== null) await api.clipboardSet(f.password, sec);
+    if (f.password !== null) await api.clipboardSet(f.password, sec, true);
     else if (f.id) await api.copySecret(f.id, "password", sec);
     app.toast("Пароль скопирован");
   }

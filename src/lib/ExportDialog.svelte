@@ -136,7 +136,7 @@
     line-height: 1.4;
   }
   .opt input {
-    margin-top: 3px;
+    margin-top: 2px;
   }
   .pw {
     display: flex;

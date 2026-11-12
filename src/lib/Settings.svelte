@@ -178,17 +178,29 @@
         <button class="btn" onclick={() => (onclose(), tidyGateways())}>Навести порядок</button>
       </div>
 
+      <div class="sect">Обучение</div>
+      <div class="acc">
+        <span class="hint">Короткий тур по возможностям и настройкам программы.</span>
+        <button class="btn" onclick={() => (onclose(), (app.tourOpen = true))}>
+          <Icon name="play" size={14} /> Пройти обучение
+        </button>
+      </div>
+
       <div class="sect">Импорт и экспорт</div>
       <div class="acc">
-        <span class="hint">Из mRemoteNG (confCons.xml) или из файла экспорта RDPMgrCoffee (.json).</span>
+        <span class="hint"
+          >Из mRemoteNG (confCons.xml), Terminals (Favorites.xml, Credentials.xml, Terminals.config) или файла
+          экспорта RDPMgrCoffee (.json — без паролей, .rdpexport — зашифрованный, с паролями).</span
+        >
         <button class="btn" onclick={() => (onclose(), (app.importOpen = true))}>
           <Icon name="download" size={14} /> Импорт…
         </button>
       </div>
       <div class="acc">
         <span class="hint"
-          >Все подключения в файл .json в «Загрузках»: адреса, порты, домены, параметры и RD-шлюзы. Логины, пароли и
-          заметки не выгружаются. Папку или выбранные записи можно выгрузить из их меню (правый клик).</span
+          >Все подключения в «Загрузки»: без логинов и паролей (.json — можно передавать коллегам) или полностью, с
+          паролями и заметками, в файл, зашифрованный вашим паролем (.rdpexport — для переноса в другое хранилище).
+          Папку или выбранные записи можно выгрузить из их меню (правый клик).</span
         >
         <button class="btn" onclick={() => exportAll()} disabled={!app.connections.length}>
           <Icon name="download" size={14} /> Экспорт…

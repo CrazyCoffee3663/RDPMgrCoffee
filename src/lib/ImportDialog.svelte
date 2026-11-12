@@ -3,6 +3,7 @@
   import { app, GATEWAY_FOLDER } from "./state.svelte";
   import { createRootFolder, ensureFolder, gwKey as makeKey, itemGwKey } from "./actions";
   import Icon from "./Icon.svelte";
+  import { parseExport } from "./exporter";
 
   let { onclose }: { onclose: () => void } = $props();
 
@@ -40,6 +41,8 @@
     await parse();
   }
   let needPw = $state(false);
+  /** Выбран файл экспорта RDPMgrCoffee (а не mRemoteNG) */
+  let fromExport = $state(false);
   let filePw = $state("");
   let parsed = $state<Parsed | null>(null);
   let error = $state("");
@@ -100,6 +103,20 @@
     xml = await file.text();
     filePw = "";
     needPw = false;
+    if (/\.json$/i.test(file.name) || xml.trimStart().startsWith("{")) {
+      // Файл экспорта RDPMgrCoffee: логинов и паролей в нём нет
+      error = "";
+      try {
+        parsed = parseExport(xml);
+        fromExport = true;
+        if (target === "mRemoteNG") target = "Импорт";
+      } catch (e) {
+        parsed = null;
+        error = errText(e);
+      }
+      return;
+    }
+    fromExport = false;
     await parse();
   }
 
@@ -213,9 +230,9 @@
 </script>
 
 <div class="backdrop" role="presentation" onmousedown={(e) => e.target === e.currentTarget && !busy && onclose()}>
-  <div class="dialog" role="dialog" aria-label="Импорт из mRemoteNG">
+  <div class="dialog" role="dialog" aria-label="Импорт подключений">
     <header>
-      <span>Импорт из mRemoteNG</span>
+      <span>Импорт подключений</span>
       <button class="icon-btn" onclick={onclose} disabled={busy}><Icon name="x" /></button>
     </header>
     <div class="body">
@@ -230,8 +247,10 @@
         <div class="actions"><button class="btn primary" onclick={onclose}>Готово</button></div>
       {:else}
         <p class="hint">
-          Выберите файл <code>confCons.xml</code> — обычно он лежит в
-          <code class="selectable">%APPDATA%\mRemoteNG</code>. Пароли расшифровываются локально и сохраняются в Bitwarden.
+          Файл mRemoteNG <code>confCons.xml</code> (обычно лежит в
+          <code class="selectable">%APPDATA%\mRemoteNG</code>; пароли расшифровываются локально и сохраняются в
+          Bitwarden) или файл экспорта RDPMgrCoffee <code>.json</code> — в нём нет логинов и паролей, их нужно будет
+          указать после импорта.
         </p>
         {#if found && fileName !== found}
           <div class="found">
@@ -242,7 +261,7 @@
         <label class="file btn">
           <Icon name="folder" size={14} />
           {fileName || (found ? "Выбрать другой файл…" : "Выбрать файл…")}
-          <input type="file" accept=".xml" onchange={pick} hidden />
+          <input type="file" accept=".xml,.json" onchange={pick} hidden />
         </label>
 
         {#if needPw}
@@ -276,7 +295,7 @@
             </details>
             <label class="chk"><input type="checkbox" bind:checked={skipDupes} /> Не импортировать дубли</label>
           {/if}
-          <label class="chk"><input type="checkbox" bind:checked={keepTree} /> Сохранить структуру папок mRemoteNG</label>
+          <label class="chk"><input type="checkbox" bind:checked={keepTree} /> Сохранить структуру папок {fromExport ? "из файла" : "mRemoteNG"}</label>
           {#if busy}
             <div class="bar"><div style="width: {progress.total ? (progress.done / progress.total) * 100 : 0}%"></div></div>
             <div class="faint">{progress.done} из {progress.total}…</div>

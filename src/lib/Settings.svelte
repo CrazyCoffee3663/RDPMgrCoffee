@@ -1,7 +1,7 @@
 <script lang="ts">
   import { app, applyTheme, findTheme } from "./state.svelte";
   import { PRESETS, newThemeId, type CustomTheme } from "./themes";
-  import { createRootFolder, migrateToRoot, needsMigration, tidyGateways, checkWinbox, installWinbox, newerVersion } from "./actions";
+  import { createRootFolder, migrateToRoot, needsMigration, tidyGateways, exportAll, checkWinbox, installWinbox, newerVersion } from "./actions";
   import { DEFAULT_TOOLS, type Tool } from "./state.svelte";
   import { PROTOCOLS, PROTOCOL_LABEL } from "./api";
   import Icon from "./Icon.svelte";
@@ -149,11 +149,20 @@
         <button class="btn" onclick={() => (onclose(), tidyGateways())}>Навести порядок</button>
       </div>
 
-      <div class="sect">Импорт</div>
+      <div class="sect">Импорт и экспорт</div>
       <div class="acc">
-        <span class="hint">Подключения, папки, пароли и RD-шлюзы из файла confCons.xml.</span>
+        <span class="hint">Из mRemoteNG (confCons.xml) или из файла экспорта RDPMgrCoffee (.json).</span>
         <button class="btn" onclick={() => (onclose(), (app.importOpen = true))}>
-          <Icon name="download" size={14} /> Из mRemoteNG…
+          <Icon name="download" size={14} /> Импорт…
+        </button>
+      </div>
+      <div class="acc">
+        <span class="hint"
+          >Все подключения в файл .json в «Загрузках»: адреса, порты, домены, параметры и RD-шлюзы. Логины, пароли и
+          заметки не выгружаются. Папку или выбранные записи можно выгрузить из их меню (правый клик).</span
+        >
+        <button class="btn" onclick={() => exportAll()} disabled={!app.connections.length}>
+          <Icon name="download" size={14} /> Экспорт…
         </button>
       </div>
 

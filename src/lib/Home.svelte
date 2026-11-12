@@ -76,7 +76,7 @@
     {#if !app.connections.length}
       <div class="first">
         <button class="btn primary" onclick={() => newItem("conn")}><Icon name="plus" size={14} /> Создать первое подключение</button>
-        <button class="btn" onclick={() => (app.importOpen = true)}><Icon name="download" size={14} /> Импорт из mRemoteNG</button>
+        <button class="btn" onclick={() => (app.importOpen = true)}><Icon name="download" size={14} /> Импорт подключений</button>
       </div>
     {/if}
 

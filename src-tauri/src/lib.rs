@@ -272,6 +272,25 @@ fn cleanup_stale_files() {
 }
 
 
+/// Сохранить текстовый файл (экспорт) в «Загрузки», не перезаписывая существующие.
+#[tauri::command]
+fn save_download(app: AppHandle, name: String, text: String) -> Result<String, String> {
+    let dir = app.path().download_dir().map_err(|e| e.to_string())?;
+    let name: String = name.chars().map(|c| if r#"<>:"/\|?*"#.contains(c) || c.is_control() { '_' } else { c }).collect();
+    let (stem, ext) = match name.rsplit_once('.') {
+        Some((s, e)) if !s.is_empty() => (s.to_string(), format!(".{}", e)),
+        _ => (name.clone(), String::new()),
+    };
+    let mut path = dir.join(&name);
+    let mut n = 1;
+    while path.exists() {
+        path = dir.join(format!("{} ({}){}", stem, n, ext));
+        n += 1;
+    }
+    std::fs::write(&path, text).map_err(|e| format!("Не удалось сохранить файл: {}", e))?;
+    Ok(path.display().to_string())
+}
+
 // ---------- SFTP ----------
 
 #[tauri::command]
@@ -509,6 +528,7 @@ pub fn run() {
             mremoteng_default_file,
             probe_hosts,
             tool_run,
+            save_download,
             tool_exec,
             tool_stop,
             sftp_list,

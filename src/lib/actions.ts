@@ -1,6 +1,7 @@
 import { api, errText, fieldValue, parseConn, inTauri, type Item, type Folder } from "./api";
 import { app, GATEWAY_FOLDER, type Tool } from "./state.svelte";
 import { dialogs, type MenuItem } from "./dialogs.svelte";
+import { exportItems } from "./exporter";
 
 export async function copyUsername(item: Item) {
   if (!item.username) return app.toast("Логин не указан", true);
@@ -160,6 +161,20 @@ async function openToolWindow(item: Item, tool: Tool) {
   w.once("tauri://error", (e) => app.toast(`Не удалось открыть окно: ${errText(e.payload)}`, true));
 }
 
+/** Экспорт папки со всеми вложенными (rel — путь относительно рабочей папки) */
+export function exportFolder(rel: string) {
+  const items = app.connections.filter((i) => {
+    const r = app.itemFolderRel(i);
+    return r === rel || r.startsWith(rel + "/");
+  });
+  return exportItems(items, rel.split("/").pop() || "папка", rel);
+}
+
+/** Экспорт всех подключений */
+export function exportAll() {
+  return exportItems(app.connections, "все подключения");
+}
+
 // ---------- Действия над несколькими записями ----------
 
 export function multiMenu(items: Item[]): MenuItem[] {
@@ -170,6 +185,12 @@ export function multiMenu(items: Item[]): MenuItem[] {
       label: `Подключить (${conns.length})`,
       icon: "play",
       action: () => conns.forEach((c) => app.connect(c)),
+      disabled: !conns.length,
+    },
+    {
+      label: `Экспорт без паролей (${conns.length})`,
+      icon: "download",
+      action: () => exportItems(conns, `выбранные (${conns.length})`),
       disabled: !conns.length,
     },
     "sep",
@@ -553,6 +574,7 @@ export function itemMenu(item: Item): MenuItem[] {
   m.push({ label: "Копировать логин", icon: "user", action: () => copyUsername(item), disabled: !item.username });
   m.push({ label: "Копировать пароль", icon: "key", action: () => copyPassword(item), disabled: !item.hasPassword });
   if (conn) m.push({ label: "Копировать адрес", icon: "copy", action: () => api.clipboardSet(conn.host) });
+  if (conn) m.push({ label: "Экспорт без пароля", icon: "download", action: () => exportItems([item], item.name) });
   m.push("sep");
   m.push({
     label: item.favorite ? "Убрать из избранного" : "В избранное",

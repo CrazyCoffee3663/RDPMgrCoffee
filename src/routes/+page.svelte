@@ -1,240 +1,434 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { invoke } from "@tauri-apps/api/core";
+  import { app, applyTheme, setupEvents } from "$lib/state.svelte";
+  import { PROTOCOL_LABEL, PROTOCOLS } from "$lib/api";
+  import { newItem } from "$lib/actions";
+  import { menu } from "$lib/dialogs.svelte";
+  import Unlock from "$lib/Unlock.svelte";
+  import Sidebar from "$lib/Sidebar.svelte";
+  import Editor from "$lib/Editor.svelte";
+  import TermView from "$lib/TermView.svelte";
+  import RdpView from "$lib/RdpView.svelte";
+  import Home from "$lib/Home.svelte";
+  import Settings from "$lib/Settings.svelte";
+  import WindowControls from "$lib/WindowControls.svelte";
+  import ImportDialog from "$lib/ImportDialog.svelte";
+  import Overlays from "$lib/Overlays.svelte";
+  import Icon from "$lib/Icon.svelte";
 
-  type Folder = { id: string; name: string };
-  type Conn = {
-    id: string;
-    name: string;
-    folderId: string | null;
-    uri: string;
-    username: string;
-    protocol: string;
-  };
-  type VaultData = { folders: Folder[]; items: Conn[] };
-  type VaultStatus = { status: string; serverUrl: string; email: string };
+  let sidebar = $state<ReturnType<typeof Sidebar>>();
+  let showSidebar = $state(true);
+  let quick = $state("");
+  let quickProto = $state("ssh");
+  let quickEl = $state<HTMLInputElement>();
+  let lastActivity = Date.now();
 
-  const CONN_PROTOCOLS = ["rdp", "ssh", "telnet", "serial"];
+  onMount(() => {
+    applyTheme(app.settings.theme);
+    const mq = window.matchMedia("(prefers-color-scheme: dark)");
+    const onScheme = () => applyTheme(app.settings.theme);
+    mq.addEventListener("change", onScheme);
+    setupEvents();
+    app.init();
 
-  let phase: "checking" | "setup" | "locked" | "open" = "checking";
-  let busy = false;
-  let error = "";
-  let info: VaultStatus = { status: "", serverUrl: "", email: "" };
+    const bump = () => (lastActivity = Date.now());
+    window.addEventListener("mousemove", bump, { passive: true });
+    window.addEventListener("keydown", bump, { passive: true });
 
-  let server = "";
-  let email = "";
-  let code = "";
-  let password = "";
-
-  let data: VaultData = { folders: [], items: [] };
-  let query = "";
-  let notice = "";
-  let noticeIsError = false;
-
-  onMount(refreshStatus);
-
-  async function refreshStatus() {
-    error = "";
-    try {
-      info = await invoke<VaultStatus>("vault_status");
-      if (info.status === "unauthenticated") {
-        server = info.serverUrl || server;
-        phase = "setup";
-      } else {
-        phase = "locked";
+    // Автоблокировка и фоновая синхронизация
+    let lastSync = Date.now();
+    const timer = setInterval(() => {
+      if (app.phase !== "unlocked") return;
+      const lockMin = app.settings.autoLockMinutes;
+      if (lockMin > 0 && Date.now() - lastActivity > lockMin * 60_000) {
+        app.lock();
+        return;
       }
-    } catch (e) {
-      error = String(e);
-      phase = "setup";
+      if (Date.now() - lastSync > Math.max(1, app.settings.syncMinutes) * 60_000) {
+        lastSync = Date.now();
+        app.sync(false);
+      }
+    }, 15_000);
+
+    return () => {
+      clearInterval(timer);
+      mq.removeEventListener("change", onScheme);
+    };
+  });
+
+  // Окно настроек скрывает окна RDP
+  $effect(() => {
+    if (app.settingsOpen) {
+      app.pushOverlay();
+      return () => app.popOverlay();
+    }
+  });
+  $effect(() => {
+    if (app.importOpen) {
+      app.pushOverlay();
+      return () => app.popOverlay();
+    }
+  });
+
+  function onKey(e: KeyboardEvent) {
+    if (app.phase !== "unlocked") return;
+    const k = e.code;
+    if (e.ctrlKey && !e.shiftKey && k === "KeyF") {
+      e.preventDefault();
+      showSidebar = true;
+      setTimeout(() => sidebar?.focusSearch());
+    } else if (e.ctrlKey && k === "KeyK") {
+      e.preventDefault();
+      quickEl?.focus();
+    } else if (e.ctrlKey && !e.shiftKey && k === "KeyN") {
+      e.preventDefault();
+      newItem(app.mode === "conn" ? "conn" : "login");
+    } else if (e.ctrlKey && e.key === "Tab") {
+      e.preventDefault();
+      app.cycleTab(e.shiftKey ? -1 : 1);
+    } else if (e.ctrlKey && e.shiftKey && k === "KeyW") {
+      e.preventDefault();
+      if (app.activeTab) app.closeTab(app.activeTab);
+    } else if (e.ctrlKey && !e.shiftKey && k === "KeyL") {
+      e.preventDefault();
+      app.lock();
+    } else if (e.ctrlKey && k === "KeyB") {
+      e.preventDefault();
+      showSidebar = !showSidebar;
     }
   }
 
-  async function setup() {
-    error = "";
-    busy = true;
-    try {
-      data = await invoke<VaultData>("vault_setup", { server, email, password, code });
-      password = "";
-      code = "";
-      phase = "open";
-    } catch (e) {
-      error = String(e);
-    }
-    busy = false;
+  function doQuick() {
+    const a = quick.trim();
+    if (!a) return;
+    app.quickConnect(a, quickProto);
+    quick = "";
   }
 
-  async function unlock() {
-    error = "";
-    busy = true;
-    try {
-      data = await invoke<VaultData>("vault_unlock", { password });
-      password = "";
-      phase = "open";
-    } catch (e) {
-      error = String(e);
-    }
-    busy = false;
+  function tabMenu(e: MouseEvent, key: string) {
+    const others = app.tabs.filter((t) => t.key !== key).map((t) => t.key);
+    menu.show(e, [
+      { label: "Переподключиться", icon: "reconnect", action: () => app.reconnect(key) },
+      {
+        label: "Изменить подключение",
+        icon: "edit",
+        action: () => (app.editing = app.tab(key)?.itemId ?? null),
+        disabled: !app.tab(key)?.itemId,
+      },
+      "sep",
+      { label: "Закрыть", icon: "x", action: () => app.closeTab(key) },
+      { label: "Закрыть остальные", action: () => others.forEach((k) => app.closeTab(k)), disabled: !others.length },
+      { label: "Закрыть все", action: () => [...app.tabs].forEach((t) => app.closeTab(t.key)) },
+    ]);
   }
 
-  async function lock() {
-    await invoke("vault_lock");
-    data = { folders: [], items: [] };
-    query = "";
-    notice = "";
-    phase = "locked";
+  // Перетаскивание вкладок
+  let dragTab: string | null = null;
+  function onTabDrop(target: string) {
+    if (!dragTab || dragTab === target) return;
+    const from = app.tabs.findIndex((t) => t.key === dragTab);
+    const to = app.tabs.findIndex((t) => t.key === target);
+    const [t] = app.tabs.splice(from, 1);
+    app.tabs.splice(to, 0, t);
+    dragTab = null;
   }
 
-  async function reset() {
-    error = "";
-    password = "";
-    await invoke("vault_reset");
-    await refreshStatus();
-  }
-
-  async function connect(item: Conn) {
-    notice = "";
-    try {
-      await invoke("connect", { id: item.id });
-      notice = `Запускаю подключение: ${item.name}`;
-      noticeIsError = false;
-    } catch (e) {
-      notice = String(e);
-      noticeIsError = true;
-    }
-  }
-
-  $: folderName = new Map<string, string>(
-    data.folders.map((f): [string, string] => [f.id, f.name])
-  );
-  $: q = query.trim().toLowerCase();
-  $: filtered = data.items.filter(
-    (i) =>
-      CONN_PROTOCOLS.includes(i.protocol) &&
-      (!q ||
-        i.name.toLowerCase().includes(q) ||
-        i.uri.toLowerCase().includes(q) ||
-        i.username.toLowerCase().includes(q))
-  );
-  $: groups = (() => {
-    const m = new Map<string, Conn[]>();
-    for (const i of filtered) {
-      const g = (i.folderId && folderName.get(i.folderId)) || "Без папки";
-      if (!m.has(g)) m.set(g, []);
-      m.get(g)!.push(i);
-    }
-    return [...m.entries()].sort((a, b) => a[0].localeCompare(b[0], "ru"));
-  })();
+  const active = $derived(app.tab(app.activeTab));
+  const connectedCount = $derived(app.tabs.filter((t) => t.state === "connected").length);
 </script>
 
-<main>
-  {#if phase === "checking"}
-    <p class="hint center">Запуск…</p>
-  {:else if phase === "setup"}
-    <form class="unlock" on:submit|preventDefault={setup}>
-      <h1>Первый запуск</h1>
-      <p class="hint">Подключение к хранилищу паролей Bitwarden / Vaultwarden</p>
-      <input type="text" placeholder="Адрес сервера, https://…" bind:value={server} disabled={busy} />
-      <input type="email" placeholder="Почта" bind:value={email} disabled={busy} />
-      <input type="password" placeholder="Мастер-пароль" bind:value={password} disabled={busy} />
-      <input type="text" placeholder="Код 2FA (если включена)" bind:value={code} disabled={busy} />
-      <button type="submit" disabled={busy || !server || !email || !password}>
-        {busy ? "Вход и синхронизация…" : "Войти"}
-      </button>
-      <p class="hint small">Если сервер находится в сети Tailscale, сначала включите Tailscale.</p>
-      {#if error}<p class="error">{error}</p>{/if}
-    </form>
-  {:else if phase === "locked"}
-    <form class="unlock" on:submit|preventDefault={unlock}>
-      <h1>Менеджер подключений</h1>
-      <p class="hint">{info.email}{info.serverUrl ? " · " + info.serverUrl : ""}</p>
-      <input
-        type="password"
-        placeholder="Мастер-пароль"
-        bind:value={password}
-        disabled={busy}
-        autofocus
-      />
-      <button type="submit" disabled={busy || !password}>
-        {busy ? "Синхронизация…" : "Разблокировать"}
-      </button>
-      <button type="button" class="link" on:click={reset} disabled={busy}>
-        Сменить сервер или аккаунт
-      </button>
-      {#if error}<p class="error">{error}</p>{/if}
-    </form>
-  {:else}
-    <header>
-      <input class="search" placeholder="Поиск по имени, адресу, логину…" bind:value={query} />
-      <button on:click={lock}>Заблокировать</button>
-    </header>
+<svelte:window onkeydown={onKey} />
 
-    {#if notice}<p class={noticeIsError ? "error" : "hint"}>{notice}</p>{/if}
+{#if app.phase === "loading"}
+  <div class="loading"></div>
+{:else if app.phase !== "unlocked"}
+  <Unlock />
+{:else}
+  <div class="app">
+    <div class="toolbar" data-tauri-drag-region>
+      <button class="icon-btn" class:active={showSidebar} title="Панель подключений (Ctrl+B)" onclick={() => (showSidebar = !showSidebar)}>
+        <Icon name="sidebar" />
+      </button>
+      <form class="quick" onsubmit={(e) => (e.preventDefault(), doQuick())}>
+        <Icon name="zap" size={14} />
+        <select bind:value={quickProto} title="Протокол">
+          {#each PROTOCOLS as p}<option value={p}>{PROTOCOL_LABEL[p]}</option>{/each}
+        </select>
+        <input bind:this={quickEl} bind:value={quick} placeholder="Быстрое подключение: user@host:port  (Ctrl+K)" />
+        <button class="go" type="submit" disabled={!quick.trim()} title="Подключиться"><Icon name="play" size={13} /></button>
+      </form>
+      <span class="sp" data-tauri-drag-region></span>
+      <button class="icon-btn" title="Синхронизировать" onclick={() => app.sync(true)} disabled={app.syncing}>
+        <span class:spin={app.syncing}><Icon name="refresh" /></span>
+      </button>
+      <button class="icon-btn" title="Заблокировать (Ctrl+L)" onclick={() => app.lock()}><Icon name="lock" /></button>
+      <button class="icon-btn" title="Настройки" onclick={() => (app.settingsOpen = true)}><Icon name="settings" /></button>
+      <WindowControls />
+    </div>
 
-    {#if groups.length === 0}
-      <p class="hint empty">
-        Ничего не найдено. Подключениями считаются записи Bitwarden с адресом вида
-        rdp://хост, ssh://хост или vnc://хост.
-      </p>
-    {/if}
+    <div class="main">
+      {#if showSidebar}<Sidebar bind:this={sidebar} />{/if}
 
-    {#each groups as [group, items]}
-      <section>
-        <h2>{group} <span>{items.length}</span></h2>
-        {#each items as item}
-          <div class="row" title="Двойной клик — подключиться" on:dblclick={() => connect(item)}>
-            <span class="badge">{item.protocol || "—"}</span>
-            <span class="name">{item.name}</span>
-            <span class="uri">{item.uri}</span>
-            <span class="user">{item.username}</span>
+      <div class="center">
+        {#if app.tabs.length}
+          <div class="tabs" role="tablist">
+            <button class="tab home-tab" class:on={!app.activeTab} title="Главная" onclick={() => (app.activeTab = null)}>
+              <Icon name="home" size={14} />
+            </button>
+            {#each app.tabs as t (t.key)}
+              <div
+                class="tab proto-{t.protocol}"
+                class:on={app.activeTab === t.key}
+                role="tab"
+                tabindex="0"
+                aria-selected={app.activeTab === t.key}
+                draggable="true"
+                ondragstart={() => (dragTab = t.key)}
+                ondragover={(e) => e.preventDefault()}
+                ondrop={() => onTabDrop(t.key)}
+                onclick={() => (app.activeTab = t.key)}
+                onkeydown={(e) => e.key === "Enter" && (app.activeTab = t.key)}
+                onauxclick={(e) => e.button === 1 && app.closeTab(t.key)}
+                oncontextmenu={(e) => tabMenu(e, t.key)}
+                title={t.message || t.title}
+              >
+                <span class="st {t.state}"></span>
+                <span class="tt">{t.title}</span>
+                <button class="tx" title="Закрыть (Ctrl+Shift+W)" onclick={(e) => (e.stopPropagation(), app.closeTab(t.key))}>
+                  <Icon name="x" size={12} />
+                </button>
+              </div>
+            {/each}
           </div>
-        {/each}
-      </section>
-    {/each}
-  {/if}
-</main>
+        {/if}
+        <div class="views">
+          {#each app.tabs as t (t.key)}
+            {#if t.protocol === "rdp"}
+              <RdpView tab={t} active={app.activeTab === t.key} />
+            {:else}
+              <TermView tab={t} active={app.activeTab === t.key} />
+            {/if}
+          {/each}
+          {#if !app.activeTab}<Home />{/if}
+        </div>
+      </div>
+
+      {#if app.editing}<Editor />{/if}
+    </div>
+
+    <div class="status">
+      <span class="si" class:err={!!app.syncError} title={app.syncError || "Синхронизировано"}>
+        <Icon name="cloud" size={13} />
+        {app.syncing ? "Синхронизация…" : app.syncError ? "Нет связи с сервером" : "Синхронизировано"}
+      </span>
+      <span class="faint">{app.status.email}</span>
+      <span class="sp"></span>
+      {#if active}<span class="faint">{active.title}</span>{/if}
+      <span>Сеансов: {connectedCount}</span>
+    </div>
+  </div>
+
+  {#if app.settingsOpen}<Settings onclose={() => (app.settingsOpen = false)} />{/if}
+  {#if app.importOpen}<ImportDialog onclose={() => (app.importOpen = false)} />{/if}
+{/if}
+
+<Overlays />
 
 <style>
-  :global(body) {
-    margin: 0;
-    font-family: "Segoe UI", system-ui, sans-serif;
-    background: #f4f5f7;
-    color: #1d2330;
+  .loading {
+    height: 100vh;
+    background: var(--bg);
   }
-  main { padding: 20px; max-width: 1000px; margin: 0 auto; }
-  .unlock { max-width: 340px; margin: 10vh auto 0; display: flex; flex-direction: column; gap: 12px; }
-  h1 { font-size: 22px; margin: 0; }
-  .hint { color: #6b7385; margin: 0; }
-  .small { font-size: 12px; }
-  .center { text-align: center; margin-top: 20vh; }
-  .empty { margin-top: 24px; }
-  .error { color: #c0392b; white-space: pre-wrap; }
-  input[type="password"], input[type="text"], input[type="email"], .search {
-    padding: 10px 12px; border: 1px solid #c9cedb; border-radius: 8px; font-size: 14px; background: #fff; color: inherit;
+  .app {
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
   }
-  button {
-    padding: 10px 16px; border: 0; border-radius: 8px; background: #2f6feb; color: #fff; font-size: 14px; cursor: pointer;
+  .toolbar {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 8px;
+    background: var(--bg-panel);
+    border-bottom: 1px solid var(--border);
   }
-  button.link { background: none; color: #6b7385; padding: 4px; text-decoration: underline; }
-  button:disabled { opacity: 0.5; cursor: default; }
-  header { display: flex; gap: 12px; align-items: center; margin-bottom: 16px; }
-  .search { flex: 1; }
-  section { margin-bottom: 20px; }
-  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.04em; color: #6b7385; margin: 0 0 6px; }
-  h2 span { font-weight: normal; opacity: 0.7; }
-  .row {
-    display: grid; grid-template-columns: 56px 1.2fr 1.4fr 1fr; gap: 12px; align-items: center;
-    padding: 10px 12px; background: #fff; border-radius: 8px; margin-bottom: 4px; font-size: 14px;
-    cursor: pointer; user-select: none;
+  .sp {
+    flex: 1;
   }
-  .row:hover { background: #eaf1ff; }
-  .badge { font-size: 11px; text-transform: uppercase; background: #e3e7f0; border-radius: 4px; padding: 2px 6px; text-align: center; }
-  .name { font-weight: 600; }
-  .uri, .user { color: #6b7385; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  @media (prefers-color-scheme: dark) {
-    :global(body) { background: #14171f; color: #e6e9f0; }
-    input[type="password"], input[type="text"], input[type="email"], .search, .row { background: #1d212c; border-color: #2c3242; color: #e6e9f0; }
-    .row:hover { background: #26304a; }
-    .badge { background: #2c3242; }
-    button.link { color: #9aa3b8; }
+  .quick {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    width: min(560px, 50vw);
+    padding: 0 3px 0 10px;
+    background: var(--bg-sunken);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    color: var(--text-faint);
+  }
+  .quick:focus-within {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px var(--accent-soft);
+  }
+  .quick select {
+    width: auto;
+    border: 0;
+    background-color: transparent;
+    padding: 4px 22px 4px 2px;
+    font-weight: 600;
+    color: var(--text-muted);
+    box-shadow: none !important;
+  }
+  .quick input {
+    border: 0;
+    background: none;
+    padding: 6px 0;
+    box-shadow: none !important;
+  }
+  .go {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 26px;
+    height: 24px;
+    color: var(--accent);
+  }
+  .go:hover:not(:disabled) {
+    background: var(--accent-soft);
+  }
+  .spin {
+    display: inline-flex;
+    animation: spin 0.9s linear infinite;
+  }
+  @keyframes spin {
+    to {
+      transform: rotate(360deg);
+    }
+  }
+  .main {
+    flex: 1;
+    display: flex;
+    min-height: 0;
+  }
+  .center {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+  }
+  .tabs {
+    display: flex;
+    align-items: flex-end;
+    gap: 2px;
+    padding: 6px 6px 0;
+    background: var(--bg);
+    border-bottom: 1px solid var(--border);
+    overflow-x: auto;
+    flex-shrink: 0;
+  }
+  .tabs::-webkit-scrollbar {
+    height: 0;
+  }
+  .tab {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    height: 32px;
+    padding: 0 6px 0 10px;
+    max-width: 220px;
+    min-width: 0;
+    border: 1px solid transparent;
+    border-bottom: 0;
+    border-radius: var(--radius) var(--radius) 0 0;
+    color: var(--text-muted);
+    cursor: default;
+    position: relative;
+    flex-shrink: 0;
+  }
+  .tab:hover {
+    background: var(--bg-hover);
+    color: var(--text);
+  }
+  .tab.on {
+    background: var(--bg-panel);
+    border-color: var(--border);
+    color: var(--text);
+    margin-bottom: -1px;
+    height: 33px;
+  }
+  .tab.on::before {
+    content: "";
+    position: absolute;
+    left: -1px;
+    right: -1px;
+    top: -1px;
+    height: 2px;
+    background: var(--pc, var(--accent));
+    border-radius: var(--radius) var(--radius) 0 0;
+  }
+  .home-tab {
+    padding: 0 10px;
+  }
+  .tt {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .st {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    flex-shrink: 0;
+    background: var(--text-faint);
+  }
+  .st.connected {
+    background: var(--ok);
+  }
+  .st.connecting {
+    background: var(--warn);
+    animation: pulse 1s infinite;
+  }
+  .st.error {
+    background: var(--danger);
+  }
+  @keyframes pulse {
+    50% {
+      opacity: 0.3;
+    }
+  }
+  .tx {
+    display: flex;
+    padding: 3px;
+    border-radius: 4px;
+    color: var(--text-faint);
+  }
+  .tx:hover {
+    background: var(--bg-hover);
+    color: var(--text);
+  }
+  .views {
+    flex: 1;
+    position: relative;
+    min-height: 0;
+    background: var(--bg);
+  }
+  .status {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    height: 24px;
+    padding: 0 10px;
+    font-size: 11.5px;
+    color: var(--text-muted);
+    background: var(--bg-panel);
+    border-top: 1px solid var(--border);
+  }
+  .si {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+  }
+  .si.err {
+    color: var(--warn);
   }
 </style>

@@ -126,6 +126,8 @@ export const api = {
       : invoke<void>("sftp_upload", { id, path }),
   sftpOp: (id: number, op: "mkdir" | "rmdir" | "rm" | "rename", path: string, to?: string) =>
     invoke<void>("sftp_op", { id, op, path, to }),
+  /** Сохранить текстовый файл в «Загрузки» (без перезаписи), вернуть путь */
+  saveDownload: (name: string, text: string) => invoke<string>("save_download", { name, text }),
   /** Показать файл в проводнике */
   reveal: (path: string) => (inTauri ? revealItemInDir(path) : Promise.resolve()),
   /** Возвращает подсказку, если пароль положен в буфер обмена */

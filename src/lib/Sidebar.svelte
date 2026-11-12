@@ -538,6 +538,9 @@
             <span class="ficon"><Icon name={it.kind === 5 ? "key" : "user"} size={14} /></span>
           {/if}
           <span class="name">{it.name}</span>
+          {#if c && c.protocol !== "winbox" && ["1", "true", "yes", "да", "on"].includes(fieldValue(it, "mikrotik").toLowerCase())}
+            <span class="mt" title="MikroTik — в меню есть WinBox">MikroTik</span>
+          {/if}
           {#if it.favorite}<span class="fav"><Icon name="star" size={11} /></span>{/if}
           {#if c && app.settings.showLogin}
             {@const login = app.loginOf(it)}
@@ -745,6 +748,15 @@
   .badge.gw {
     --pc: #64748b;
     width: 26px;
+  }
+  .mt {
+    flex-shrink: 0;
+    font-size: 9px;
+    font-weight: 700;
+    padding: 1px 4px;
+    border-radius: 3px;
+    color: var(--p-winbox);
+    background: color-mix(in srgb, var(--p-winbox) 14%, transparent);
   }
   .fav {
     color: var(--warn);

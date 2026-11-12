@@ -584,7 +584,11 @@ export function itemMenu(item: Item): MenuItem[] {
   });
   m.push({ label: "Удалить", icon: "trash", danger: true, action: () => deleteItem(item), disabled: !item.edit, hint: "Del" });
   if (conn) {
-    const tools = app.settings.tools.filter((t) => !t.protocols.length || t.protocols.includes(conn.protocol));
+    // SSH/Telnet-подключение с отметкой «Это MikroTik» получает инструменты MikroTik (WinBox)
+    const mt = ["1", "true", "yes", "да", "on"].includes(fieldValue(item, "mikrotik").toLowerCase());
+    const tools = app.settings.tools.filter(
+      (t) => !t.protocols.length || t.protocols.includes(conn.protocol) || (mt && t.protocols.includes("winbox")),
+    );
     if (tools.length) m.push("sep");
     for (const t of tools) m.push({ label: t.name, icon: t.command === "winbox" ? "cable" : t.command === "url" ? "cloud" : "terminal", action: () => runTool(item, t) });
   }

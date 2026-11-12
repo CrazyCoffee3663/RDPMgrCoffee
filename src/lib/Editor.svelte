@@ -499,6 +499,10 @@
               <span>Туннели <small class="faint">— по одному на строку: <code>L 8080 10.0.0.5:80</code> (локальный порт → хост за сервером), <code>D 1080</code> (SOCKS5-прокси)</small></span>
               <textarea class="mono" rows="3" value={opt("tunnels")} oninput={(e) => setOpt("tunnels", e.currentTarget.value)} placeholder="L 13389 10.0.0.5:3389"></textarea>
             </label>
+            <label class="chk full">
+              <input type="checkbox" checked={flag("mikrotik")} onchange={(e) => setOpt("mikrotik", e.currentTarget.checked)} />
+              Это MikroTik — в меню появится WinBox (подключается к тому же адресу, порт 8291)
+            </label>
           </div>
         {/if}
       {:else if f.isGateway}

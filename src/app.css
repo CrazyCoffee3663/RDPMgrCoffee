@@ -27,6 +27,7 @@
   --p-telnet: #f59e0b;
   --p-serial: #a855f7;
   --p-winbox: #e11d48;
+  --p-vnc: #06b6d4;
   --term-bg: #ffffff;
   color-scheme: light;
 }
@@ -247,6 +248,9 @@ button:disabled {
 }
 .proto-winbox {
   --pc: var(--p-winbox);
+}
+.proto-vnc {
+  --pc: var(--p-vnc);
 }
 
 kbd {

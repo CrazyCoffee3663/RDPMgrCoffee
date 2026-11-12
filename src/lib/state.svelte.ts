@@ -327,7 +327,7 @@ class AppState {
       const m = /^(?:[a-z]+:\/\/)?(\[[^\]]+\]|[^:/?#]+)(?::(\d+))?/i.exec((g?.uris[0] ?? "").trim());
       return m ? { host: m[1], port: Number(m[2] ?? 443), kind: "tls" } : null;
     }
-    const kind = c.protocol === "rdp" || c.protocol === "ssh" ? c.protocol : "tcp";
+    const kind = c.protocol === "rdp" || c.protocol === "ssh" || c.protocol === "vnc" ? c.protocol : "tcp";
     return { host: c.host, port: c.port ?? DEFAULT_PORTS[c.protocol] ?? 0, kind };
   }
 

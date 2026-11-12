@@ -153,16 +153,23 @@ pub fn start_term(
             "ssh" => run_ssh(&app, id, &p, cols, rows, &out, rx).await,
             "telnet" => run_telnet(&app, id, &p, cols, rows, &out, rx).await,
             "serial" => run_serial(&app, id, &p, &out, rx).await,
+            "vnc" => run_vnc(&app, id, &p, &out, rx).await,
             other => Err(format!("Протокол {} не поддерживается терминалом", other)),
         };
         app.state::<Sessions>().terms.lock().unwrap().remove(&id);
+        // В канал VNC идёт только поток протокола RFB — текст туда не пишем
+        let text_channel = p.protocol != "vnc";
         match res {
             Ok(()) => {
-                send_text(&out, "\n\x1b[90m[Соединение закрыто]\x1b[0m\n");
+                if text_channel {
+                    send_text(&out, "\n\x1b[90m[Соединение закрыто]\x1b[0m\n");
+                }
                 emit_status(&app, id, "closed", "");
             }
             Err(e) => {
-                send_text(&out, &format!("\n\x1b[31m{}\x1b[0m\n", e));
+                if text_channel {
+                    send_text(&out, &format!("\n\x1b[31m{}\x1b[0m\n", e));
+                }
                 emit_status(&app, id, "error", e);
             }
         }
@@ -919,6 +926,43 @@ async fn run_telnet(
                     cols = c; rows = r;
                     if parser.naws_on { let _ = wr.write_all(&naws(c, r)).await; }
                 }
+                Some(TermCmd::Close) | None => break,
+            }
+        }
+    }
+    Ok(())
+}
+
+// ---------------- VNC ----------------
+
+/// VNC: сырой TCP-поток RFB. Протокол разбирает noVNC в интерфейсе; Rust только передаёт байты
+/// (в браузере нет TCP, а WebSocket-прокси с открытым портом не нужен).
+async fn run_vnc(
+    app: &AppHandle,
+    id: u32,
+    p: &ConnParams,
+    out: &Channel<InvokeResponseBody>,
+    mut rx: mpsc::UnboundedReceiver<TermCmd>,
+) -> Result<(), String> {
+    let port = p.port.unwrap_or(5900);
+    let stream = tokio::time::timeout(Duration::from_secs(15), tokio::net::TcpStream::connect((p.host.as_str(), port)))
+        .await
+        .map_err(|_| "Превышено время ожидания подключения".to_string())?
+        .map_err(|e| format!("Не удалось подключиться к {}:{}: {}", p.host, port, e))?;
+    let _ = stream.set_nodelay(true);
+    let (mut rd, mut wr) = stream.into_split();
+    emit_status(app, id, "connected", "");
+    let mut buf = vec![0u8; 65536];
+    loop {
+        tokio::select! {
+            n = rd.read(&mut buf) => {
+                let n = n.map_err(|e| e.to_string())?;
+                if n == 0 { break; }
+                send_out(out, &buf[..n]);
+            }
+            cmd = rx.recv() => match cmd {
+                Some(TermCmd::Data(d)) => wr.write_all(&d).await.map_err(|e| e.to_string())?,
+                Some(TermCmd::Resize(..)) => {}
                 Some(TermCmd::Close) | None => break,
             }
         }

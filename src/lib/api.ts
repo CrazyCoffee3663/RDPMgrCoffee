@@ -118,6 +118,8 @@ export const api = {
 
   open: (args: OpenArgs, onData: Channel<ArrayBuffer>) => invoke<Opened>("session_open", { args, onData }),
   input: (id: number, data: string) => invoke<void>("session_input", { id, data }),
+  /** Двоичные данные в сеанс (VNC) */
+  inputBytes: (id: number, data: number[]) => invoke<void>("session_input_bytes", { id, data }),
   resize: (id: number, cols: number, rows: number) => invoke<void>("session_resize", { id, cols, rows }),
   close: (id: number) => invoke<void>("session_close", { id }),
   rdpPlace: (id: number, x: number, y: number, w: number, h: number, visible: boolean) =>
@@ -176,17 +178,17 @@ export function errText(e: unknown): string {
 
 // ---------- Модель подключений поверх записей Bitwarden ----------
 
-export const PROTOCOLS = ["rdp", "ssh", "telnet", "serial", "winbox"] as const;
+export const PROTOCOLS = ["rdp", "ssh", "telnet", "serial", "winbox", "vnc"] as const;
 export type Protocol = (typeof PROTOCOLS)[number];
-export const DEFAULT_PORTS: Record<Protocol, number | null> = { rdp: 3389, ssh: 22, telnet: 23, serial: null, winbox: 8291 };
-export const PROTOCOL_LABEL: Record<Protocol, string> = { rdp: "RDP", ssh: "SSH", telnet: "Telnet", serial: "COM", winbox: "MikroTik" };
+export const DEFAULT_PORTS: Record<Protocol, number | null> = { rdp: 3389, ssh: 22, telnet: 23, serial: null, winbox: 8291, vnc: 5900 };
+export const PROTOCOL_LABEL: Record<Protocol, string> = { rdp: "RDP", ssh: "SSH", telnet: "Telnet", serial: "COM", winbox: "MikroTik", vnc: "VNC" };
 /** Протоколы, которые открываются во вкладке (WinBox запускается отдельной программой) */
 export const TAB_PROTOCOLS = PROTOCOLS.filter((p) => p !== "winbox");
 
 /** Поля, которыми управляет редактор подключения. Остальные показываются как «дополнительные». */
 export const KNOWN_FIELDS = [
   "credential", "domain", "gateway", "sshkey", "resolution", "admin", "sound", "microphone",
-  "drives", "printers", "clipboard", "smartcard", "auth", "gwtransport", "tunnels", "jump", "cert", "freerdp", "keepalive", "baud", "sercfg",
+  "drives", "printers", "clipboard", "smartcard", "auth", "gwtransport", "tunnels", "jump", "mikrotik", "winboxport", "cert", "freerdp", "keepalive", "baud", "sercfg",
 ];
 
 export type ConnInfo = { protocol: Protocol; host: string; port: number | null; uri: string };

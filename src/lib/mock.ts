@@ -18,6 +18,7 @@ const items: any[] = [
   conn("Файловый сервер", "f2", "rdp://fs01.corp.local", "admin"),
   conn("Веб-сервер", "f1", "ssh://web01.corp.local", "deploy", [], true),
   conn("База данных", "f1", "ssh://db01.corp.local:2222", "postgres"),
+  conn("Видеосервер (VNC)", "f2", "vnc://cam.corp.local", ""),
   conn("Коммутатор ядра", "f4", "telnet://10.0.0.2", "admin"),
   conn("Консоль маршрутизатора", "f4", "serial://COM3", "", [["baud", "115200"]]),
   conn("ООО Ромашка — терминал", "f3", "rdp://ts.romashka.ru", "ivanov"),
@@ -45,6 +46,7 @@ function login(id: string, name: string, folderId: string | null, username: stri
 let state: "setup" | "locked" | "unlocked" = "locked";
 let local = false;
 const channels = new Map<number, (d: ArrayBuffer) => void>();
+const vncState = new Map<number, { stage: string; send: (b: Uint8Array) => void }>();
 const enc = new TextEncoder();
 const listeners = new Map<string, ((e: any) => void)[]>();
 
@@ -185,7 +187,15 @@ const H: Record<string, Handler> = {
     const it = items.find((x) => x.id === args.itemId);
     const proto = (it?.uris[0] ?? args.quick ?? "ssh://").split("://")[0];
     setTimeout(() => mockEmit("session-status", { id, state: "connecting", message: "" }));
-    if (proto !== "rdp") {
+    if (proto === "vnc") {
+      // Мини-сервер RFB 3.8: пароль (VNC auth), экран 320x200, одна картинка-градиент
+      const send = (b: Uint8Array) => onData.onmessage?.(b.slice().buffer);
+      vncState.set(id, { stage: "version", send });
+      setTimeout(() => {
+        mockEmit("session-status", { id, state: "connected", message: "" });
+        send(enc.encode("RFB 003.008\n"));
+      }, 300);
+    } else if (proto !== "rdp") {
       setTimeout(() => {
         const send = (s: string) => onData.onmessage?.(enc.encode(s).buffer);
         send(`\x1b[90mПодключение к ${it?.name ?? args.quick}…\x1b[0m\r\n`);
@@ -197,6 +207,47 @@ const H: Record<string, Handler> = {
       setTimeout(() => mockEmit("session-status", { id, state: "connected", message: "" }), 600);
     }
     return { id, kind: proto === "rdp" ? "rdp" : "term", protocol: proto, title: it?.name ?? args.quick };
+  },
+  session_input_bytes: ({ id, data }) => {
+    const v = vncState.get(id);
+    if (!v) return;
+    const u8 = Uint8Array.from(data as number[]);
+    if (v.stage === "version") {
+      v.stage = "security";
+      v.send(Uint8Array.from([1, 2])); // один тип: VNC-пароль
+    } else if (v.stage === "security") {
+      v.stage = "challenge";
+      v.send(new Uint8Array(16)); // challenge
+    } else if (v.stage === "challenge" && u8.length >= 16) {
+      v.stage = "init";
+      v.send(Uint8Array.from([0, 0, 0, 0])); // SecurityResult: OK
+    } else if (v.stage === "init") {
+      v.stage = "run";
+      const w = 320, h = 200, name = enc.encode("demo-vnc");
+      const si = new Uint8Array(24 + name.length);
+      const dv = new DataView(si.buffer);
+      dv.setUint16(0, w);
+      dv.setUint16(2, h);
+      si.set([32, 24, 0, 1, 0, 255, 0, 255, 0, 255, 16, 8, 0], 4);
+      dv.setUint32(20, name.length);
+      si.set(name, 24);
+      v.send(si);
+      setTimeout(() => {
+        const fb = new Uint8Array(4 + 12 + w * h * 4);
+        const d = new DataView(fb.buffer);
+        d.setUint16(2, 1); // один прямоугольник
+        d.setUint16(8, w);
+        d.setUint16(10, h); // x=0 y=0, encoding 0 (raw)
+        for (let y = 0; y < h; y++)
+          for (let x = 0; x < w; x++) {
+            const o = 16 + (y * w + x) * 4;
+            fb[o] = (x * 255) / w; // B
+            fb[o + 1] = (y * 255) / h; // G
+            fb[o + 2] = 160; // R
+          }
+        v.send(fb);
+      }, 300);
+    }
   },
   session_input: ({ id, data }) => {
     const out = channels.get(id);

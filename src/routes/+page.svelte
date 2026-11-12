@@ -1,8 +1,11 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { app, applyTheme, setupEvents } from "$lib/state.svelte";
-  import { PROTOCOL_LABEL, PROTOCOLS } from "$lib/api";
-  import { newItem } from "$lib/actions";
+  import { api, errText, PROTOCOL_LABEL, PROTOCOLS } from "$lib/api";
+  import { getCurrentWindow } from "@tauri-apps/api/window";
+
+  const inTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+  import { newItem, checkWinbox, installWinbox } from "$lib/actions";
   import { menu } from "$lib/dialogs.svelte";
   import Unlock from "$lib/Unlock.svelte";
   import Sidebar from "$lib/Sidebar.svelte";
@@ -13,6 +16,7 @@
   import Settings from "$lib/Settings.svelte";
   import WindowControls from "$lib/WindowControls.svelte";
   import ImportDialog from "$lib/ImportDialog.svelte";
+  import SnippetsPopup from "$lib/SnippetsPopup.svelte";
   import Overlays from "$lib/Overlays.svelte";
   import Icon from "$lib/Icon.svelte";
 
@@ -35,8 +39,9 @@
     window.addEventListener("mousemove", bump, { passive: true });
     window.addEventListener("keydown", bump, { passive: true });
 
-    // Автоблокировка и фоновая синхронизация
+    // Автоблокировка, фоновая синхронизация и проверка доступности хостов
     let lastSync = Date.now();
+    let lastProbe = 0;
     const timer = setInterval(() => {
       if (app.phase !== "unlocked") return;
       const lockMin = app.settings.autoLockMinutes;
@@ -48,6 +53,10 @@
         lastSync = Date.now();
         app.sync(false);
       }
+      if (app.settings.probeEnabled && Date.now() - lastProbe > Math.max(0.5, app.settings.probeMinutes) * 60_000) {
+        lastProbe = Date.now();
+        app.probe();
+      }
     }, 15_000);
 
     return () => {
@@ -56,9 +65,20 @@
     };
   });
 
+  // Проверка обновлений WinBox после разблокировки (раз в сутки)
+  $effect(() => {
+    if (app.phase === "unlocked") setTimeout(() => checkWinbox(), 5000);
+  });
+
   // Окно настроек скрывает окна RDP
   $effect(() => {
     if (app.settingsOpen) {
+      app.pushOverlay();
+      return () => app.popOverlay();
+    }
+  });
+  $effect(() => {
+    if (app.snippetsOpen) {
       app.pushOverlay();
       return () => app.popOverlay();
     }
@@ -92,6 +112,14 @@
     } else if (e.ctrlKey && !e.shiftKey && k === "KeyL") {
       e.preventDefault();
       app.lock();
+    } else if (e.ctrlKey && e.shiftKey && k === "KeyS") {
+      e.preventDefault();
+      app.snippetsOpen = !app.snippetsOpen;
+    } else if (k === "F11") {
+      e.preventDefault();
+      setFullscreen(!app.fullscreen);
+    } else if (k === "Escape" && app.fullscreen && !app.overlays) {
+      setFullscreen(false);
     } else if (e.ctrlKey && k === "KeyB") {
       e.preventDefault();
       showSidebar = !showSidebar;
@@ -105,10 +133,37 @@
     quick = "";
   }
 
+  async function setFullscreen(on: boolean) {
+    app.fullscreen = on;
+    if (inTauri) await getCurrentWindow().setFullscreen(on).catch(() => {});
+  }
+
+  async function detachTab(key: string) {
+    const t = app.tab(key);
+    if (!t || t.sessionId === null) return;
+    try {
+      await api.rdpDetach(t.sessionId, t.title);
+      t.detached = true;
+    } catch (e) {
+      app.toast(errText(e), true);
+    }
+  }
+
   function tabMenu(e: MouseEvent, key: string) {
     const others = app.tabs.filter((t) => t.key !== key).map((t) => t.key);
+    const t = app.tab(key);
+    const rdpLive = t?.protocol === "rdp" && t.state === "connected";
     menu.show(e, [
       { label: "Переподключиться", icon: "reconnect", action: () => app.reconnect(key) },
+      t?.detached
+        ? { label: "Вернуть во вкладку", icon: "sidebar", action: () => t.sessionId !== null && api.rdpAttach(t.sessionId) }
+        : { label: "Открепить в отдельное окно", icon: "copy", action: () => detachTab(key), disabled: !rdpLive },
+      {
+        label: app.fullscreen ? "Выйти из полноэкранного режима" : "Полноэкранный режим",
+        icon: "monitor",
+        action: () => ((app.activeTab = key), setFullscreen(!app.fullscreen)),
+        hint: "F11",
+      },
       {
         label: "Изменить подключение",
         icon: "edit",
@@ -144,7 +199,7 @@
 {:else if app.phase !== "unlocked"}
   <Unlock />
 {:else}
-  <div class="app">
+  <div class="app" class:fs={app.fullscreen}>
     <div class="toolbar" data-tauri-drag-region>
       <button class="icon-btn" class:active={showSidebar} title="Панель подключений (Ctrl+B)" onclick={() => (showSidebar = !showSidebar)}>
         <Icon name="sidebar" />
@@ -158,6 +213,7 @@
         <button class="go" type="submit" disabled={!quick.trim()} title="Подключиться"><Icon name="play" size={13} /></button>
       </form>
       <span class="sp" data-tauri-drag-region></span>
+      <button class="icon-btn" title="Сниппеты команд (Ctrl+Shift+S)" onclick={() => (app.snippetsOpen = true)}><Icon name="terminal" /></button>
       <button class="icon-btn" title="Синхронизировать" onclick={() => app.sync(true)} disabled={app.syncing}>
         <span class:spin={app.syncing}><Icon name="refresh" /></span>
       </button>
@@ -167,7 +223,7 @@
     </div>
 
     <div class="main">
-      {#if showSidebar}<Sidebar bind:this={sidebar} />{/if}
+      {#if showSidebar && !app.fullscreen}<Sidebar bind:this={sidebar} />{/if}
 
       <div class="center">
         {#if app.tabs.length}
@@ -194,11 +250,20 @@
               >
                 <span class="st {t.state}"></span>
                 <span class="tt">{t.title}</span>
+                {#if t.detached}<span class="tdet" title="Открыта в отдельном окне"><Icon name="copy" size={11} /></span>{/if}
                 <button class="tx" title="Закрыть (Ctrl+Shift+W)" onclick={(e) => (e.stopPropagation(), app.closeTab(t.key))}>
                   <Icon name="x" size={12} />
                 </button>
               </div>
             {/each}
+            <span class="tsp"></span>
+            <button
+              class="tab fs-btn"
+              title={app.fullscreen ? "Выйти из полноэкранного режима (F11)" : "Полноэкранный режим (F11)"}
+              onclick={() => setFullscreen(!app.fullscreen)}
+            >
+              <Icon name={app.fullscreen ? "x" : "monitor"} size={14} />
+            </button>
           </div>
         {/if}
         <div class="views">
@@ -223,6 +288,12 @@
       </span>
       <span class="faint">{app.status.email}</span>
       <span class="sp"></span>
+      {#if app.winboxUpdate}
+        {@const u = app.winboxUpdate}
+        <button class="upd" onclick={() => installWinbox(u.latest, true)} title="Установлена {u.installed}">
+          <Icon name="download" size={12} /> Доступна WinBox {u.latest}
+        </button>
+      {/if}
       {#if active}<span class="faint">{active.title}</span>{/if}
       <span>Сеансов: {connectedCount}</span>
     </div>
@@ -230,6 +301,7 @@
 
   {#if app.settingsOpen}<Settings onclose={() => (app.settingsOpen = false)} />{/if}
   {#if app.importOpen}<ImportDialog onclose={() => (app.importOpen = false)} />{/if}
+  {#if app.snippetsOpen}<SnippetsPopup onclose={() => (app.snippetsOpen = false)} />{/if}
 {/if}
 
 <Overlays />
@@ -315,6 +387,30 @@
     display: flex;
     flex-direction: column;
     min-width: 0;
+  }
+  .upd {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 1px 8px;
+    font-size: 11.5px;
+    color: var(--accent);
+    background: var(--accent-soft);
+    border-radius: 10px;
+  }
+  .fs .toolbar,
+  .fs .status {
+    display: none;
+  }
+  .tsp {
+    flex: 1;
+  }
+  .fs-btn {
+    flex-shrink: 0;
+  }
+  .tdet {
+    display: inline-flex;
+    color: var(--text-faint);
   }
   .tabs {
     display: flex;

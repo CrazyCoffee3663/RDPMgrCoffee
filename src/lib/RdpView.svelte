@@ -32,7 +32,9 @@
     }
   }
 
-  const visible = $derived(active && app.overlays === 0 && tab.state !== "closed" && tab.state !== "error");
+  const visible = $derived(
+    active && !tab.detached && app.overlays === 0 && tab.state !== "closed" && tab.state !== "error",
+  );
 
   function place() {
     if (tab.sessionId === null || !el) return;
@@ -83,6 +85,15 @@
       <button class="btn primary" onclick={() => app.reconnect(tab.key)}>
         <Icon name="reconnect" size={14} /> Переподключиться
       </button>
+    </div>
+  {:else if tab.detached}
+    <div class="center">
+      <Icon name="copy" size={28} />
+      <div class="msg">Сеанс открыт в отдельном окне</div>
+      <button class="btn primary" onclick={() => tab.sessionId !== null && api.rdpAttach(tab.sessionId)}>
+        Вернуть во вкладку
+      </button>
+      <small class="faint">Или просто закройте отдельное окно — сеанс вернётся сюда.</small>
     </div>
   {:else if app.overlays > 0 && active}
     <div class="center faint">Окно сеанса скрыто, пока открыт диалог</div>

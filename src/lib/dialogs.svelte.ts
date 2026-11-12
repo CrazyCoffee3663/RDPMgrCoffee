@@ -2,7 +2,7 @@ import { app } from "./state.svelte";
 
 export type Dialog = {
   id: number;
-  kind: "confirm" | "input";
+  kind: "confirm" | "input" | "select";
   title: string;
   message: string;
   value: string;
@@ -10,6 +10,8 @@ export type Dialog = {
   danger: boolean;
   /** Дополнительная кнопка (возвращает "alt") */
   altText?: string;
+  /** Варианты для kind = "select": [значение, подпись] */
+  options?: [string, string][];
   resolve: (v: string | null) => void;
 };
 
@@ -41,6 +43,11 @@ class Dialogs {
   /** Выбор из двух действий: "ok" | "alt" | null (отмена) */
   choose(title: string, message: string, okText: string, altText: string, danger = false): Promise<string | null> {
     return this.open({ kind: "confirm", title, message, value: "", okText, altText, danger });
+  }
+
+  /** Выбор из списка; возвращает значение варианта или null */
+  select(title: string, message: string, options: [string, string][], value = "", okText = "OK"): Promise<string | null> {
+    return this.open({ kind: "select", title, message, value: value || options[0]?.[0] || "", okText, options, danger: false });
   }
 
   input(title: string, message: string, value = "", okText = "OK"): Promise<string | null> {

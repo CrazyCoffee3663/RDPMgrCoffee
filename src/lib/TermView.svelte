@@ -9,6 +9,14 @@
   import { api, errText, makeChannel } from "./api";
   import { app, type Tab } from "./state.svelte";
   import Icon from "./Icon.svelte";
+  import SftpPanel from "./SftpPanel.svelte";
+
+  /** Панель файлов SFTP (только SSH) */
+  let showFiles = $state(false);
+  $effect(() => {
+    void showFiles;
+    setTimeout(() => doFit(), 30);
+  });
 
   let { tab, active }: { tab: Tab; active: boolean } = $props();
 
@@ -195,6 +203,8 @@
       }
       // Ctrl+Tab и Ctrl+Shift+W обрабатывает приложение
       if (e.ctrlKey && (e.key === "Tab" || (e.shiftKey && e.code === "KeyW"))) return false;
+      // Ctrl+Shift+S — сниппеты, F11 — полный экран
+      if ((e.ctrlKey && e.shiftKey && e.code === "KeyS") || e.code === "F11") return false;
       return true;
     });
     // Как в PuTTY: правая кнопка копирует выделение или вставляет
@@ -244,7 +254,15 @@
 </script>
 
 <div class="wrap" class:hidden={!active}>
-  <div class="term" bind:this={el}></div>
+  <div class="body">
+    <div class="term" bind:this={el}></div>
+    {#if showFiles && tab.sessionId !== null}
+      <SftpPanel sessionId={tab.sessionId} onclose={() => (showFiles = false)} />
+    {/if}
+    {#if tab.protocol === "ssh" && tab.state === "connected" && !showFiles}
+      <button class="files-btn" title="Файлы (SFTP)" onclick={() => (showFiles = true)}><Icon name="folder" size={14} /> Файлы</button>
+    {/if}
+  </div>
   {#if tab.state === "closed" || tab.state === "error"}
     <div class="bar" class:err={tab.state === "error"}>
       <Icon name={tab.state === "error" ? "alert" : "plug"} size={15} />
@@ -268,8 +286,35 @@
     visibility: hidden;
     pointer-events: none;
   }
+  .body {
+    position: relative;
+    flex: 1;
+    min-height: 0;
+    display: flex;
+  }
+  .files-btn {
+    position: absolute;
+    top: 8px;
+    right: 18px;
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    padding: 3px 9px;
+    font-size: 12px;
+    color: var(--text-muted);
+    background: var(--bg-panel);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    opacity: 0.55;
+    transition: opacity 0.15s;
+  }
+  .files-btn:hover {
+    opacity: 1;
+    color: var(--text);
+  }
   .term {
     flex: 1;
+    min-width: 0;
     min-height: 0;
     padding: 6px 0 0 8px;
   }

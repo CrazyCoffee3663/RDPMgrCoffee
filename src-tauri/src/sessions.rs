@@ -30,7 +30,13 @@ pub struct Sessions {
     terms: Mutex<HashMap<u32, mpsc::UnboundedSender<TermCmd>>>,
     prompts: Mutex<HashMap<u64, oneshot::Sender<Option<String>>>>,
     pub known_hosts: Mutex<PathBuf>,
+    /// Открытые SSH-соединения (для SFTP)
+    ssh: Mutex<HashMap<u32, Arc<SshHandle>>>,
+    /// SFTP-сессии поверх них (создаются при первом обращении)
+    sftp: tokio::sync::Mutex<HashMap<u32, Arc<russh_sftp::client::SftpSession>>>,
 }
+
+type SshHandle = client::Handle<SshHandler>;
 
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -244,15 +250,15 @@ impl client::Handler for SshHandler {
     }
 }
 
-async fn run_ssh(
+/// Подключиться (напрямую или через промежуточный хост) и войти.
+/// Соединения промежуточных хостов складываются в keep — их надо держать живыми.
+async fn ssh_login(
     app: &AppHandle,
     id: u32,
     p: &ConnParams,
-    cols: u32,
-    rows: u32,
     out: &Channel<InvokeResponseBody>,
-    mut rx: mpsc::UnboundedReceiver<TermCmd>,
-) -> Result<(), String> {
+    keep: &mut Vec<SshHandle>,
+) -> Result<SshHandle, String> {
     let port = p.port.unwrap_or(22);
     let keepalive: u64 = p.opt("keepalive").parse().unwrap_or(30);
     let config = Arc::new(client::Config {
@@ -263,23 +269,36 @@ async fn run_ssh(
         ..Default::default()
     });
     let host_id = if port == 22 { p.host.clone() } else { format!("[{}]:{}", p.host, port) };
-    send_text(out, &format!("\x1b[90mПодключение к {}:{}…\x1b[0m\n", p.host, port));
-    let handler = SshHandler {
-        app: app.clone(),
-        sid: id,
-        host_id,
-    };
-    let mut h = tokio::time::timeout(
-        Duration::from_secs(20),
-        client::connect(config, (p.host.as_str(), port), handler),
-    )
-    .await
-    .map_err(|_| "Превышено время ожидания подключения".to_string())?
-    .map_err(|e| match e {
+    let handler = SshHandler { app: app.clone(), sid: id, host_id };
+    let connect_err = |e: russh::Error| match e {
         russh::Error::UnknownKey => "Ключ сервера не принят".to_string(),
-        e => format!("Не удалось подключиться: {}", e),
-    })?;
+        e => format!("Не удалось подключиться к {}: {}", p.host, e),
+    };
+    let mut h = if let Some(j) = &p.jump {
+        send_text(out, &format!("\x1b[90mПромежуточный хост {}…\x1b[0m\n", j.host));
+        let jh = Box::pin(ssh_login(app, id, j, out, keep)).await?;
+        send_text(out, &format!("\x1b[90mПодключение к {}:{} через {}…\x1b[0m\n", p.host, port, j.host));
+        let ch = jh
+            .channel_open_direct_tcpip(p.host.clone(), port as u32, "127.0.0.1", 0)
+            .await
+            .map_err(|e| format!("Промежуточный хост не смог подключиться к {}:{}: {}", p.host, port, e))?;
+        keep.push(jh);
+        tokio::time::timeout(Duration::from_secs(20), client::connect_stream(config, ch.into_stream(), handler))
+            .await
+            .map_err(|_| "Превышено время ожидания подключения".to_string())?
+            .map_err(connect_err)?
+    } else {
+        send_text(out, &format!("\x1b[90mПодключение к {}:{}…\x1b[0m\n", p.host, port));
+        tokio::time::timeout(Duration::from_secs(20), client::connect(config, (p.host.as_str(), port), handler))
+            .await
+            .map_err(|_| "Превышено время ожидания подключения".to_string())?
+            .map_err(connect_err)?
+    };
+    ssh_auth(app, id, p, &mut h).await?;
+    Ok(h)
+}
 
+async fn ssh_auth(app: &AppHandle, id: u32, p: &ConnParams, h: &mut SshHandle) -> Result<(), String> {
     // Логин
     let user = if p.username.is_empty() {
         ask(app, id, "text", "Вход по SSH", &format!("Логин для {}:", p.host), false)
@@ -364,38 +383,309 @@ async fn run_ssh(
             .success();
     }
     if !ok {
-        return Err("Аутентификация не удалась".into());
+        return Err(format!("Аутентификация на {} не удалась", p.host));
     }
+    Ok(())
+}
 
-    let mut ch = h.channel_open_session().await.map_err(|e| e.to_string())?;
-    ch.request_pty(false, "xterm-256color", cols, rows, 0, 0, &[])
-        .await
-        .map_err(|e| e.to_string())?;
-    ch.request_shell(false).await.map_err(|e| e.to_string())?;
-    emit_status(app, id, "connected", "");
 
-    loop {
-        tokio::select! {
-            msg = ch.wait() => match msg {
-                Some(ChannelMsg::Data { data }) => send_out(out, &data),
-                Some(ChannelMsg::ExtendedData { data, .. }) => send_out(out, &data),
-                Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => break,
-                _ => {}
-            },
-            cmd = rx.recv() => match cmd {
-                Some(TermCmd::Data(d)) => { let _ = ch.data_bytes(d).await; }
-                Some(TermCmd::Resize(c, r)) => { let _ = ch.window_change(c, r, 0, 0).await; }
-                Some(TermCmd::Close) | None => {
-                    let _ = ch.close().await;
-                    break;
+async fn run_ssh(
+    app: &AppHandle,
+    id: u32,
+    p: &ConnParams,
+    cols: u32,
+    rows: u32,
+    out: &Channel<InvokeResponseBody>,
+    mut rx: mpsc::UnboundedReceiver<TermCmd>,
+) -> Result<(), String> {
+    let mut keep = Vec::new();
+    let h = Arc::new(ssh_login(app, id, p, out, &mut keep).await?);
+    let st = app.state::<Sessions>();
+    st.ssh.lock().unwrap().insert(id, h.clone());
+    let tunnels = start_tunnels(h.clone(), p.opt("tunnels"), out).await;
+
+    let res = async {
+        let mut ch = h.channel_open_session().await.map_err(|e| e.to_string())?;
+        ch.request_pty(false, "xterm-256color", cols, rows, 0, 0, &[])
+            .await
+            .map_err(|e| e.to_string())?;
+        ch.request_shell(false).await.map_err(|e| e.to_string())?;
+        emit_status(app, id, "connected", "");
+
+        loop {
+            tokio::select! {
+                msg = ch.wait() => match msg {
+                    Some(ChannelMsg::Data { data }) => send_out(out, &data),
+                    Some(ChannelMsg::ExtendedData { data, .. }) => send_out(out, &data),
+                    Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => break,
+                    _ => {}
+                },
+                cmd = rx.recv() => match cmd {
+                    Some(TermCmd::Data(d)) => { let _ = ch.data_bytes(d).await; }
+                    Some(TermCmd::Resize(c, r)) => { let _ = ch.window_change(c, r, 0, 0).await; }
+                    Some(TermCmd::Close) | None => {
+                        let _ = ch.close().await;
+                        break;
+                    }
                 }
             }
         }
+        Ok::<(), String>(())
     }
-    let _ = h
-        .disconnect(russh::Disconnect::ByApplication, "", "en")
-        .await;
+    .await;
+
+    for t in tunnels {
+        t.abort();
+    }
+    st.ssh.lock().unwrap().remove(&id);
+    st.sftp.lock().await.remove(&id);
+    let _ = h.disconnect(russh::Disconnect::ByApplication, "", "en").await;
+    for j in keep.into_iter().rev() {
+        let _ = j.disconnect(russh::Disconnect::ByApplication, "", "en").await;
+    }
+    res
+}
+
+// ---------------- SSH-туннели ----------------
+
+#[derive(Debug, PartialEq)]
+enum Tunnel {
+    /// L [bind:]порт хост:порт — локальный порт на этом ПК ведёт к хосту за SSH-сервером
+    Local { bind: String, lport: u16, host: String, port: u16 },
+    /// D [bind:]порт — SOCKS5-прокси через SSH-сервер
+    Dynamic { bind: String, lport: u16 },
+}
+
+fn split_bind(s: &str) -> Option<(String, u16)> {
+    match s.rsplit_once(':') {
+        Some((b, p)) => Some((b.trim_matches(['[', ']']).to_string(), p.parse().ok()?)),
+        None => Some(("127.0.0.1".into(), s.parse().ok()?)),
+    }
+}
+
+/// Разбор поля tunnels: правила через перевод строки или «;».
+fn parse_tunnels(spec: &str) -> Result<Vec<Tunnel>, String> {
+    let mut out = vec![];
+    for rule in spec.split(['\n', ';']).map(str::trim).filter(|r| !r.is_empty()) {
+        let parts: Vec<&str> = rule.split_whitespace().collect();
+        let bad = || format!("Неверное правило туннеля «{}»", rule);
+        match parts.first().map(|k| k.to_ascii_uppercase()).as_deref() {
+            Some("L") if parts.len() == 3 => {
+                let (bind, lport) = split_bind(parts[1]).ok_or_else(bad)?;
+                let (host, port) = parts[2].rsplit_once(':').ok_or_else(bad)?;
+                out.push(Tunnel::Local {
+                    bind,
+                    lport,
+                    host: host.trim_matches(['[', ']']).to_string(),
+                    port: port.parse().map_err(|_| bad())?,
+                });
+            }
+            Some("D") if parts.len() == 2 => {
+                let (bind, lport) = split_bind(parts[1]).ok_or_else(bad)?;
+                out.push(Tunnel::Dynamic { bind, lport });
+            }
+            _ => return Err(bad()),
+        }
+    }
+    Ok(out)
+}
+
+async fn start_tunnels(h: Arc<SshHandle>, spec: &str, out: &Channel<InvokeResponseBody>) -> Vec<tokio::task::JoinHandle<()>> {
+    let rules = match parse_tunnels(spec) {
+        Ok(r) => r,
+        Err(e) => {
+            send_text(out, &format!("\x1b[33m{}\x1b[0m\n", e));
+            return vec![];
+        }
+    };
+    let mut tasks = vec![];
+    for t in rules {
+        let (bind, lport, desc) = match &t {
+            Tunnel::Local { bind, lport, host, port } => (bind.clone(), *lport, format!("{}:{} → {}:{}", bind, lport, host, port)),
+            Tunnel::Dynamic { bind, lport } => (bind.clone(), *lport, format!("SOCKS5 {}:{}", bind, lport)),
+        };
+        let listener = match tokio::net::TcpListener::bind((bind.as_str(), lport)).await {
+            Ok(l) => l,
+            Err(e) => {
+                send_text(out, &format!("\x1b[33mТуннель {} не открыт: {}\x1b[0m\n", desc, e));
+                continue;
+            }
+        };
+        send_text(out, &format!("\x1b[90mТуннель {}\x1b[0m\n", desc));
+        let h = h.clone();
+        tasks.push(tokio::spawn(async move {
+            while let Ok((mut tcp, peer)) = listener.accept().await {
+                let h = h.clone();
+                let target = match &t {
+                    Tunnel::Local { host, port, .. } => Some((host.clone(), *port)),
+                    Tunnel::Dynamic { .. } => None,
+                };
+                tokio::spawn(async move {
+                    let target = match target {
+                        Some(t) => t,
+                        None => match socks5_handshake(&mut tcp).await {
+                            Some(t) => t,
+                            None => return,
+                        },
+                    };
+                    let Ok(ch) = h
+                        .channel_open_direct_tcpip(target.0, target.1 as u32, peer.ip().to_string(), peer.port() as u32)
+                        .await
+                    else {
+                        return;
+                    };
+                    let mut cs = ch.into_stream();
+                    let _ = tokio::io::copy_bidirectional(&mut tcp, &mut cs).await;
+                });
+            }
+        }));
+    }
+    tasks
+}
+
+/// Минимальный SOCKS5 (без авторизации, только CONNECT). Возвращает куда подключаться.
+async fn socks5_handshake(s: &mut tokio::net::TcpStream) -> Option<(String, u16)> {
+    let mut b = [0u8; 2];
+    s.read_exact(&mut b).await.ok()?;
+    if b[0] != 5 {
+        return None;
+    }
+    let mut methods = vec![0u8; b[1] as usize];
+    s.read_exact(&mut methods).await.ok()?;
+    s.write_all(&[5, 0]).await.ok()?;
+    let mut hdr = [0u8; 4];
+    s.read_exact(&mut hdr).await.ok()?;
+    if hdr[0] != 5 || hdr[1] != 1 {
+        let _ = s.write_all(&[5, 7, 0, 1, 0, 0, 0, 0, 0, 0]).await;
+        return None;
+    }
+    let host = match hdr[3] {
+        1 => {
+            let mut a = [0u8; 4];
+            s.read_exact(&mut a).await.ok()?;
+            std::net::Ipv4Addr::from(a).to_string()
+        }
+        3 => {
+            let mut l = [0u8; 1];
+            s.read_exact(&mut l).await.ok()?;
+            let mut d = vec![0u8; l[0] as usize];
+            s.read_exact(&mut d).await.ok()?;
+            String::from_utf8(d).ok()?
+        }
+        4 => {
+            let mut a = [0u8; 16];
+            s.read_exact(&mut a).await.ok()?;
+            std::net::Ipv6Addr::from(a).to_string()
+        }
+        _ => return None,
+    };
+    let mut pb = [0u8; 2];
+    s.read_exact(&mut pb).await.ok()?;
+    s.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]).await.ok()?;
+    Some((host, u16::from_be_bytes(pb)))
+}
+
+// ---------------- SFTP ----------------
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SftpEntry {
+    name: String,
+    dir: bool,
+    link: bool,
+    size: u64,
+    mtime: u32,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SftpListing {
+    path: String,
+    entries: Vec<SftpEntry>,
+}
+
+impl Sessions {
+    /// SFTP-сессия для SSH-вкладки (открывается при первом обращении).
+    pub async fn sftp(&self, id: u32) -> Result<Arc<russh_sftp::client::SftpSession>, String> {
+        let mut g = self.sftp.lock().await;
+        if let Some(s) = g.get(&id) {
+            return Ok(s.clone());
+        }
+        let h = self.ssh.lock().unwrap().get(&id).cloned().ok_or("SSH-сеанс не найден или ещё не подключён")?;
+        let ch = h.channel_open_session().await.map_err(|e| e.to_string())?;
+        ch.request_subsystem(true, "sftp").await.map_err(|e| e.to_string())?;
+        let sftp = russh_sftp::client::SftpSession::new(ch.into_stream())
+            .await
+            .map_err(|e| format!("Сервер не поддерживает SFTP: {}", e))?;
+        let sftp = Arc::new(sftp);
+        g.insert(id, sftp.clone());
+        Ok(sftp)
+    }
+}
+
+pub async fn sftp_list(st: &Sessions, id: u32, path: &str) -> Result<SftpListing, String> {
+    let sftp = st.sftp(id).await?;
+    let path = sftp.canonicalize(if path.is_empty() { "." } else { path }).await.map_err(|e| e.to_string())?;
+    let mut entries: Vec<SftpEntry> = sftp
+        .read_dir(path.clone())
+        .await
+        .map_err(|e| e.to_string())?
+        .filter(|e| e.file_name() != "." && e.file_name() != "..")
+        .map(|e| {
+            let m = e.metadata();
+            SftpEntry {
+                name: e.file_name(),
+                dir: e.file_type().is_dir(),
+                link: e.file_type().is_symlink(),
+                size: m.size.unwrap_or(0),
+                mtime: m.mtime.unwrap_or(0),
+            }
+        })
+        .collect();
+    entries.sort_by(|a, b| b.dir.cmp(&a.dir).then(a.name.to_lowercase().cmp(&b.name.to_lowercase())));
+    Ok(SftpListing { path, entries })
+}
+
+/// Скачать файл в папку dir (не перезаписывая существующие). Возвращает путь.
+pub async fn sftp_download(st: &Sessions, id: u32, remote: &str, dir: &std::path::Path) -> Result<PathBuf, String> {
+    let sftp = st.sftp(id).await?;
+    let name = remote.rsplit('/').next().filter(|n| !n.is_empty()).unwrap_or("file");
+    let name: String = name.chars().map(|c| if r#"<>:"/\|?*"#.contains(c) { '_' } else { c }).collect();
+    let mut local = dir.join(&name);
+    let (stem, ext) = match name.rsplit_once('.') {
+        Some((s, e)) if !s.is_empty() => (s.to_string(), format!(".{}", e)),
+        _ => (name.clone(), String::new()),
+    };
+    let mut n = 1;
+    while local.exists() {
+        local = dir.join(format!("{} ({}){}", stem, n, ext));
+        n += 1;
+    }
+    let mut f = sftp.open(remote).await.map_err(|e| e.to_string())?;
+    let mut w = tokio::fs::File::create(&local).await.map_err(|e| e.to_string())?;
+    tokio::io::copy(&mut f, &mut w).await.map_err(|e| e.to_string())?;
+    w.flush().await.map_err(|e| e.to_string())?;
+    Ok(local)
+}
+
+pub async fn sftp_upload(st: &Sessions, id: u32, remote: &str, data: &[u8]) -> Result<(), String> {
+    let sftp = st.sftp(id).await?;
+    let mut f = sftp.create(remote).await.map_err(|e| e.to_string())?;
+    f.write_all(data).await.map_err(|e| e.to_string())?;
+    f.shutdown().await.map_err(|e| e.to_string())?;
     Ok(())
+}
+
+pub async fn sftp_op(st: &Sessions, id: u32, op: &str, path: &str, to: &str) -> Result<(), String> {
+    let sftp = st.sftp(id).await?;
+    match op {
+        "mkdir" => sftp.create_dir(path).await,
+        "rmdir" => sftp.remove_dir(path).await,
+        "rm" => sftp.remove_file(path).await,
+        "rename" => sftp.rename(path, to).await,
+        _ => return Err("Неизвестная операция".into()),
+    }
+    .map_err(|e| e.to_string())
 }
 
 // ---------------- Telnet ----------------
@@ -718,5 +1008,19 @@ mod tests {
         let mut r3 = vec![];
         p.feed(&[IAC, SB, OPT_TTYPE, 1, IAC, SE], 80, 24, &mut data, &mut r3);
         assert!(r3.windows(14).any(|w| w == b"XTERM-256COLOR"));
+    }
+}
+
+#[cfg(test)]
+mod tunnel_tests {
+    use super::*;
+
+    #[test]
+    fn parse_rules() {
+        let r = parse_tunnels("L 8080 10.0.0.5:80; D 0.0.0.0:1080\nL [::1]:3390 srv:3389").unwrap();
+        assert_eq!(r[0], Tunnel::Local { bind: "127.0.0.1".into(), lport: 8080, host: "10.0.0.5".into(), port: 80 });
+        assert_eq!(r[1], Tunnel::Dynamic { bind: "0.0.0.0".into(), lport: 1080 });
+        assert_eq!(r[2], Tunnel::Local { bind: "::1".into(), lport: 3390, host: "srv".into(), port: 3389 });
+        assert!(parse_tunnels("X 1 2").is_err());
     }
 }

@@ -89,6 +89,8 @@
       <span><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>W</kbd></span><span>закрыть вкладку</span>
       <span><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>C</kbd> / <kbd>V</kbd></span><span>копировать / вставить в терминале</span>
       <span><kbd>Ctrl</kbd>+<kbd>L</kbd></span><span>заблокировать хранилище</span>
+      <span><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>S</kbd></span><span>сниппеты команд</span>
+      <span><kbd>F11</kbd></span><span>полноэкранный режим</span>
     </div>
   </div>
 </div>

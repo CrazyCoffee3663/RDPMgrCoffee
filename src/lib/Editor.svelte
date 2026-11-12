@@ -56,6 +56,7 @@
   const credGroups = $derived(groups(app.credentials));
   const gwGroups = $derived(groups(app.gateways));
   const keyGroups = $derived(groups(app.sshKeys));
+  const jumpGroups = $derived(groups(app.connections.filter((i) => parseConn(i)?.protocol === "ssh")));
 
   // Значение ссылки (id или имя записи) → id
   function refId(v: string): string {
@@ -96,7 +97,7 @@
       if (((c && KNOWN_FIELDS.includes(k)) || (gw && (k === "domain" || k === "samecreds"))) && fl.kind !== 1) opts[k] = fl.value ?? "";
       else extra.push({ ...fl });
     }
-    for (const k of ["credential", "gateway", "sshkey"]) if (opts[k]) opts[k] = refId(opts[k]);
+    for (const k of ["credential", "gateway", "sshkey", "jump"]) if (opts[k]) opts[k] = refId(opts[k]);
     f = {
       id: it.id,
       kind: it.kind,
@@ -480,6 +481,17 @@
             <label>
               <span>Keepalive, сек</span>
               <input value={opt("keepalive")} oninput={(e) => setOpt("keepalive", e.currentTarget.value)} placeholder="30" inputmode="numeric" />
+            </label>
+            <label>
+              <span>Промежуточный хост (jump)</span>
+              <select value={opt("jump")} onchange={(e) => setOpt("jump", (e.target as HTMLSelectElement).value)}>
+                <option value="">Напрямую</option>
+                {@render refOptions(jumpGroups, opt("jump"))}
+              </select>
+            </label>
+            <label class="full">
+              <span>Туннели <small class="faint">— по одному на строку: <code>L 8080 10.0.0.5:80</code> (локальный порт → хост за сервером), <code>D 1080</code> (SOCKS5-прокси)</small></span>
+              <textarea class="mono" rows="3" value={opt("tunnels")} oninput={(e) => setOpt("tunnels", e.currentTarget.value)} placeholder="L 13389 10.0.0.5:3389"></textarea>
             </label>
           </div>
         {/if}

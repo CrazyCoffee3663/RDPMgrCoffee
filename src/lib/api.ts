@@ -1,4 +1,5 @@
 import { invoke as tauriInvoke, Channel } from "@tauri-apps/api/core";
+import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import { listen as tauriListen, type EventCallback, type UnlistenFn } from "@tauri-apps/api/event";
 
 // Вне Tauri (npm run dev в обычном браузере) работают демо-данные из mock.ts
@@ -113,6 +114,25 @@ export const api = {
     invoke<void>("rdp_place", { id, x, y, w, h, visible }),
   promptAnswer: (id: number, value: string | null) => invoke<void>("prompt_answer", { id, value }),
   serialPorts: () => invoke<string[]>("serial_ports"),
+  sftpList: (id: number, path: string) =>
+    invoke<{ path: string; entries: { name: string; dir: boolean; link: boolean; size: number; mtime: number }[] }>("sftp_list", { id, path }),
+  sftpDownload: (id: number, path: string) => invoke<string>("sftp_download", { id, path }),
+  /** Содержимое уходит сырым телом запроса, без JSON */
+  sftpUpload: (id: number, path: string, data: Uint8Array) =>
+    inTauri
+      ? tauriInvoke<void>("sftp_upload", data, { headers: { "x-sid": String(id), "x-path": encodeURIComponent(path) } })
+      : invoke<void>("sftp_upload", { id, path }),
+  sftpOp: (id: number, op: "mkdir" | "rmdir" | "rm" | "rename", path: string, to?: string) =>
+    invoke<void>("sftp_op", { id, op, path, to }),
+  /** Показать файл в проводнике */
+  reveal: (path: string) => (inTauri ? revealItemInDir(path) : Promise.resolve()),
+  toolRun: (itemId: string, command: string, args: string) => invoke<void>("tool_run", { itemId, command, args }),
+  winboxStatus: () => invoke<{ installed: string | null; latest: string | null; path: string }>("winbox_status"),
+  winboxInstall: (version: string) => invoke<void>("winbox_install", { version }),
+  rdpDetach: (id: number, title: string) => invoke<void>("rdp_detach", { id, title }),
+  rdpAttach: (id: number) => invoke<void>("rdp_attach", { id }),
+  probeHosts: (targets: { id: string; host: string; port: number }[], timeoutMs: number, parallel: number) =>
+    invoke<{ id: string; up: boolean }[]>("probe_hosts", { targets, timeoutMs, parallel }),
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   importMremoteng: (xml: string, password: string | null) => invoke<any>("import_mremoteng", { xml, password }),
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -134,7 +154,7 @@ export const PROTOCOL_LABEL: Record<Protocol, string> = { rdp: "RDP", ssh: "SSH"
 /** Поля, которыми управляет редактор подключения. Остальные показываются как «дополнительные». */
 export const KNOWN_FIELDS = [
   "credential", "domain", "gateway", "sshkey", "resolution", "admin", "sound", "microphone",
-  "drives", "printers", "clipboard", "smartcard", "auth", "gwtransport", "cert", "freerdp", "keepalive", "baud", "sercfg",
+  "drives", "printers", "clipboard", "smartcard", "auth", "gwtransport", "tunnels", "jump", "cert", "freerdp", "keepalive", "baud", "sercfg",
 ];
 
 export type ConnInfo = { protocol: Protocol; host: string; port: number | null; uri: string };

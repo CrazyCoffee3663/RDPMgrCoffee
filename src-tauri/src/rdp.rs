@@ -22,7 +22,12 @@ struct RdpSession {
     child: Arc<Mutex<Child>>,
     /// Последнее положение в клиентских координатах главного окна и видимость
     rect: (i32, i32, i32, i32, bool),
+    /// Сеанс открыт в отдельном окне (не следует за вкладкой)
+    detached: bool,
 }
+
+/// Для оконной процедуры хоста: доступ к состоянию приложения
+static APP: OnceLock<AppHandle> = OnceLock::new();
 
 #[derive(Default)]
 pub struct Rdp {
@@ -56,6 +61,14 @@ mod win {
             if msg == WM_SETFOCUS {
                 if let Ok(child) = GetWindow(hwnd, GW_CHILD) {
                     let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(Some(child));
+                }
+                return LRESULT(0);
+            }
+            // Закрытие отдельного окна сеанса — вернуть его во вкладку
+            if msg == WM_CLOSE {
+                let id = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as u32;
+                if let Some(app) = super::APP.get() {
+                    super::attach_on_main(app, id);
                 }
                 return LRESULT(0);
             }
@@ -101,7 +114,7 @@ mod win {
     }
 
     /// Вызывать в главном потоке. owner — главное окно приложения.
-    pub fn create(parent: isize) -> Result<isize, String> {
+    pub fn create(parent: isize, id: u32) -> Result<isize, String> {
         register();
         unsafe {
             let hinst = GetModuleHandleW(None).map_err(|e| e.to_string())?;
@@ -120,6 +133,7 @@ mod win {
                 None,
             )
             .map_err(|e| format!("Не удалось создать окно RDP: {}", e))?;
+            SetWindowLongPtrW(h, GWLP_USERDATA, id as isize);
             Ok(h.0 as isize)
         }
     }
@@ -220,6 +234,46 @@ mod win {
                     let _ = SetForegroundWindow(h);
                 }
             }
+        }
+    }
+
+    /// Превратить хост в обычное окно с рамкой (открепление вкладки).
+    pub fn detach(hwnd: isize, title: &str) {
+        unsafe {
+            let h = HWND(hwnd as _);
+            let mut wr = Default::default();
+            let _ = GetWindowRect(h, &mut wr);
+            SetWindowLongPtrW(h, GWLP_HWNDPARENT, 0);
+            SetWindowLongPtrW(h, GWL_STYLE, (WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN).0 as isize);
+            SetWindowLongPtrW(h, GWL_EXSTYLE, WS_EX_APPWINDOW.0 as isize);
+            let t: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
+            let _ = SetWindowTextW(h, windows::core::PCWSTR(t.as_ptr()));
+            // Размер с учётом рамки: клиентская область остаётся как была
+            let mut r = windows::Win32::Foundation::RECT { left: 0, top: 0, right: wr.right - wr.left, bottom: wr.bottom - wr.top };
+            let _ = AdjustWindowRectEx(&mut r, WS_OVERLAPPEDWINDOW, false, WS_EX_APPWINDOW);
+            let _ = SetWindowPos(
+                h,
+                Some(HWND_TOP),
+                wr.left + 24,
+                wr.top + 24,
+                r.right - r.left,
+                r.bottom - r.top,
+                SWP_FRAMECHANGED | SWP_SHOWWINDOW,
+            );
+            let _ = SetForegroundWindow(h);
+            focus(hwnd);
+        }
+    }
+
+    /// Вернуть хост во вкладку: снова окно без рамки поверх главного.
+    pub fn attach(hwnd: isize, owner: isize) {
+        unsafe {
+            let h = HWND(hwnd as _);
+            let _ = ShowWindow(h, SW_HIDE);
+            SetWindowLongPtrW(h, GWL_STYLE, (WS_POPUP | WS_CLIPCHILDREN).0 as isize);
+            SetWindowLongPtrW(h, GWL_EXSTYLE, WS_EX_TOOLWINDOW.0 as isize);
+            SetWindowLongPtrW(h, GWLP_HWNDPARENT, owner);
+            let _ = SetWindowPos(h, None, 0, 0, 0, 0, SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
         }
     }
 
@@ -394,6 +448,7 @@ fn log_errors(path: &PathBuf) -> String {
 
 pub async fn open(app: &AppHandle, id: u32, p: ConnParams, x: i32, y: i32, w: i32, h: i32) -> Result<(), String> {
     let parent = main_hwnd(app)?;
+    let _ = APP.set(app.clone());
     #[cfg(not(windows))]
     {
         let _ = (parent, id, p, x, y, w, h);
@@ -401,7 +456,7 @@ pub async fn open(app: &AppHandle, id: u32, p: ConnParams, x: i32, y: i32, w: i3
     }
     #[cfg(windows)]
     {
-        let hwnd = on_main(app, move || win::create(parent)).await??;
+        let hwnd = on_main(app, move || win::create(parent, id)).await??;
         on_main(app, move || {
             win::place(hwnd, parent, x, y, w, h, true);
             win::focus(hwnd);
@@ -451,7 +506,7 @@ pub async fn open(app: &AppHandle, id: u32, p: ConnParams, x: i32, y: i32, w: i3
             .sessions
             .lock()
             .unwrap()
-            .insert(id, RdpSession { hwnd, child: child.clone(), rect: (x, y, w, h, true) });
+            .insert(id, RdpSession { hwnd, child: child.clone(), rect: (x, y, w, h, true), detached: false });
         emit_status(app, id, "connected", "");
 
         let app2 = app.clone();
@@ -483,10 +538,11 @@ pub fn place(app: &AppHandle, id: u32, x: i32, y: i32, w: i32, h: i32, visible: 
     let hwnd = {
         let st = app.state::<Rdp>();
         let mut g = st.sessions.lock().unwrap();
-        g.get_mut(&id).map(|s| {
+        g.get_mut(&id).and_then(|s| {
             let was_visible = s.rect.4;
             s.rect = (x, y, w, h, visible);
-            (s.hwnd, visible && !was_visible)
+            // Открепленное окно живёт само по себе
+            (!s.detached).then_some((s.hwnd, visible && !was_visible))
         })
     };
     let owner = main_hwnd(app).unwrap_or(0);
@@ -504,6 +560,54 @@ pub fn place(app: &AppHandle, id: u32, x: i32, y: i32, w: i32, h: i32, visible: 
     let _ = (hwnd, owner, x, y, w, h, visible);
 }
 
+/// Открепить сеанс в отдельное окно.
+pub fn detach(app: &AppHandle, id: u32, title: String) -> Result<(), String> {
+    let hwnd = {
+        let st = app.state::<Rdp>();
+        let mut g = st.sessions.lock().unwrap();
+        let s = g.get_mut(&id).ok_or("Сеанс не найден")?;
+        s.detached = true;
+        s.hwnd
+    };
+    #[cfg(windows)]
+    let _ = app.run_on_main_thread(move || win::detach(hwnd, &title));
+    #[cfg(not(windows))]
+    let _ = (hwnd, title);
+    Ok(())
+}
+
+/// Вернуть сеанс во вкладку (из команды интерфейса).
+pub fn attach(app: &AppHandle, id: u32) {
+    let app2 = app.clone();
+    let _ = app.run_on_main_thread(move || attach_on_main(&app2, id));
+}
+
+/// Вызывать в главном потоке.
+fn attach_on_main(app: &AppHandle, id: u32) {
+    let found = {
+        let st = app.state::<Rdp>();
+        let mut g = st.sessions.lock().unwrap();
+        g.get_mut(&id).filter(|s| s.detached).map(|s| {
+            s.detached = false;
+            (s.hwnd, s.rect)
+        })
+    };
+    let Some((hwnd, (x, y, w, h, visible))) = found else { return };
+    let owner = main_hwnd(app).unwrap_or(0);
+    #[cfg(windows)]
+    {
+        win::attach(hwnd, owner);
+        win::place(hwnd, owner, x, y, w, h, visible);
+        if visible {
+            win::focus(hwnd);
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = (hwnd, owner, x, y, w, h, visible);
+    use tauri::Emitter;
+    let _ = app.emit("rdp-docked", id);
+}
+
 /// Главное окно сдвинули/развернули — переставить окна сеансов.
 pub fn reposition_all(app: &AppHandle) {
     let all: Vec<(isize, (i32, i32, i32, i32, bool))> = app
@@ -512,6 +616,7 @@ pub fn reposition_all(app: &AppHandle) {
         .lock()
         .unwrap()
         .values()
+        .filter(|s| !s.detached)
         .map(|s| (s.hwnd, s.rect))
         .collect();
     if all.is_empty() {

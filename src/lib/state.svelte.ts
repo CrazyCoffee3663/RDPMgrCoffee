@@ -14,6 +14,8 @@ export type Tab = {
   message: string;
   /** Увеличивается при переподключении — вид пересоздаёт сессию */
   gen: number;
+  /** RDP-сеанс открыт в отдельном окне */
+  detached?: boolean;
 };
 
 export type PromptReq = {
@@ -29,6 +31,22 @@ export type Toast = { id: number; text: string; error: boolean };
 
 /** Папка для записей RD-шлюзов (по умолчанию скрыта в дереве) */
 export const GATEWAY_FOLDER = "RDG";
+
+/** Внешний инструмент. command: путь к программе, "winbox" или "url" */
+export type Tool = { id: string; name: string; command: string; args: string; protocols: string[] };
+
+export const DEFAULT_TOOLS: Tool[] = [
+  { id: "t-ping", name: "Ping", command: "cmd", args: "/k ping -t %HOST%", protocols: [] },
+  { id: "t-tracert", name: "Tracert", command: "cmd", args: "/k tracert %HOST%", protocols: [] },
+  {
+    id: "t-port", name: "Проверить порт", command: "powershell",
+    args: "-NoExit -Command Test-NetConnection %HOST% -Port %PORT%", protocols: [],
+  },
+  { id: "t-winbox", name: "WinBox", command: "winbox", args: "%HOST% %USER% %PASSWORD%", protocols: [] },
+  { id: "t-web", name: "Веб-интерфейс", command: "url", args: "https://%HOST%", protocols: [] },
+];
+
+export type Snippet = { id: string; name: string; cmd: string; enter: boolean };
 
 export type Settings = {
   /** "system" | "dark" | "light" | id готовой или своей темы */
@@ -47,6 +65,23 @@ export type Settings = {
   hiddenFolders: string[];
   /** Ручной порядок в дереве: ключ родителя ("root" | "f:путь") → ключи детей ("f:путь" | id записи) */
   order: Record<string, string[]>;
+  /** Подпись с логином у подключений в дереве */
+  showLogin: boolean;
+  /** Индикатор доступности хостов */
+  probeEnabled: boolean;
+  probeMinutes: number;
+  probeTimeoutMs: number;
+  probeParallel: number;
+  /** Проверять только подключения в раскрытых папках */
+  probeVisibleOnly: boolean;
+  /** Для подключений через RD-шлюз проверять сам шлюз */
+  probeViaGateway: boolean;
+  /** Сниппеты команд для терминала */
+  snippets: Snippet[];
+  /** Внешние инструменты в меню подключения */
+  tools: Tool[];
+  /** Проверять обновления WinBox (раз в сутки) */
+  winboxAutoCheck: boolean;
 };
 
 const DEFAULT_SETTINGS: Settings = {
@@ -61,6 +96,20 @@ const DEFAULT_SETTINGS: Settings = {
   rootFolder: "",
   hiddenFolders: [GATEWAY_FOLDER],
   order: {},
+  showLogin: true,
+  probeEnabled: true,
+  probeMinutes: 2,
+  probeTimeoutMs: 1500,
+  probeParallel: 16,
+  probeVisibleOnly: true,
+  probeViaGateway: true,
+  snippets: [
+    { id: "s-df", name: "Место на дисках", cmd: "df -h", enter: true },
+    { id: "s-top", name: "Нагрузка", cmd: "top -o %CPU", enter: true },
+    { id: "s-log", name: "Системный журнал", cmd: "journalctl -n 100 -f", enter: true },
+  ],
+  tools: DEFAULT_TOOLS,
+  winboxAutoCheck: true,
 };
 
 function loadJson<T>(key: string, def: T): T {
@@ -102,6 +151,10 @@ class AppState {
   activeTab = $state<string | null>(null);
   mode = $state<"conn" | "logins">("conn");
   selected = $state<string | null>(null);
+  /** Полноэкранный режим: окно на весь экран, видны только вкладки */
+  fullscreen = $state(false);
+  /** Множественный выбор в дереве (Ctrl/Shift); selected — последняя запись */
+  selection = $state<string[]>([]);
   /** id записи в редакторе, "new:conn"/"new:login" для новой, null — закрыт */
   editing = $state<string | null>(null);
   editingFolder = $state<string | null>(null);
@@ -110,6 +163,9 @@ class AppState {
   toasts = $state<Toast[]>([]);
   settingsOpen = $state(false);
   importOpen = $state(false);
+  snippetsOpen = $state(false);
+  /** Доступная новая версия WinBox (если установленная устарела) */
+  winboxUpdate = $state<{ installed: string; latest: string } | null>(null);
 
   settings = $state<Settings>(loadJson("settings", DEFAULT_SETTINGS));
   recent = $state<string[]>(loadArr("recent"));
@@ -194,6 +250,64 @@ class AppState {
   saveSettings() {
     save("settings", this.settings);
     applyTheme(this.settings.theme);
+  }
+
+  // ---------- Доступность хостов ----------
+
+  /** id подключения → отвечает ли хост (нет ключа — ещё не проверяли) */
+  reach = $state<Record<string, boolean>>({});
+  /** Подключения, видимые сейчас в дереве (заполняет Sidebar) */
+  visibleIds = $state<string[]>([]);
+  private probing = false;
+
+  /** Логин подключения: свой или из записи учётных данных */
+  loginOf(it: Item): string {
+    const ref = fieldValue(it, "credential");
+    if (ref) {
+      const c = this.item(ref) ?? this.view.items.find((i) => i.name === ref);
+      if (c?.username) return c.username;
+    }
+    if (it.username) return it.username;
+    const m = /^[a-z]+:\/\/([^@/]+)@/i.exec(it.uris[0] ?? "");
+    return m ? decodeURIComponent(m[1]) : "";
+  }
+
+  /** Куда стучаться для проверки: сам хост или RD-шлюз */
+  probeTarget(it: Item): { host: string; port: number } | null {
+    const c = parseConn(it);
+    if (!c || c.protocol === "serial") return null;
+    const gw = fieldValue(it, "gateway");
+    if (gw && c.protocol === "rdp") {
+      if (!this.settings.probeViaGateway) return null;
+      const g = this.item(gw) ?? this.view.items.find((i) => i.name === gw);
+      const m = /^(?:[a-z]+:\/\/)?(\[[^\]]+\]|[^:/?#]+)(?::(\d+))?/i.exec((g?.uris[0] ?? "").trim());
+      return m ? { host: m[1], port: Number(m[2] ?? 443) } : null;
+    }
+    return { host: c.host, port: c.port ?? (c.protocol === "rdp" ? 3389 : c.protocol === "ssh" ? 22 : 23) };
+  }
+
+  async probe() {
+    const s = this.settings;
+    if (!s.probeEnabled || this.probing || this.phase !== "unlocked") return;
+    const ids = s.probeVisibleOnly ? new Set(this.visibleIds) : null;
+    const targets: { id: string; host: string; port: number }[] = [];
+    for (const it of this.connections) {
+      if (ids && !ids.has(it.id)) continue;
+      const t = this.probeTarget(it);
+      if (t) targets.push({ id: it.id, ...t });
+    }
+    if (!targets.length) return;
+    this.probing = true;
+    try {
+      const res = await api.probeHosts(targets, s.probeTimeoutMs, s.probeParallel);
+      const next = { ...this.reach };
+      for (const r of res) next[r.id] = r.up;
+      this.reach = next;
+    } catch {
+      /* сеть недоступна — оставляем прежние значения */
+    } finally {
+      this.probing = false;
+    }
   }
 
   /** Показывать скрытые папки (временно, не сохраняется) */
@@ -399,6 +513,13 @@ export async function setupEvents() {
     }
     t.state = e.payload.state;
     t.message = e.payload.message;
+  });
+  await listen<number>("rdp-docked", (e) => {
+    const t = app.tabs.find((t) => t.sessionId === e.payload);
+    if (t) {
+      t.detached = false;
+      app.activeTab = t.key;
+    }
   });
   await listen<PromptReq>("prompt", (e) => {
     app.prompts.push(e.payload);

@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { parseConn, PROTOCOL_LABEL, type Item, type Folder } from "./api";
+  import { parseConn, fieldValue, PROTOCOL_LABEL, type Item, type Folder } from "./api";
   import { app } from "./state.svelte";
   import { menu } from "./dialogs.svelte";
   import * as act from "./actions";
@@ -133,9 +133,57 @@
     return out;
   });
 
+  // Видимые подключения — для проверки доступности; новые проверяем сразу
+  let probeDebounce = 0;
+  $effect(() => {
+    const ids = rows.filter((r) => r.kind === "item").map((r) => (r as { item: Item }).item.id);
+    app.visibleIds = ids;
+    if (!app.settings.probeEnabled) return;
+    if (ids.some((id) => !(id in app.reach))) {
+      clearTimeout(probeDebounce);
+      probeDebounce = window.setTimeout(() => app.probe(), 600);
+    }
+  });
+
+  /** Цвет точки: зелёный — подключено, жёлтый — отвечает, красный — не отвечает */
+  function dotState(it: Item): { cls: string; title: string } | null {
+    const live = liveItems.get(it.id);
+    if (live === "connected") return { cls: "connected", title: "Подключено" };
+    if (live === "connecting") return { cls: "connecting", title: "Подключение…" };
+    if (!app.settings.probeEnabled) return live ? { cls: live, title: live } : null;
+    const r = app.reach[it.id];
+    const via = fieldValue(it, "gateway") ? " (проверен RD-шлюз)" : "";
+    if (r === true) return { cls: "up", title: "Доступен" + via };
+    if (r === false) return { cls: "down", title: "Нет ответа" + via };
+    return null;
+  }
+
   const liveItems = $derived(
     new Map(app.tabs.filter((t) => t.itemId).map((t) => [t.itemId!, t.state] as [string, string])),
   );
+
+  // ---- множественный выбор ----
+  let anchor: string | null = null;
+  const selSet = $derived(new Set(app.selection));
+  function itemsInRows(): Item[] {
+    return rows.filter((r) => r.kind === "item").map((r) => (r as { item: Item }).item);
+  }
+  function clickItem(e: MouseEvent, it: Item) {
+    if (e.ctrlKey || e.metaKey) {
+      app.selection = selSet.has(it.id) ? app.selection.filter((x) => x !== it.id) : [...app.selection, it.id];
+      anchor = it.id;
+    } else if (e.shiftKey && anchor) {
+      const list = itemsInRows();
+      const a = list.findIndex((x) => x.id === anchor);
+      const b = list.findIndex((x) => x.id === it.id);
+      if (a >= 0 && b >= 0) app.selection = list.slice(Math.min(a, b), Math.max(a, b) + 1).map((x) => x.id);
+    } else {
+      app.selection = [it.id];
+      anchor = it.id;
+    }
+    app.selected = it.id;
+  }
+  const selectedItems = () => app.selection.map((id) => app.item(id)).filter((x): x is Item => !!x);
 
   function onItemKey(e: KeyboardEvent) {
     const idx = rows.findIndex((r) => r.kind === "item" && r.item.id === app.selected);
@@ -147,6 +195,15 @@
         const r = rows[i];
         if (r.kind === "item") {
           app.selected = r.item.id;
+          if (e.shiftKey && anchor) {
+            const list = itemsInRows();
+            const a = list.findIndex((x) => x.id === anchor);
+            const b = list.findIndex((x) => x.id === r.item.id);
+            app.selection = list.slice(Math.min(a, b), Math.max(a, b) + 1).map((x) => x.id);
+          } else {
+            app.selection = [r.item.id];
+            anchor = r.item.id;
+          }
           document.getElementById("row-" + r.item.id)?.scrollIntoView({ block: "nearest" });
           break;
         }
@@ -157,8 +214,15 @@
       else app.editing = sel.id;
     } else if (e.key === "F2" && sel) {
       app.editing = sel.id;
+    } else if (e.key === "Delete" && app.selection.length > 1) {
+      act.deleteMany(selectedItems().filter((i) => i.edit));
     } else if (e.key === "Delete" && sel) {
       act.deleteItem(sel);
+    } else if (e.key === "a" && (e.ctrlKey || e.metaKey)) {
+      e.preventDefault();
+      app.selection = itemsInRows().map((i) => i.id);
+    } else if (e.key === "Escape") {
+      app.selection = app.selected ? [app.selected] : [];
     }
   }
 
@@ -209,12 +273,14 @@
   }
 
   // ---- перетаскивание: перенос в папку и ручной порядок ----
-  let drag: { kind: "folder"; path: string } | { kind: "item"; id: string } | null = null;
+  let drag: { kind: "folder"; path: string } | { kind: "item"; id: string; ids: string[] } | null = null;
   const parentOf = (path: string) => (path.includes("/") ? path.slice(0, path.lastIndexOf("/")) : "");
 
   function onDragStart(e: DragEvent, it: Item) {
     if (!it.edit) return e.preventDefault();
-    drag = { kind: "item", id: it.id };
+    // Тянем выбранную группу, если запись в ней; иначе только её
+    const ids = selSet.has(it.id) && app.selection.length > 1 ? [...app.selection] : [it.id];
+    drag = { kind: "item", id: it.id, ids };
     e.dataTransfer!.setData("text/plain", it.name);
     e.dataTransfer!.effectAllowed = "move";
   }
@@ -302,8 +368,11 @@
     }
     const it = app.item(d.id);
     if (!it) return;
-    if (!r) return void act.moveItem(it, app.defaultFolderId());
-    if (pos === "into" && r.kind === "node") return void act.moveItem(it, r.node.folder!.id);
+    const many = d.ids.length > 1 ? d.ids.map((id) => app.item(id)).filter((x): x is Item => !!x && x.edit) : null;
+    if (!r) return void (many ? act.moveMany(many, app.defaultFolderId()) : act.moveItem(it, app.defaultFolderId()));
+    if (pos === "into" && r.kind === "node")
+      return void (many ? act.moveMany(many, r.node.folder!.id) : act.moveItem(it, r.node.folder!.id));
+    if (many) return void act.moveMany(many, r.parent.folder?.id ?? app.defaultFolderId());
     if (r.kind !== "item" || pos === "into") return;
     const targetFolder = r.parent.folder?.id ?? app.defaultFolderId();
     const siblings = r.parent.items.map((i) => i.id);
@@ -429,7 +498,8 @@
         <div
           id="row-{it.id}"
           class="row item {c ? 'proto-' + c.protocol : ''}"
-          class:sel={app.selected === it.id}
+          class:sel={selSet.has(it.id) || (app.selected === it.id && !app.selection.length)}
+          class:cur={app.selected === it.id}
           style="padding-left:{8 + r.depth * 16 + 14}px"
           role="treeitem"
           aria-selected={app.selected === it.id}
@@ -442,15 +512,18 @@
           ondragover={(e) => rowDragOver(e, r)}
           ondragleave={() => dragOver === "i:" + it.id && (dragOver = null)}
           ondrop={(e) => rowDrop(e, r)}
-          onclick={() => {
-            app.selected = it.id;
+          onclick={(e) => {
+            clickItem(e, it);
             treeEl?.focus();
             if (app.editing && app.editing !== it.id && !app.editing.startsWith("new:")) app.editing = it.id;
           }}
           ondblclick={() => (c ? app.connect(it) : (app.editing = it.id))}
           onkeydown={() => {}}
           oncontextmenu={(e) => {
+            if (selSet.has(it.id) && app.selection.length > 1) return menu.show(e, act.multiMenu(selectedItems()));
             app.selected = it.id;
+            app.selection = [it.id];
+            anchor = it.id;
             menu.show(e, act.itemMenu(it));
           }}
         >
@@ -463,7 +536,14 @@
           {/if}
           <span class="name">{it.name}</span>
           {#if it.favorite}<span class="fav"><Icon name="star" size={11} /></span>{/if}
-          {#if live}<span class="dot {live}" title={live === "connected" ? "Подключено" : live}></span>{/if}
+          {#if c && app.settings.showLogin}
+            {@const login = app.loginOf(it)}
+            {#if login}<span class="login" title="Логин">{login}</span>{/if}
+          {/if}
+          {#if c}
+            {@const d = dotState(it)}
+            {#if d}<span class="dot {d.cls}" title={d.title}></span>{/if}
+          {:else if live}<span class="dot {live}"></span>{/if}
           <span class="sub">{subtitle(it)}</span>
         </div>
       {/if}
@@ -587,7 +667,7 @@
   .row.sel {
     background: var(--bg-active);
   }
-  .tree:focus .row.sel {
+  .tree:focus .row.cur {
     box-shadow: inset 0 0 0 1px var(--accent);
   }
   .row.drop-before {
@@ -624,7 +704,12 @@
   .name {
     overflow: hidden;
     text-overflow: ellipsis;
+    flex-shrink: 0;
+    max-width: 62%;
+  }
+  .folder .name {
     flex-shrink: 1;
+    max-width: none;
   }
   .sub {
     margin-left: auto;
@@ -668,6 +753,25 @@
   }
   .dot.connected {
     background: var(--ok);
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--ok) 25%, transparent);
+  }
+  .dot.up {
+    background: var(--warn);
+  }
+  .dot.down {
+    background: var(--danger);
+  }
+  .login {
+    flex-shrink: 4;
+    max-width: 40%;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    font-size: 10.5px;
+    color: var(--text-faint);
+    padding: 0 5px;
+    border-radius: 3px;
+    background: color-mix(in srgb, var(--text) 6%, transparent);
   }
   .dot.connecting {
     background: var(--warn);

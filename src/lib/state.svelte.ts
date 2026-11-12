@@ -33,17 +33,26 @@ export type Toast = { id: number; text: string; error: boolean };
 export const GATEWAY_FOLDER = "RDG";
 
 /** Внешний инструмент. command: путь к программе, "winbox" или "url" */
-export type Tool = { id: string; name: string; command: string; args: string; protocols: string[] };
+export type Tool = {
+  id: string;
+  name: string;
+  command: string;
+  args: string;
+  protocols: string[];
+  /** Показывать вывод во всплывающем окне приложения (для консольных программ) */
+  popup?: boolean;
+};
 
 /** Как запускается подключение типа WinBox: адрес[:порт] логин пароль */
 export const WINBOX_CONNECT: Tool = { id: "winbox-connect", name: "WinBox", command: "winbox", args: "%ADDR% %USER% %PASSWORD%", protocols: [] };
 
 export const DEFAULT_TOOLS: Tool[] = [
-  { id: "t-ping", name: "Ping", command: "cmd", args: "/k ping -t %HOST%", protocols: [] },
-  { id: "t-tracert", name: "Tracert", command: "cmd", args: "/k tracert %HOST%", protocols: [] },
+  { id: "t-ping", name: "Ping", command: "ping", args: "-t %HOST%", protocols: [], popup: true },
+  { id: "t-tracert", name: "Tracert", command: "tracert", args: "%HOST%", protocols: [], popup: true },
   {
     id: "t-port", name: "Проверить порт", command: "powershell",
-    args: "-NoExit -Command Test-NetConnection %HOST% -Port %PORT%", protocols: [],
+    args: `-NoProfile -Command "$ProgressPreference='SilentlyContinue'; Test-NetConnection %HOST% -Port %PORT% | Format-List"`,
+    protocols: [], popup: true,
   },
   { id: "t-winbox", name: "WinBox", command: "winbox", args: "%ADDR% %USER% %PASSWORD%", protocols: [] },
   { id: "t-web", name: "Веб-интерфейс", command: "url", args: "https://%HOST%", protocols: [] },
@@ -85,7 +94,24 @@ export type Settings = {
   tools: Tool[];
   /** Проверять обновления WinBox (раз в сутки) */
   winboxAutoCheck: boolean;
+  /** Пароль внешним программам — через буфер обмена, а не в командной строке */
+  toolPasswordClipboard: boolean;
 };
+
+/** Старые стандартные инструменты (cmd /k …) → новые, с выводом в окне приложения */
+const OLD_TOOL_ARGS: Record<string, string[]> = {
+  "t-ping": ["/k ping -t %HOST%"],
+  "t-tracert": ["/k tracert %HOST%"],
+  "t-port": ["-NoExit -Command Test-NetConnection %HOST% -Port %PORT%"],
+  "t-winbox": ["%HOST% %USER% %PASSWORD%"],
+};
+function migrateSettings(s: Settings): Settings {
+  s.tools = s.tools.map((t) => {
+    const def = DEFAULT_TOOLS.find((d) => d.id === t.id);
+    return def && OLD_TOOL_ARGS[t.id]?.includes(t.args) ? { ...def, protocols: t.protocols } : t;
+  });
+  return s;
+}
 
 const DEFAULT_SETTINGS: Settings = {
   theme: "system",
@@ -113,6 +139,7 @@ const DEFAULT_SETTINGS: Settings = {
   ],
   tools: DEFAULT_TOOLS,
   winboxAutoCheck: true,
+  toolPasswordClipboard: true,
 };
 
 function loadJson<T>(key: string, def: T): T {
@@ -170,7 +197,7 @@ class AppState {
   /** Доступная новая версия WinBox (если установленная устарела) */
   winboxUpdate = $state<{ installed: string; latest: string } | null>(null);
 
-  settings = $state<Settings>(loadJson("settings", DEFAULT_SETTINGS));
+  settings = $state<Settings>(migrateSettings(loadJson("settings", DEFAULT_SETTINGS)));
   recent = $state<string[]>(loadArr("recent"));
   expanded = $state<string[]>(loadArr("expanded"));
 

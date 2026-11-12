@@ -330,13 +330,59 @@ async fn sftp_op(sessions: State<'_, Sessions>, id: u32, op: String, path: Strin
 pub struct Tools {
     dir: PathBuf,
     http: reqwest::Client,
+    /// Запущенные во всплывающих окнах программы: метка окна → сигнал остановки
+    runs: std::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<()>>>,
 }
 
 /// Запустить внешний инструмент для подключения (подстановки — в tools.rs).
 #[tauri::command]
-async fn tool_run(vault: State<'_, Vault>, tools: State<'_, Tools>, item_id: String, command: String, args: String) -> Result<(), String> {
+async fn tool_run(
+    vault: State<'_, Vault>,
+    tools: State<'_, Tools>,
+    item_id: String,
+    command: String,
+    args: String,
+    pw_clip: bool,
+) -> Result<Option<String>, String> {
     let p = conn::from_vault(&vault, &item_id).await?;
-    tools::run(&tools.dir, &command, &args, &p)
+    tools::run(&tools.dir, &command, &args, &p, pw_clip)
+}
+
+/// Выполнить инструмент с выводом в окно приложения (вызывается из самого окна).
+#[tauri::command]
+async fn tool_exec(
+    window: tauri::Window,
+    vault: State<'_, Vault>,
+    tools: State<'_, Tools>,
+    item_id: String,
+    command: String,
+    args: String,
+    pw_clip: bool,
+    on_data: tauri::ipc::Channel<String>,
+) -> Result<Option<i32>, String> {
+    let p = conn::from_vault(&vault, &item_id).await?;
+    let (args, clip) = tools::prepare(&args, &p, pw_clip);
+    let exe = tools::resolve(&tools.dir, &command, &p)?;
+    if clip {
+        clip::set(&p.password, Some(tools::PW_CLIP_SECS))?;
+    }
+    let label = window.label().to_string();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    // Прежний запуск в этом окне (перезапуск) останавливается: его отправитель закрывается
+    tools.runs.lock().unwrap().insert(label.clone(), tx);
+    let r = tools::exec(&exe, &args, |s| { let _ = on_data.send(s); }, rx).await;
+    let mut runs = tools.runs.lock().unwrap();
+    if runs.get(&label).is_some_and(|t| t.is_closed()) {
+        runs.remove(&label);
+    }
+    r
+}
+
+#[tauri::command]
+fn tool_stop(window: tauri::Window, tools: State<'_, Tools>) {
+    if let Some(tx) = tools.runs.lock().unwrap().remove(window.label()) {
+        let _ = tx.send(());
+    }
 }
 
 #[tauri::command]
@@ -402,17 +448,29 @@ pub fn run() {
                     .timeout(std::time::Duration::from_secs(120))
                     .build()
                     .unwrap_or_default(),
+                runs: Default::default(),
             });
             cleanup_stale_files();
             Ok(())
         })
         .on_window_event(|w, e| match e {
+            // Окна инструментов: закрытие останавливает запущенную программу
+            tauri::WindowEvent::Destroyed if w.label() != "main" => {
+                w.app_handle().state::<Tools>().runs.lock().unwrap().remove(w.label());
+            }
             tauri::WindowEvent::Destroyed => {
                 let app = w.app_handle();
                 app.state::<Sessions>().close_all();
                 rdp::close_all(app);
+                for (label, win) in app.webview_windows() {
+                    if label != "main" {
+                        let _ = win.destroy();
+                    }
+                }
             }
-            tauri::WindowEvent::Moved(_) | tauri::WindowEvent::Resized(_) => rdp::reposition_all(w.app_handle()),
+            tauri::WindowEvent::Moved(_) | tauri::WindowEvent::Resized(_) if w.label() == "main" => {
+                rdp::reposition_all(w.app_handle())
+            }
             _ => {}
         })
         .invoke_handler(tauri::generate_handler![
@@ -449,6 +507,8 @@ pub fn run() {
             mremoteng_default_file,
             probe_hosts,
             tool_run,
+            tool_exec,
+            tool_stop,
             sftp_list,
             sftp_download,
             sftp_upload,

@@ -288,6 +288,10 @@
             <button class="icon-btn" title="Удалить" onclick={() => delTool(t)}><Icon name="trash" size={14} /></button>
             <input class="ta mono" bind:value={t.args} onchange={changed} placeholder="Аргументы" />
             <div class="tp">
+              <label class="chk" title="Вывод программы во всплывающем окне приложения, а не в консоли Windows"
+                ><input type="checkbox" bind:checked={t.popup} onchange={changed} />В окне приложения</label
+              >
+              <span class="faint">·</span>
               {#each PROTOCOLS as p}
                 <label class="chk"
                   ><input type="checkbox" checked={!t.protocols.length || t.protocols.includes(p)}
@@ -322,6 +326,17 @@
         <label class="row">
           <span>Проверять обновления WinBox <small>(раз в сутки, установка — только после подтверждения)</small></span>
           <span><input type="checkbox" bind:checked={s.winboxAutoCheck} onchange={changed} /></span>
+        </label>
+        <label class="row">
+          <span
+            >Передавать пароль через буфер обмена
+            <small
+              >(WinBox и другие программы получают только адрес и логин, пароль вставляется Ctrl+V и стирается из
+              буфера через 45 с. Если выключить — пароль попадёт в командную строку, которую видят другие программы и
+              журналы аудита Windows)</small
+            ></span
+          >
+          <span><input type="checkbox" bind:checked={s.toolPasswordClipboard} onchange={changed} /></span>
         </label>
 
         <div class="sect">Безопасность</div>

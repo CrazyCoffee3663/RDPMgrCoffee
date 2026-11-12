@@ -1,4 +1,4 @@
-import { api, errText, fieldValue, parseConn, type Item, type Folder } from "./api";
+import { api, errText, fieldValue, parseConn, inTauri, type Item, type Folder } from "./api";
 import { app, GATEWAY_FOLDER, type Tool } from "./state.svelte";
 import { dialogs, type MenuItem } from "./dialogs.svelte";
 
@@ -116,8 +116,10 @@ export async function checkWinbox(force = false) {
 }
 
 export async function runTool(item: Item, tool: Tool) {
+  if (tool.popup) return openToolWindow(item, tool);
   try {
-    await api.toolRun(item.id, tool.command, tool.args);
+    const note = await api.toolRun(item.id, tool.command, tool.args, app.settings.toolPasswordClipboard);
+    if (note) app.toast(note);
   } catch (e) {
     const t = errText(e);
     if (t !== "WINBOX_MISSING") return app.toast(t, true);
@@ -126,6 +128,36 @@ export async function runTool(item: Item, tool: Tool) {
     if (!st?.latest) return app.toast("WinBox не установлен, а сайт MikroTik недоступен", true);
     if (await installWinbox(st.latest, false)) await runTool(item, tool);
   }
+}
+
+let toolWinSeq = 0;
+/** Отдельное окно в стиле приложения с выводом программы (ping, tracert…) */
+async function openToolWindow(item: Item, tool: Tool) {
+  const q = new URLSearchParams({
+    tool: tool.name,
+    item: item.id,
+    title: item.name,
+    cmd: tool.command,
+    args: tool.args,
+  }).toString();
+  if (!inTauri) {
+    window.open("/?" + q, "_blank", "width=760,height=480");
+    return;
+  }
+  const { WebviewWindow } = await import("@tauri-apps/api/webviewWindow");
+  const w = new WebviewWindow(`tool-${Date.now().toString(36)}-${++toolWinSeq}`, {
+    url: "/?" + q,
+    title: `${tool.name} — ${item.name}`,
+    width: 760,
+    height: 480,
+    minWidth: 420,
+    minHeight: 220,
+    center: true,
+    decorations: false,
+    shadow: true,
+    dragDropEnabled: false,
+  });
+  w.once("tauri://error", (e) => app.toast(`Не удалось открыть окно: ${errText(e.payload)}`, true));
 }
 
 // ---------- Действия над несколькими записями ----------

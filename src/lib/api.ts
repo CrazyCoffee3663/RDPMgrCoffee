@@ -3,7 +3,7 @@ import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import { listen as tauriListen, type EventCallback, type UnlistenFn } from "@tauri-apps/api/event";
 
 // Вне Tauri (npm run dev в обычном браузере) работают демо-данные из mock.ts
-const inTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+export const inTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 let mock: typeof import("./mock") | null = null;
 const mockReady = !inTauri && import.meta.env.DEV ? import("./mock").then((m) => (mock = m)) : null;
 
@@ -16,7 +16,8 @@ async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T
 
 export function makeChannel<T>(): Channel<T> {
   if (inTauri) return new Channel<T>();
-  return new mock!.MockChannel<T>() as unknown as Channel<T>;
+  // Демо-режим: достаточно объекта с onmessage (mock.ts может быть ещё не загружен)
+  return { onmessage: () => {} } as unknown as Channel<T>;
 }
 
 export async function listen<T>(event: string, cb: EventCallback<T>): Promise<UnlistenFn> {
@@ -126,7 +127,13 @@ export const api = {
     invoke<void>("sftp_op", { id, op, path, to }),
   /** Показать файл в проводнике */
   reveal: (path: string) => (inTauri ? revealItemInDir(path) : Promise.resolve()),
-  toolRun: (itemId: string, command: string, args: string) => invoke<void>("tool_run", { itemId, command, args }),
+  /** Возвращает подсказку, если пароль положен в буфер обмена */
+  toolRun: (itemId: string, command: string, args: string, pwClip: boolean) =>
+    invoke<string | null>("tool_run", { itemId, command, args, pwClip }),
+  /** Выполнить инструмент с выводом в текущее окно; код выхода или null, если остановлен */
+  toolExec: (itemId: string, command: string, args: string, pwClip: boolean, onData: Channel<string>) =>
+    invoke<number | null>("tool_exec", { itemId, command, args, pwClip, onData }),
+  toolStop: () => invoke<void>("tool_stop"),
   winboxStatus: () => invoke<{ installed: string | null; latest: string | null; path: string }>("winbox_status"),
   winboxInstall: (version: string) => invoke<void>("winbox_install", { version }),
   rdpDetach: (id: number, title: string) => invoke<void>("rdp_detach", { id, title }),

@@ -96,6 +96,8 @@ export type Settings = {
   winboxAutoCheck: boolean;
   /** Обучающий тур пройден (или пропущен) */
   tourDone: boolean;
+  /** Писать журнал FreeRDP на диск (для диагностики; в нём адреса и логины) */
+  rdpLog: boolean;
 };
 
 /** Старые стандартные инструменты (cmd /k …) → новые, с выводом в окне приложения */
@@ -147,6 +149,7 @@ const DEFAULT_SETTINGS: Settings = {
   tools: DEFAULT_TOOLS,
   winboxAutoCheck: true,
   tourDone: false,
+  rdpLog: false,
 };
 
 function loadJson<T>(key: string, def: T): T {
@@ -428,6 +431,8 @@ class AppState {
   }
 
   async logout() {
+    // Смена аккаунта/хранилища — открытые сеансы закрываются
+    for (const t of [...this.tabs]) this.closeTab(t.key);
     await api.logout();
     this.view = { folders: [], collections: [], orgs: [], items: [] };
     this.editing = null;

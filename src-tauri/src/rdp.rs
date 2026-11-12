@@ -20,6 +20,14 @@ pub static FREERDP_EXE: OnceLock<PathBuf> = OnceLock::new();
 struct RdpSession {
     hwnd: isize,
     child: Arc<Mutex<Child>>,
+    pid: u32,
+    /// Объект задания Windows с процессом FreeRDP: через него включается/выключается
+    /// доступ к буферу обмена, а при закрытии программы FreeRDP завершается вместе с ней
+    job: isize,
+    /// Буфер обмена для этого подключения разрешён в настройках записи
+    clip: bool,
+    /// Сейчас доступ к буферу открыт
+    clip_on: bool,
     /// Последнее положение в клиентских координатах главного окна и видимость
     rect: (i32, i32, i32, i32, bool),
     /// Сеанс открыт в отдельном окне (не следует за вкладкой)
@@ -32,6 +40,8 @@ static APP: OnceLock<AppHandle> = OnceLock::new();
 #[derive(Default)]
 pub struct Rdp {
     sessions: Mutex<HashMap<u32, RdpSession>>,
+    /// Хранилище заблокировано: окна сеансов скрыты, буфер обмена закрыт
+    locked: Mutex<bool>,
 }
 
 #[cfg(windows)]
@@ -287,6 +297,87 @@ mod win {
         }
     }
 
+    /// Объект задания для процесса FreeRDP (завершить вместе с программой).
+    pub fn job_new(process: isize) -> isize {
+        use windows::Win32::System::JobObjects::*;
+        unsafe {
+            let Ok(job) = CreateJobObjectW(None, windows::core::PCWSTR::null()) else { return 0 };
+            let mut lim = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+            lim.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            let _ = SetInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                &lim as *const _ as *const _,
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            );
+            if AssignProcessToJobObject(job, windows::Win32::Foundation::HANDLE(process as _)).is_err() {
+                let _ = windows::Win32::Foundation::CloseHandle(job);
+                return 0;
+            }
+            job.0 as isize
+        }
+    }
+
+    /// Разрешить/запретить процессам задания читать и менять буфер обмена.
+    pub fn job_clip(job: isize, allow: bool) -> bool {
+        use windows::Win32::System::JobObjects::*;
+        if job == 0 {
+            return false;
+        }
+        let ui = JOBOBJECT_BASIC_UI_RESTRICTIONS {
+            UIRestrictionsClass: if allow {
+                JOB_OBJECT_UILIMIT(0)
+            } else {
+                JOB_OBJECT_UILIMIT_READCLIPBOARD | JOB_OBJECT_UILIMIT_WRITECLIPBOARD
+            },
+        };
+        unsafe {
+            SetInformationJobObject(
+                windows::Win32::Foundation::HANDLE(job as _),
+                JobObjectBasicUIRestrictions,
+                &ui as *const _ as *const _,
+                std::mem::size_of::<JOBOBJECT_BASIC_UI_RESTRICTIONS>() as u32,
+            )
+            .is_ok()
+        }
+    }
+
+    pub fn job_close(job: isize) {
+        if job != 0 {
+            unsafe {
+                let _ = windows::Win32::Foundation::CloseHandle(windows::Win32::Foundation::HANDLE(job as _));
+            }
+        }
+    }
+
+    /// Пока доступ был закрыт, FreeRDP не видел новых копирований — сообщаем ему,
+    /// что буфер изменился, чтобы сервер получил текущее содержимое.
+    pub fn nudge_clipboard(pid: u32) {
+        unsafe {
+            let msg_parent = HWND(-3isize as _); // HWND_MESSAGE
+            let mut prev: Option<HWND> = None;
+            loop {
+                let Ok(h) = FindWindowExW(Some(msg_parent), prev, w!("ClipboardHiddenMessageProcessor"), windows::core::PCWSTR::null()) else { break };
+                if h.0.is_null() {
+                    break;
+                }
+                let mut wpid = 0u32;
+                GetWindowThreadProcessId(h, Some(&mut wpid));
+                if wpid == pid {
+                    let _ = PostMessageW(Some(h), WM_CLIPBOARDUPDATE, WPARAM(0), LPARAM(0));
+                }
+                prev = Some(h);
+            }
+        }
+    }
+
+    /// Скрыть/показать окно сеанса (блокировка хранилища, открепленные окна).
+    pub fn show(hwnd: isize, visible: bool) {
+        unsafe {
+            let _ = ShowWindow(HWND(hwnd as _), if visible { SW_SHOWNA } else { SW_HIDE });
+        }
+    }
+
     pub fn destroy(hwnd: isize) {
         unsafe {
             let _ = DestroyWindow(HWND(hwnd as _));
@@ -321,9 +412,10 @@ async fn on_main<T: Send + 'static>(
     rx.await.map_err(|e| e.to_string())
 }
 
-/// auth=kerberos — оставить системный Negotiate (Kerberos → NTLM), как у mstsc.
+/// По умолчанию — системный Negotiate (Kerberos → NTLM), как у mstsc.
+/// auth=ntlm — только встроенный NTLM FreeRDP (быстрее вне домена, но слабее).
 fn use_kerberos(p: &ConnParams) -> bool {
-    p.opt("auth").eq_ignore_ascii_case("kerberos")
+    !p.opt("auth").eq_ignore_ascii_case("ntlm")
 }
 
 /// Ключи FreeRDP, которые нельзя задать через поле «freerdp» записи: они ослабляют защиту
@@ -477,9 +569,24 @@ fn build_args(p: &ConnParams, hwnd: isize, w: i32, h: i32, pin: Option<&str>) ->
     Ok(a)
 }
 
-/// Последние строки ошибок из лога FreeRDP.
-fn log_errors(path: &PathBuf) -> String {
-    let text = std::fs::read_to_string(path).unwrap_or_default();
+/// Сеанс завершён пользователем или сервером штатно — это не ошибка.
+fn normal_end(text: &str) -> bool {
+    [
+        "ERRINFO_LOGOFF_BY_USER",
+        "ERRINFO_RPC_INITIATED_DISCONNECT_BY_USER",
+        "ERRINFO_RPC_INITIATED_LOGOFF",
+        "ERRINFO_RPC_INITIATED_DISCONNECT",
+        "ERRINFO_DISCONNECTED_BY_OTHERCONNECTION",
+    ]
+    .iter()
+    .any(|c| text.contains(c))
+}
+
+/// Последние строки ошибок из вывода FreeRDP.
+fn log_errors(text: &str) -> String {
+    if normal_end(text) {
+        return String::new();
+    }
     let errs: Vec<&str> = text
         .lines()
         .filter(|l| l.contains("[ERROR]"))
@@ -573,13 +680,14 @@ async fn cert_check(app: &AppHandle, id: u32, p: &ConnParams) -> Result<Option<S
     Ok(Some(crate::rdpcert::freerdp_pin(&[&fp])))
 }
 
-pub async fn open(app: &AppHandle, id: u32, p: ConnParams, x: i32, y: i32, w: i32, h: i32) -> Result<(), String> {
+#[allow(clippy::too_many_arguments)]
+pub async fn open(app: &AppHandle, id: u32, p: ConnParams, x: i32, y: i32, w: i32, h: i32, log_enabled: bool) -> Result<(), String> {
     let pin = cert_check(app, id, &p).await?;
     let parent = main_hwnd(app)?;
     let _ = APP.set(app.clone());
     #[cfg(not(windows))]
     {
-        let _ = (parent, id, p, x, y, w, h);
+        let _ = (parent, id, p, x, y, w, h, log_enabled);
         return Err("RDP пока поддерживается только в Windows".into());
     }
     #[cfg(windows)]
@@ -592,9 +700,13 @@ pub async fn open(app: &AppHandle, id: u32, p: ConnParams, x: i32, y: i32, w: i3
         .await?;
         let args = build_args(&p, hwnd, w, h, pin.as_deref())?;
 
+        // Журнал на диск — только если включён в настройках (там адреса и логины).
+        // Без журнала вывод FreeRDP (только ошибки) держим в памяти — для сообщения об ошибке.
+        let last_log = std::env::temp_dir().join("connmgr-rdp-last.log");
         let log_path = std::env::temp_dir().join(format!("connmgr-rdp-{}-{}.log", std::process::id(), id));
-        let log = std::fs::File::create(&log_path).map_err(|e| e.to_string())?;
-        let log2 = log.try_clone().map_err(|e| e.to_string())?;
+        if !log_enabled {
+            let _ = std::fs::remove_file(&last_log);
+        }
         let exe = FREERDP_EXE.get().cloned().unwrap_or_else(|| PathBuf::from("wfreerdp.exe"));
         let mut cmd = Command::new(&exe);
         // Провайдер OpenSSL legacy (MD4) нужен для NTLM — без него не проходит
@@ -602,16 +714,20 @@ pub async fn open(app: &AppHandle, id: u32, p: ConnParams, x: i32, y: i32, w: i3
         if let Some(dir) = exe.parent().map(|d| d.join("ossl-modules")).filter(|d| d.is_dir()) {
             cmd.env("OPENSSL_MODULES", dir);
         }
-        // Этапы подключения в лог — чтобы было видно, где задержка
-        cmd.env("WLOG_LEVEL", "INFO");
+        // С журналом — этапы подключения (видно, где задержка); без — только ошибки
+        cmd.env("WLOG_LEVEL", if log_enabled { "INFO" } else { "ERROR" });
         // Встроенный NTLM FreeRDP вместо системного SSPI — без задержек на поиск KDC
         if !use_kerberos(&p) {
             cmd.env("WINPR_NATIVE_SSPI", "0");
         }
-        cmd.arg("/args-from:stdin")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::from(log))
-            .stderr(Stdio::from(log2));
+        cmd.arg("/args-from:stdin").stdin(Stdio::piped());
+        if log_enabled {
+            let log = std::fs::File::create(&log_path).map_err(|e| e.to_string())?;
+            let log2 = log.try_clone().map_err(|e| e.to_string())?;
+            cmd.stdout(Stdio::from(log)).stderr(Stdio::from(log2));
+        } else {
+            cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        }
         {
             use std::os::windows::process::CommandExt;
             cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
@@ -629,12 +745,43 @@ pub async fn open(app: &AppHandle, id: u32, p: ConnParams, x: i32, y: i32, w: i3
                 .map_err(|e| format!("Не удалось передать параметры FreeRDP: {}", e))?;
         }
         let pid = child.id();
+        let job = {
+            use std::os::windows::io::AsRawHandle;
+            win::job_new(child.as_raw_handle() as isize)
+        };
+        // Вывод FreeRDP без журнала: последние строки — в памяти
+        let mem_log: Arc<Mutex<std::collections::VecDeque<String>>> = Default::default();
+        for pipe in [
+            child.stdout.take().map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
+            child.stderr.take().map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let buf = mem_log.clone();
+            std::thread::spawn(move || {
+                use std::io::BufRead;
+                for line in std::io::BufReader::new(pipe).lines().map_while(Result::ok) {
+                    let mut b = buf.lock().unwrap();
+                    b.push_back(line);
+                    if b.len() > 200 {
+                        b.pop_front();
+                    }
+                }
+            });
+        }
+        let clip = !p.opt("clipboard").eq_ignore_ascii_case("off");
+        let locked = *app.state::<Rdp>().locked.lock().unwrap();
         let child = Arc::new(Mutex::new(child));
-        app.state::<Rdp>()
-            .sessions
-            .lock()
-            .unwrap()
-            .insert(id, RdpSession { hwnd, child: child.clone(), rect: (x, y, w, h, true), detached: false });
+        app.state::<Rdp>().sessions.lock().unwrap().insert(
+            id,
+            RdpSession { hwnd, child: child.clone(), pid, job, clip, clip_on: true, rect: (x, y, w, h, !locked), detached: false },
+        );
+        // Новая вкладка активна; если хранилище уже заблокировано — сразу скрыть
+        sync_clipboard(app);
+        if locked {
+            let _ = on_main(app, move || win::show(hwnd, false)).await;
+        }
         emit_status(app, id, "connected", "");
 
         let app2 = app.clone();
@@ -648,9 +795,20 @@ pub async fn open(app: &AppHandle, id: u32, p: ConnParams, x: i32, y: i32, w: i3
             };
             let removed = app2.state::<Rdp>().sessions.lock().unwrap().remove(&id);
             let killed = removed.is_none();
-            let errors = log_errors(&log_path);
-            // Лог последнего сеанса оставляем для диагностики
-            let _ = std::fs::rename(&log_path, std::env::temp_dir().join("connmgr-rdp-last.log"));
+            if let Some(s) = &removed {
+                win::job_close(s.job);
+            }
+            // Потоки чтения успевают дочитать вывод завершившегося процесса
+            std::thread::sleep(Duration::from_millis(150));
+            let text = if log_enabled {
+                let t = std::fs::read_to_string(&log_path).unwrap_or_default();
+                // Журнал последнего сеанса оставляем для диагностики (включён в настройках)
+                let _ = std::fs::rename(&log_path, &last_log);
+                t
+            } else {
+                mem_log.lock().unwrap().iter().cloned().collect::<Vec<_>>().join("\n")
+            };
+            let errors = log_errors(&text);
             let _ = app2.run_on_main_thread(move || win::destroy(hwnd));
             if killed || code == 0 || errors.is_empty() {
                 emit_status(&app2, id, "closed", "");
@@ -663,6 +821,8 @@ pub async fn open(app: &AppHandle, id: u32, p: ConnParams, x: i32, y: i32, w: i3
 }
 
 pub fn place(app: &AppHandle, id: u32, x: i32, y: i32, w: i32, h: i32, visible: bool) {
+    let locked = *app.state::<Rdp>().locked.lock().unwrap();
+    let visible = visible && !locked;
     let hwnd = {
         let st = app.state::<Rdp>();
         let mut g = st.sessions.lock().unwrap();
@@ -686,6 +846,58 @@ pub fn place(app: &AppHandle, id: u32, x: i32, y: i32, w: i32, h: i32, visible: 
     }
     #[cfg(not(windows))]
     let _ = (hwnd, owner, x, y, w, h, visible);
+    sync_clipboard(app);
+}
+
+/// Буфер обмена открыт только активному сеансу: видимой вкладке или открепленному окну,
+/// и только пока хранилище не заблокировано. Остальные сеансы буфер не видят и не меняют.
+fn sync_clipboard(app: &AppHandle) {
+    let locked = *app.state::<Rdp>().locked.lock().unwrap();
+    let st = app.state::<Rdp>();
+    let mut g = st.sessions.lock().unwrap();
+    for s in g.values_mut() {
+        let allow = s.clip && !locked && (s.detached || s.rect.4);
+        if allow != s.clip_on {
+            #[cfg(windows)]
+            {
+                win::job_clip(s.job, allow);
+                if allow {
+                    win::nudge_clipboard(s.pid);
+                }
+            }
+            s.clip_on = allow;
+        }
+    }
+}
+
+/// Блокировка хранилища: скрыть все окна сеансов (и открепленные), закрыть им буфер обмена.
+/// Разблокировка — вернуть как было.
+pub fn set_locked(app: &AppHandle, locked: bool) {
+    *app.state::<Rdp>().locked.lock().unwrap() = locked;
+    let all: Vec<(isize, bool, (i32, i32, i32, i32, bool))> = app
+        .state::<Rdp>()
+        .sessions
+        .lock()
+        .unwrap()
+        .values()
+        .map(|s| (s.hwnd, s.detached, s.rect))
+        .collect();
+    sync_clipboard(app);
+    let owner = main_hwnd(app).unwrap_or(0);
+    #[cfg(windows)]
+    let _ = app.run_on_main_thread(move || {
+        for (h, detached, (x, y, w, hh, v)) in all {
+            if locked {
+                win::show(h, false);
+            } else if detached {
+                win::show(h, true);
+            } else {
+                win::place(h, owner, x, y, w, hh, v);
+            }
+        }
+    });
+    #[cfg(not(windows))]
+    let _ = (all, owner);
 }
 
 /// Открепить сеанс в отдельное окно.
@@ -701,6 +913,7 @@ pub fn detach(app: &AppHandle, id: u32, title: String) -> Result<(), String> {
     let _ = app.run_on_main_thread(move || win::detach(hwnd, &title));
     #[cfg(not(windows))]
     let _ = (hwnd, title);
+    sync_clipboard(app);
     Ok(())
 }
 
@@ -734,6 +947,7 @@ fn attach_on_main(app: &AppHandle, id: u32) {
     let _ = (hwnd, owner, x, y, w, h, visible);
     use tauri::Emitter;
     let _ = app.emit("rdp-docked", id);
+    sync_clipboard(app);
 }
 
 /// Главное окно сдвинули/развернули — переставить окна сеансов.
@@ -808,6 +1022,19 @@ mod tests {
         assert!(build_args(&p, 1, 800, 600, None).is_ok());
         let a = build_args(&base, 1, 800, 600, Some("deny,fingerprint:sha256:AB")).unwrap();
         assert!(a.contains(&"/cert:deny,fingerprint:sha256:AB".to_string()));
+    }
+
+    #[test]
+    fn logoff_is_not_an_error() {
+        let logoff = "[ERROR][com.freerdp.core] - [rdp_set_error_info]: ERRINFO_LOGOFF_BY_USER [0x0001000C]";
+        assert_eq!(log_errors(logoff), "");
+        let fail = "[ERROR][com.freerdp.core] - [nla_recv_pdu]: ERRCONNECT_LOGON_FAILURE [0x00020014]";
+        assert_eq!(log_errors(fail), "Неверный логин или пароль");
+        let p = ConnParams { protocol: "rdp".into(), host: "h".into(), ..Default::default() };
+        assert!(use_kerberos(&p), "Kerberos по умолчанию");
+        let mut n = p.clone();
+        n.opts.insert("auth".into(), "ntlm".into());
+        assert!(!use_kerberos(&n));
     }
 
     #[test]

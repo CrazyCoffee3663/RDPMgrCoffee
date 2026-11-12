@@ -185,7 +185,8 @@
     }
 
     term.onData((d) => {
-      if (tab.sessionId !== null && tab.state === "connected") api.input(tab.sessionId, d);
+      // Пока хранилище заблокировано, ввод в терминалы не идёт
+      if (tab.sessionId !== null && tab.state === "connected" && app.phase === "unlocked") api.input(tab.sessionId, d);
       else if ((tab.state === "closed" || tab.state === "error") && d === "\r") app.reconnect(tab.key);
     });
     term.onResize(({ cols, rows }) => {

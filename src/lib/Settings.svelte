@@ -387,6 +387,16 @@
           <span>Очищать скопированный пароль через, сек <small>(0 — не очищать)</small></span>
           <input type="number" min="0" max="600" bind:value={s.clipboardClearSeconds} onchange={changed} />
         </label>
+        <label class="row">
+          <span
+            >Журнал RDP для диагностики
+            <small
+              >(этапы подключения FreeRDP в %TEMP%\connmgr-rdp-last.log — там адреса серверов и логины; включайте только
+              для поиска проблем)</small
+            ></span
+          >
+          <span><input type="checkbox" bind:checked={s.rdpLog} onchange={changed} /></span>
+        </label>
 
         <div class="sect">Синхронизация</div>
         <label class="row">

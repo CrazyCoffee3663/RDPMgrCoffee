@@ -87,15 +87,17 @@ async fn vault_local_restore(vault: State<'_, Vault>, text: String) -> CmdResult
 }
 
 #[tauri::command]
-async fn vault_unlock(vault: State<'_, Vault>, password: String) -> CmdResult<bool> {
-    vault.unlock(&password).await
+async fn vault_unlock(app: AppHandle, vault: State<'_, Vault>, password: String) -> CmdResult<bool> {
+    let r = vault.unlock(&password).await?;
+    rdp::set_locked(&app, false);
+    Ok(r)
 }
 
 #[tauri::command]
 async fn vault_lock(app: AppHandle, vault: State<'_, Vault>) -> CmdResult<()> {
     vault.lock().await;
-    // Сессии продолжают работать: пароли им уже переданы.
-    let _ = app;
+    // Сеансы продолжают работать, но скрыты за экраном блокировки и без доступа к буферу обмена
+    rdp::set_locked(&app, true);
     Ok(())
 }
 
@@ -206,6 +208,9 @@ struct OpenArgs {
     rows: u32,
     /// Область вкладки в физических пикселях (для RDP)
     rect: Option<[i32; 4]>,
+    /// Писать журнал FreeRDP на диск (настройка «Журнал RDP»)
+    #[serde(default)]
+    rdp_log: bool,
 }
 
 #[tauri::command]
@@ -236,7 +241,7 @@ async fn session_open(
     let protocol = p.protocol.clone();
     if p.protocol == "rdp" {
         let [x, y, w, h] = args.rect.unwrap_or([0, 0, 1024, 768]);
-        rdp::open(&app, id, p, x, y, w, h).await?;
+        rdp::open(&app, id, p, x, y, w, h, args.rdp_log).await?;
         Ok(Opened { id, kind: "rdp".into(), protocol, title })
     } else {
         sessions::start_term(app.clone(), id, p, args.cols.max(10), args.rows.max(5), on_data);

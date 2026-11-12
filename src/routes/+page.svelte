@@ -210,7 +210,7 @@
 
 {#if app.phase === "loading"}
   <div class="loading"></div>
-{:else if app.phase !== "unlocked"}
+{:else if app.phase !== "unlocked" && !app.tabs.length}
   <Unlock />
 {:else}
   <div class="app" class:fs={app.fullscreen}>
@@ -324,6 +324,10 @@
   {#if app.exportReq}<ExportDialog onclose={() => (app.exportReq = null)} />{/if}
   {#if app.tourOpen}<Tour onclose={() => (app.tourOpen = false)} />{/if}
   {#if app.snippetsOpen}<SnippetsPopup onclose={() => (app.snippetsOpen = false)} />{/if}
+  {#if app.phase !== "unlocked"}
+    <!-- Есть открытые сеансы: экран блокировки закрывает их, но не разрывает -->
+    <div class="lockcover"><Unlock /></div>
+  {/if}
 {/if}
 
 <Overlays />
@@ -548,5 +552,16 @@
   }
   .si.err {
     color: var(--warn);
+  }
+  .lockcover {
+    position: fixed;
+    inset: 0;
+    z-index: 1000;
+    /* Непрозрачная подложка: в некоторых темах фон полупрозрачный */
+    background: linear-gradient(var(--bg), var(--bg)), #0e1014;
+    backdrop-filter: blur(40px);
+  }
+  :global(:root[data-theme="light"]) .lockcover {
+    background: linear-gradient(var(--bg), var(--bg)), #f4f5f7;
   }
 </style>

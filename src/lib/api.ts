@@ -77,6 +77,8 @@ export type OpenArgs = {
   cols: number;
   rows: number;
   rect?: [number, number, number, number];
+  /** Писать журнал FreeRDP на диск */
+  rdpLog?: boolean;
 };
 
 export const api = {

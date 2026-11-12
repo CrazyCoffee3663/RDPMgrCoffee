@@ -80,19 +80,155 @@ fn winbox_exe(tools: &Path) -> Option<PathBuf> {
         .find(|p| p.is_file())
 }
 
+/// Разобрать и подставить аргументы. pw_clip: аргументы с %PASSWORD% не передаются
+/// (командную строку процесса видят другие программы и журналы аудита Windows) —
+/// возвращается true, если пароль надо положить в буфер обмена.
+pub fn prepare(args: &str, p: &ConnParams, pw_clip: bool) -> (Vec<String>, bool) {
+    let mut dropped = false;
+    let out = split_args(args)
+        .into_iter()
+        .filter(|a| {
+            let hide = pw_clip && a.contains("%PASSWORD%");
+            dropped |= hide;
+            !hide
+        })
+        .map(|a| expand(&a, p))
+        .collect();
+    (out, dropped && !p.password.is_empty())
+}
+
+/// Путь к программе инструмента
+pub fn resolve(tools: &Path, command: &str, p: &ConnParams) -> Result<PathBuf, String> {
+    if command.eq_ignore_ascii_case("winbox") {
+        winbox_exe(tools).ok_or_else(|| "WINBOX_MISSING".to_string())
+    } else {
+        Ok(PathBuf::from(expand(command, p)))
+    }
+}
+
+pub const PW_CLIP_SECS: u64 = 45;
+
 /// Запустить инструмент. command: путь к программе, "winbox" (встроенный) или "url" (открыть ссылку).
-pub fn run(tools: &Path, command: &str, args: &str, p: &ConnParams) -> Result<(), String> {
-    let args: Vec<String> = split_args(args).iter().map(|a| expand(a, p)).collect();
+/// Возвращает подсказку для пользователя, если пароль положен в буфер обмена.
+pub fn run(tools: &Path, command: &str, args: &str, p: &ConnParams, pw_clip: bool) -> Result<Option<String>, String> {
+    let (args, clip) = prepare(args, p, pw_clip);
     if command.eq_ignore_ascii_case("url") {
         let url = args.first().ok_or("Не указан адрес")?;
-        return open_url(url);
+        open_url(url)?;
+        return Ok(None);
     }
-    let exe = if command.eq_ignore_ascii_case("winbox") {
-        winbox_exe(tools).ok_or("WINBOX_MISSING")?
-    } else {
-        PathBuf::from(expand(command, p))
-    };
-    spawn_console(&exe, &args).map_err(|e| format!("Не удалось запустить {}: {}", exe.display(), e))
+    let exe = resolve(tools, command, p)?;
+    spawn_console(&exe, &args).map_err(|e| format!("Не удалось запустить {}: {}", exe.display(), e))?;
+    if clip {
+        crate::clip::set(&p.password, Some(PW_CLIP_SECS))?;
+        return Ok(Some(format!(
+            "Пароль скопирован — вставьте его (Ctrl+V). Буфер очистится через {} с",
+            PW_CLIP_SECS
+        )));
+    }
+    Ok(None)
+}
+
+// ---------- Запуск с выводом в окно приложения ----------
+
+/// Вывод консольных программ Windows — в OEM-кодировке (cp866 у русской Windows).
+#[derive(Default)]
+pub struct OemDecoder {
+    pending: Vec<u8>,
+}
+
+impl OemDecoder {
+    pub fn push(&mut self, b: &[u8]) -> String {
+        self.pending.extend_from_slice(b);
+        // Для UTF-8 не режем многобайтовый символ на границе чтения
+        let cut = if oem_cp() == 65001 {
+            match std::str::from_utf8(&self.pending) {
+                Ok(_) => self.pending.len(),
+                Err(e) if e.error_len().is_none() => e.valid_up_to(),
+                Err(_) => self.pending.len(),
+            }
+        } else {
+            self.pending.len()
+        };
+        let chunk: Vec<u8> = self.pending.drain(..cut).collect();
+        decode_oem(&chunk)
+    }
+    pub fn finish(&mut self) -> String {
+        let rest = std::mem::take(&mut self.pending);
+        decode_oem(&rest)
+    }
+}
+
+#[cfg(windows)]
+fn oem_cp() -> u32 {
+    unsafe { windows::Win32::Globalization::GetOEMCP() }
+}
+#[cfg(not(windows))]
+fn oem_cp() -> u32 {
+    65001
+}
+
+#[cfg(windows)]
+fn decode_oem(b: &[u8]) -> String {
+    use windows::Win32::Globalization::{MultiByteToWideChar, CP_OEMCP, MULTI_BYTE_TO_WIDE_CHAR_FLAGS};
+    if b.is_empty() {
+        return String::new();
+    }
+    let mut buf = vec![0u16; b.len() * 2 + 4];
+    let n = unsafe { MultiByteToWideChar(CP_OEMCP, MULTI_BYTE_TO_WIDE_CHAR_FLAGS(0), b, Some(&mut buf)) };
+    if n <= 0 {
+        return String::from_utf8_lossy(b).into_owned();
+    }
+    String::from_utf16_lossy(&buf[..n as usize])
+}
+#[cfg(not(windows))]
+fn decode_oem(b: &[u8]) -> String {
+    String::from_utf8_lossy(b).into_owned()
+}
+
+/// Выполнить программу без окна консоли, отдавая вывод в `out`. Остановка — через `stop`
+/// (сигнал или закрытие отправителя). Возвращает код выхода (None — остановлено).
+pub async fn exec<F: Fn(String)>(
+    exe: &Path,
+    args: &[String],
+    out: F,
+    mut stop: tokio::sync::oneshot::Receiver<()>,
+) -> Result<Option<i32>, String> {
+    use std::process::Stdio;
+    use tokio::io::AsyncReadExt;
+    let mut cmd = tokio::process::Command::new(exe);
+    cmd.args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
+    #[cfg(windows)]
+    cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    let mut child = cmd.spawn().map_err(|e| format!("Не удалось запустить {}: {}", exe.display(), e))?;
+    let mut so = child.stdout.take().ok_or("нет stdout")?;
+    let mut se = child.stderr.take().ok_or("нет stderr")?;
+    let (mut d1, mut d2) = (OemDecoder::default(), OemDecoder::default());
+    let (mut b1, mut b2) = ([0u8; 4096], [0u8; 4096]);
+    let (mut o_done, mut e_done) = (false, false);
+    while !(o_done && e_done) {
+        tokio::select! {
+            r = so.read(&mut b1), if !o_done => match r {
+                Ok(n) if n > 0 => { let s = d1.push(&b1[..n]); if !s.is_empty() { out(s) } }
+                _ => o_done = true,
+            },
+            r = se.read(&mut b2), if !e_done => match r {
+                Ok(n) if n > 0 => { let s = d2.push(&b2[..n]); if !s.is_empty() { out(s) } }
+                _ => e_done = true,
+            },
+            _ = &mut stop => {
+                let _ = child.kill().await;
+                return Ok(None);
+            }
+        }
+    }
+    for s in [d1.finish(), d2.finish()] {
+        if !s.is_empty() {
+            out(s);
+        }
+    }
+    let st = child.wait().await.map_err(|e| e.to_string())?;
+    Ok(st.code())
 }
 
 /// Склеить аргументы в командную строку Windows (правила CommandLineToArgvW).
@@ -263,9 +399,34 @@ mod tests {
         };
         assert_eq!(expand("%USER%@%HOST%:%PORT%", &p), "admin@10.0.0.1:22");
         assert_eq!(expand("%PASSWORD%", &p), "p w");
+        let (a, clip) = prepare("%ADDR% %USER% %PASSWORD%", &p, true);
+        assert_eq!(a, vec!["10.0.0.1", "admin"]);
+        assert!(clip);
+        let (a, clip) = prepare("%ADDR% %USER% %PASSWORD%", &p, false);
+        assert_eq!(a.len(), 3);
+        assert!(!clip);
         assert_eq!(
             quote_args("cmd", &["/k".into(), "ping".into(), "a b".into(), r#"x"y"#.into(), r"c:\d e\".into()]),
             r#""cmd" /k ping "a b" "x\"y" "c:\d e\\""#
         );
+    }
+}
+
+#[cfg(all(test, windows))]
+mod exec_tests {
+    use super::*;
+    #[tokio::test]
+    async fn ping_output_decoded() {
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let b = buf.clone();
+        let (_tx, rx) = tokio::sync::oneshot::channel();
+        let code = exec(Path::new("ping"), &["-n".into(), "1".into(), "127.0.0.1".into()], move |s| b.lock().unwrap().push_str(&s), rx)
+            .await
+            .unwrap();
+        let out = buf.lock().unwrap().clone();
+        eprintln!("{}", out);
+        assert_eq!(code, Some(0));
+        assert!(out.contains("127.0.0.1"));
+        assert!(!out.contains('\u{FFFD}'));
     }
 }

@@ -97,7 +97,26 @@ const H: Record<string, Handler> = {
   clipboard_get: () => "",
   serial_ports: () => ["COM1", "COM3"],
   rdp_detach: () => {},
-  tool_run: () => {},
+  tool_run: () => null,
+  tool_stop: () => {
+    toolStop?.();
+  },
+  tool_exec: ({ args, onData }) =>
+    new Promise((resolve) => {
+      let n = 0;
+      onData.onmessage(`\r\nОбмен пакетами с ${args?.host ?? "10.0.0.5"} по с 32 байтами данных:\r\n`);
+      const t = setInterval(() => {
+        onData.onmessage(`Ответ от 10.0.0.5: число байт=32 время=${1 + (n % 4)}мс TTL=127\r\n`);
+        if (++n >= 30) {
+          clearInterval(t);
+          resolve(0);
+        }
+      }, 700);
+      toolStop = () => {
+        clearInterval(t);
+        resolve(null);
+      };
+    }),
   sftp_list: ({ path }) => ({
     path: path || "/home/deploy",
     entries: [
@@ -158,6 +177,8 @@ const H: Record<string, Handler> = {
   rdp_place: () => {},
   prompt_answer: () => {},
 };
+
+let toolStop: (() => void) | null = null;
 
 export async function mockInvoke<T>(cmd: string, args: any = {}): Promise<T> {
   await new Promise((r) => setTimeout(r, 60));

@@ -282,10 +282,16 @@
     </div>
 
     <div class="status">
+      {#if app.status.local}
+      <span class="si" title="Зашифрованное хранилище на этом компьютере, без сервера">
+        <Icon name="lock" size={12} /> Локальное хранилище
+      </span>
+      {:else}
       <span class="si" class:err={!!app.syncError} title={app.syncError || "Синхронизировано"}>
         <Icon name="cloud" size={13} />
         {app.syncing ? "Синхронизация…" : app.syncError ? "Нет связи с сервером" : "Синхронизировано"}
       </span>
+      {/if}
       <span class="faint">{app.status.email}</span>
       <span class="sp"></span>
       {#if app.winboxUpdate}

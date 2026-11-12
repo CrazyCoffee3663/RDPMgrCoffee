@@ -3,6 +3,7 @@
   import { app } from "./state.svelte";
   import Icon from "./Icon.svelte";
   import WindowControls from "./WindowControls.svelte";
+  import { dialogs } from "./dialogs.svelte";
 
   const PROVIDER_NAMES: Record<number, string> = {
     0: "Приложение-аутентификатор",
@@ -11,6 +12,10 @@
   };
 
   let step = $state<"creds" | "twoFactor" | "newDevice">("creds");
+  /** Где хранить данные: сервер Bitwarden или локальный зашифрованный файл */
+  let where = $state<"bitwarden" | "local">("bitwarden");
+  let password2 = $state("");
+  let understood = $state(false);
   let server = $state(app.status.server || "");
   let email = $state(app.status.email || "");
   let password = $state("");
@@ -71,12 +76,50 @@
       password = "";
       await app.afterUnlock(hasCache);
     });
-  const switchAccount = () =>
-    run(async () => {
+  async function switchAccount() {
+    if (
+      app.status.local &&
+      !(await dialogs.confirm(
+        "Сменить хранилище?",
+        "Файлы локального хранилища будут перенесены в папку резервной копии рядом с ним (ничего не удаляется). Вернуть их можно, восстановив из резервной копии.",
+        "Сменить",
+        true,
+      ))
+    )
+      return;
+    await run(async () => {
       await app.logout();
       step = "creds";
       password = "";
     });
+  }
+
+  const createLocal = () =>
+    run(async () => {
+      if (password !== password2) throw "Пароли не совпадают";
+      await api.createLocal(password);
+      password = "";
+      password2 = "";
+      await app.afterUnlock(true);
+    });
+
+  async function restore(e: Event) {
+    const f = (e.currentTarget as HTMLInputElement).files?.[0];
+    (e.currentTarget as HTMLInputElement).value = "";
+    if (!f) return;
+    await run(async () => {
+      await api.localRestore(await f.text());
+      app.status = await api.status();
+      app.phase = "locked";
+    });
+  }
+  const pwScore = $derived(
+    (password.length >= 12 ? 1 : 0) +
+      (password.length >= 16 ? 1 : 0) +
+      (/[a-zа-я]/.test(password) && /[A-ZА-Я]/.test(password) ? 1 : 0) +
+      (/\d/.test(password) ? 1 : 0) +
+      (/[^\p{L}\d]/u.test(password) ? 1 : 0),
+  );
 </script>
 
 <div class="titlebar" data-tauri-drag-region>
@@ -89,16 +132,22 @@
       <div class="mark"><Icon name="plug" size={22} /></div>
       <div>
         <div class="title">RDPMgrCoffee</div>
-        <div class="muted small">Менеджер подключений с хранилищем Bitwarden</div>
+        <div class="muted small">Менеджер подключений с зашифрованным хранилищем</div>
       </div>
     </div>
 
     {#if app.phase === "locked"}
       <form onsubmit={(e) => (e.preventDefault(), unlock())}>
         <div class="who">
-          <Icon name="user" size={14} />
-          <span class="selectable">{app.status.email}</span>
-          <span class="faint">· {app.status.server.replace(/^https?:\/\//, "")}</span>
+          {#if app.status.local}
+            <Icon name="lock" size={14} />
+            <span>Локальное хранилище</span>
+            <span class="faint">· этот компьютер</span>
+          {:else}
+            <Icon name="user" size={14} />
+            <span class="selectable">{app.status.email}</span>
+            <span class="faint">· {app.status.server.replace(/^https?:\/\//, "")}</span>
+          {/if}
         </div>
         <!-- svelte-ignore a11y_autofocus -->
         <input type="password" placeholder="Мастер-пароль" bind:value={password} disabled={busy} autofocus />
@@ -106,9 +155,53 @@
           <Icon name="unlock" size={15} />
           {busy ? "Разблокировка…" : "Разблокировать"}
         </button>
-        <button type="button" class="link" onclick={switchAccount} disabled={busy}>Сменить аккаунт или сервер</button>
+        <button type="button" class="link" onclick={switchAccount} disabled={busy}>
+          {app.status.local ? "Другое хранилище или Bitwarden" : "Сменить аккаунт или сервер"}
+        </button>
       </form>
     {:else if step === "creds"}
+      <div class="where">
+        <button class:on={where === "bitwarden"} onclick={() => ((where = "bitwarden"), (error = ""))} disabled={busy}>
+          <Icon name="cloud" size={14} /> Bitwarden / Vaultwarden
+        </button>
+        <button class:on={where === "local"} onclick={() => ((where = "local"), (error = ""))} disabled={busy}>
+          <Icon name="lock" size={14} /> Только на этом компьютере
+        </button>
+      </div>
+    {/if}
+    {#if app.phase !== "locked" && step === "creds" && where === "local"}
+      <form onsubmit={(e) => (e.preventDefault(), createLocal())}>
+        <p class="muted small">
+          Подключения и пароли хранятся в файле на этом компьютере, полностью зашифрованном (AES-256 + HMAC, ключ из
+          мастер-пароля через Argon2id). Без мастер-пароля файл прочитать нельзя.
+        </p>
+        <label>
+          <span>Мастер-пароль <small class="faint">(не короче 12 символов)</small></span>
+          <input type="password" bind:value={password} disabled={busy} autocomplete="new-password" />
+        </label>
+        <div class="meter" data-s={pwScore}><i></i></div>
+        <label>
+          <span>Повторите мастер-пароль</span>
+          <input type="password" bind:value={password2} disabled={busy} autocomplete="new-password" />
+        </label>
+        <label class="chk small">
+          <input type="checkbox" bind:checked={understood} disabled={busy} />
+          <span>Я понимаю: забытый мастер-пароль восстановить невозможно, данные будут потеряны.</span>
+        </label>
+        <button
+          class="btn primary"
+          type="submit"
+          disabled={busy || password.length < 12 || password !== password2 || !understood}
+        >
+          {busy ? "Создание…" : "Создать хранилище"}
+        </button>
+        <label class="link restore">
+          Восстановить из резервной копии (.rdpvault)…
+          <input type="file" accept=".rdpvault,.json" hidden onchange={restore} disabled={busy} />
+        </label>
+        <p class="faint small">Без синхронизации между компьютерами. Делайте резервные копии в настройках.</p>
+      </form>
+    {:else if app.phase !== "locked" && step === "creds"}
       <form onsubmit={(e) => (e.preventDefault(), login())}>
         <label>
           <span>Сервер</span>
@@ -130,7 +223,7 @@
           клиентах Bitwarden.
         </p>
       </form>
-    {:else}
+    {:else if app.phase !== "locked" && step !== "creds"}
       <form onsubmit={(e) => (e.preventDefault(), submitCode())}>
         {#if step === "twoFactor"}
           <div class="subtitle">Двухфакторная аутентификация</div>
@@ -167,6 +260,63 @@
 </div>
 
 <style>
+  .where {
+    display: flex;
+    gap: 4px;
+    padding: 3px;
+    border-radius: var(--radius);
+    background: var(--bg-sunken);
+    margin-bottom: 12px;
+  }
+  .where button {
+    flex: 1;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    padding: 6px 8px;
+    font-size: 12.5px;
+    border-radius: var(--radius-sm);
+    color: var(--text-muted);
+  }
+  .where button.on {
+    background: var(--bg-panel);
+    color: var(--text);
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.15);
+  }
+  .meter {
+    height: 4px;
+    border-radius: 2px;
+    background: var(--bg-sunken);
+    overflow: hidden;
+    margin: -4px 0 4px;
+  }
+  .meter i {
+    display: block;
+    height: 100%;
+    width: 0;
+    background: var(--danger);
+    transition: width 0.2s;
+  }
+  .meter[data-s="1"] i { width: 25%; }
+  .meter[data-s="2"] i { width: 50%; background: var(--warn); }
+  .meter[data-s="3"] i { width: 75%; background: var(--warn); }
+  .meter[data-s="4"] i,
+  .meter[data-s="5"] i { width: 100%; background: var(--ok); }
+  .chk {
+    display: flex;
+    gap: 8px;
+    align-items: flex-start;
+    flex-direction: row;
+  }
+  .chk input {
+    width: auto;
+    margin-top: 2px;
+  }
+  .restore {
+    cursor: pointer;
+    text-align: center;
+  }
   .titlebar {
     position: fixed;
     top: 0;

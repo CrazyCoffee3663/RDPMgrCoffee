@@ -179,6 +179,14 @@ pub fn stretch(master_key: &[u8; 32]) -> SymKey {
     SymKey { enc, mac }
 }
 
+/// Зашифровать ключ пользователя мастер-ключом (как в Bitwarden: растянутый ключ, EncString типа 2).
+pub fn protect_user_key(master_key: &[u8; 32], user_key: &SymKey) -> String {
+    let mut b = user_key.to_bytes();
+    let out = stretch(master_key).encrypt(&b);
+    b.zeroize();
+    out
+}
+
 /// Расшифровать защищённый ключ пользователя мастер-ключом.
 pub fn decrypt_user_key(master_key: &[u8; 32], protected: &str) -> CResult<SymKey> {
     let bytes = if protected.starts_with("0.") {

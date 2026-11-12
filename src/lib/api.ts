@@ -48,7 +48,7 @@ export type Item = {
   revision: string;
 };
 export type VaultView = { folders: Folder[]; collections: Collection[]; orgs: Org[]; items: Item[] };
-export type Status = { state: "setup" | "locked" | "unlocked"; server: string; email: string };
+export type Status = { state: "setup" | "locked" | "unlocked"; server: string; email: string; local: boolean };
 export type LoginResult = { status: "ok" | "twoFactor" | "newDevice"; providers: number[] };
 export type Secret = { password: string; totp: string; fields: Field[]; sshPrivateKey: string };
 
@@ -87,6 +87,12 @@ export const api = {
   loginNewDevice: (code: string) => invoke<LoginResult>("vault_login_new_device", { code }),
   sendEmailCode: () => invoke<void>("vault_send_email_code"),
   unlock: (password: string) => invoke<boolean>("vault_unlock", { password }),
+  /** Локальное хранилище без Bitwarden */
+  createLocal: (password: string) => invoke<void>("vault_create_local", { password }),
+  changeLocalPassword: (old: string, next: string) => invoke<void>("vault_change_local_password", { old, new: next }),
+  /** Зашифрованная резервная копия в «Загрузки»; возвращает путь */
+  localBackup: () => invoke<string>("vault_local_backup"),
+  localRestore: (text: string) => invoke<void>("vault_local_restore", { text }),
   lock: () => invoke<void>("vault_lock"),
   logout: () => invoke<void>("vault_logout"),
   sync: (force: boolean) => invoke<boolean>("vault_sync", { force }),

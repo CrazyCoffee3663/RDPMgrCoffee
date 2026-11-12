@@ -170,7 +170,7 @@ let tabSeq = 0;
 
 class AppState {
   phase = $state<"loading" | "setup" | "locked" | "unlocked">("loading");
-  status = $state<Status>({ state: "setup", server: "", email: "" });
+  status = $state<Status>({ state: "setup", server: "", email: "", local: false });
   view = $state<VaultView>({ folders: [], collections: [], orgs: [], items: [] });
   syncing = $state(false);
   syncError = $state("");

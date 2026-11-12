@@ -1,12 +1,15 @@
 <script lang="ts">
   // Обучающий тур: показывается при первом запуске, повторно — из настроек.
-  import { app } from "./state.svelte";
+  import { app, applyTheme } from "./state.svelte";
+  import { PRESETS } from "./themes";
+  import { createRootFolder, migrateToRoot, needsMigration } from "./actions";
   import Icon from "./Icon.svelte";
 
   let { onclose }: { onclose: () => void } = $props();
 
-  type Step = { icon: string; title: string; lead: string; points: [string, string][] };
-  const STEPS: Step[] = [
+  /** kind — интерактивный шаг: выбор темы или рабочей папки Bitwarden */
+  type Step = { icon: string; title: string; lead: string; points: [string, string][]; kind?: "theme" | "workspace" };
+  const ALL: Step[] = [
     {
       icon: "plug",
       title: "Добро пожаловать в RDPMgrCoffee",
@@ -17,6 +20,13 @@
       ],
     },
     {
+      icon: "edit",
+      title: "Выберите тему",
+      lead: "Оформление можно поменять в любой момент в настройках, там же — редактор своей темы.",
+      points: [],
+      kind: "theme",
+    },
+    {
       icon: "lock",
       title: "Хранилище и безопасность",
       lead: "Подключения и пароли хранятся либо в Bitwarden / Vaultwarden, либо локально — в файле на этом компьютере. В обоих случаях всё зашифровано, расшифровка — только у вас.",
@@ -25,6 +35,13 @@
         ["Пароли", "никогда не попадают в командную строку программ и в журнал буфера обмена Windows"],
         ["Буфер", "скопированный пароль стирается автоматически"],
       ],
+    },
+    {
+      icon: "folderOpen",
+      title: "Рабочая папка Bitwarden",
+      lead: "Менеджер может работать только с одной папкой хранилища: в дереве, поиске и списках будут лишь её записи, а личные логины, карты и прочее останутся в стороне. Новые записи создаются внутри неё.",
+      points: [],
+      kind: "workspace",
     },
     {
       icon: "folder",
@@ -110,6 +127,37 @@
     },
   ];
 
+  // Рабочая папка — только для Bitwarden (в локальном хранилище и так только подключения)
+  const STEPS = ALL.filter((st) => st.kind !== "workspace" || !app.status.local);
+
+  // ---- Тема ----
+  const STOCK: [string, string, string][] = [
+    ["system", "Как в системе", "linear-gradient(135deg,#f5f6f8 50%,#15171c 50%)"],
+    ["dark", "Тёмная", "#15171c"],
+    ["light", "Светлая", "#f5f6f8"],
+  ];
+  function pickTheme(id: string) {
+    app.settings.theme = id;
+    app.saveSettings();
+    applyTheme(id);
+  }
+
+  // ---- Рабочая папка ----
+  const topFolders = $derived(
+    app.view.folders.map((f) => f.name).filter((n) => !n.includes("/")).sort((a, b) => a.localeCompare(b, "ru")),
+  );
+  let rootChoice = $state(app.settings.rootFolder || "");
+  let newRoot = $state("Подключения");
+  let rootBusy = $state(false);
+  const rootTarget = $derived(rootChoice === "__new" ? newRoot.trim() : rootChoice);
+  async function applyRoot() {
+    rootBusy = true;
+    app.settings.rootFolder = rootTarget;
+    app.saveSettings();
+    if (rootTarget) await createRootFolder();
+    rootBusy = false;
+  }
+
   let i = $state(0);
   const step = $derived(STEPS[i]);
   const last = $derived(i === STEPS.length - 1);
@@ -122,6 +170,8 @@
   function onKey(e: KeyboardEvent) {
     // Enter на кнопке — это её нажатие, не листаем второй раз
     if (e.key === "Enter" && (e.target as HTMLElement)?.tagName === "BUTTON") return;
+    // Стрелки и Enter в списке выбора/поле ввода — для них, а не для листания
+    if (e.key !== "Escape" && ["INPUT", "SELECT", "TEXTAREA"].includes((e.target as HTMLElement)?.tagName)) return;
     if (e.key === "Escape") finish();
     else if (e.key === "ArrowRight" || e.key === "Enter") last ? finish() : i++;
     else if (e.key === "ArrowLeft" && i > 0) i--;
@@ -143,6 +193,47 @@
       <div class="content">
         <h2>{step.title}</h2>
         <p class="lead">{step.lead}</p>
+        {#if step.kind === "theme"}
+          <div class="themes">
+            {#each STOCK as [id, label, bg]}
+              <button class="sw" class:on={app.settings.theme === id} onclick={() => pickTheme(id)}>
+                <span class="pv" style="background:{bg}"></span>{label}
+              </button>
+            {/each}
+            {#each PRESETS as t (t.id)}
+              <button class="sw" class:on={app.settings.theme === t.id} onclick={() => pickTheme(t.id)}>
+                <span class="pv" style="background:{t.gradient ? `linear-gradient(${t.angle}deg, ${t.g1}, ${t.g2})` : t.bg}"
+                  ><i style="background:{t.panel}"></i><b style="background:{t.accent}"></b></span
+                >{t.name}
+              </button>
+            {/each}
+          </div>
+        {:else if step.kind === "workspace"}
+          <div class="ws">
+            <select bind:value={rootChoice} disabled={rootBusy}>
+              <option value="">Всё хранилище (без изоляции)</option>
+              {#each topFolders as n}<option value={n}>{n}</option>{/each}
+              <option value="__new">Создать новую папку…</option>
+            </select>
+            {#if rootChoice === "__new"}
+              <input bind:value={newRoot} placeholder="Имя папки" disabled={rootBusy} />
+            {/if}
+            <div class="wsrow">
+              <span class="faint">Сейчас: {app.settings.rootFolder || "всё хранилище"}</span>
+              <button class="btn primary" onclick={applyRoot}
+                disabled={rootBusy || rootTarget === app.settings.rootFolder || (rootChoice === "__new" && !newRoot.trim())}
+                >{rootBusy ? "Применение…" : "Применить"}</button
+              >
+            </div>
+            {#if needsMigration()}
+              <div class="wsrow">
+                <span>Вне рабочей папки подключений: <b>{needsMigration()}</b></span>
+                <button class="btn" onclick={() => migrateToRoot()}>Перенести в неё</button>
+              </div>
+            {/if}
+            <small class="faint">Можно пропустить и выбрать позже: Настройки → Рабочая папка.</small>
+          </div>
+        {/if}
         {#if step.points.length}
           <dl>
             {#each step.points as [k, v]}
@@ -261,6 +352,60 @@
   }
   .sp {
     flex: 1;
+  }
+  .themes {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(92px, 1fr));
+    gap: 8px;
+  }
+  .sw {
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+    padding: 6px;
+    font-size: 11.5px;
+    border-radius: 9px;
+    border: 1px solid var(--border);
+    color: var(--text-muted);
+  }
+  .sw.on {
+    border-color: var(--accent);
+    color: var(--text);
+    box-shadow: 0 0 0 2px var(--accent-soft);
+  }
+  .pv {
+    position: relative;
+    display: block;
+    height: 38px;
+    border-radius: 6px;
+    overflow: hidden;
+  }
+  .pv i {
+    position: absolute;
+    left: 6px;
+    top: 6px;
+    width: 45%;
+    height: 26px;
+    border-radius: 4px;
+  }
+  .pv b {
+    position: absolute;
+    right: 6px;
+    bottom: 6px;
+    width: 14px;
+    height: 6px;
+    border-radius: 3px;
+  }
+  .ws {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .wsrow {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
   }
   .dots {
     display: flex;

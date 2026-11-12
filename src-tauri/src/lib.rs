@@ -305,7 +305,19 @@ fn locate(app: &AppHandle, rel: &str) -> PathBuf {
             return clean(p);
         }
     }
-    clean(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources").join(rel))
+    // Папка исходников — только в сборке для разработки. В установленной программе такой
+    // путь (C:\R\…) мог бы создать любой пользователь и подложить свой wfreerdp.exe.
+    #[cfg(debug_assertions)]
+    {
+        clean(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources").join(rel))
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        app.path()
+            .resource_dir()
+            .map(|d| clean(d.join("resources").join(rel)))
+            .unwrap_or_else(|_| PathBuf::from(rel))
+    }
 }
 
 fn cleanup_stale_files() {

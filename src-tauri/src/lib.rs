@@ -6,6 +6,7 @@ mod net;
 mod tools;
 mod transfer;
 mod terminals;
+mod web;
 mod rdp;
 mod rdpcert;
 mod sessions;
@@ -394,6 +395,28 @@ fn idle_ms() -> u64 {
     0
 }
 
+// ---------- Веб-вкладки ----------
+
+#[tauri::command]
+fn web_open(app: AppHandle, label: String, url: String, x: f64, y: f64, w: f64, h: f64) -> Result<(), String> {
+    web::open(&app, label, url, x, y, w, h)
+}
+
+#[tauri::command]
+fn web_place(app: AppHandle, label: String, x: f64, y: f64, w: f64, h: f64, visible: bool) -> Result<(), String> {
+    web::place(&app, &label, x, y, w, h, visible)
+}
+
+#[tauri::command]
+fn web_close(app: AppHandle, label: String) {
+    web::close(&app, &label)
+}
+
+#[tauri::command]
+fn web_nav(app: AppHandle, label: String, op: String) -> Result<(), String> {
+    web::nav(&app, &label, &op)
+}
+
 // ---------- SFTP ----------
 
 #[tauri::command]
@@ -669,6 +692,10 @@ pub fn run() {
             probe_hosts,
             tool_run,
             save_download,
+            web_open,
+            web_place,
+            web_close,
+            web_nav,
             idle_ms,
             export_encrypted,
             import_encrypted,

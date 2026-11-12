@@ -108,8 +108,9 @@
       orgId: it.orgId,
       collectionIds: it.collectionIds,
       protocol: c?.protocol ?? "rdp",
-      host: c?.host ?? gm?.[1]?.replace(/^\[|\]$/g, "") ?? "",
-      port: c?.port ? String(c.port) : gm?.[2] ?? "",
+      // Веб-подключение: в поле «Адрес» — вся ссылка
+      host: c?.protocol === "web" ? c.uri : (c?.host ?? gm?.[1]?.replace(/^\[|\]$/g, "") ?? ""),
+      port: c?.protocol === "web" ? "" : c?.port ? String(c.port) : (gm?.[2] ?? ""),
       credMode: opts.credential ? "ref" : "own",
       username: it.username,
       password: null,
@@ -184,6 +185,8 @@
 
     const fields: Field[] = [];
     if (f.isConn) {
+      if (f.protocol === "web") f.opts.protocol = "web";
+      else delete f.opts.protocol;
       if (f.credMode === "ref") f.opts.credential = f.opts.credential || "";
       else delete f.opts.credential;
       for (const k of KNOWN_FIELDS) {
@@ -356,14 +359,21 @@
               <input value={opt("sercfg")} oninput={(e) => setOpt("sercfg", e.currentTarget.value)} placeholder="9600,8,n,1,N" />
             </label>
           {:else}
-            <label class="host">
-              <span>Адрес</span>
-              <input bind:value={f.host} placeholder="host.example.com или 10.0.0.5" />
-            </label>
-            <label class="port">
-              <span>Порт</span>
-              <input bind:value={f.port} placeholder={String(DEFAULT_PORTS[f.protocol] ?? "")} inputmode="numeric" />
-            </label>
+            {#if f.protocol === "web"}
+              <label class="full">
+                <span>Адрес страницы</span>
+                <input bind:value={f.host} placeholder="https://192.168.88.1 или http://camera.local/admin" />
+              </label>
+            {:else}
+              <label class="host">
+                <span>Адрес</span>
+                <input bind:value={f.host} placeholder="host.example.com или 10.0.0.5" />
+              </label>
+              <label class="port">
+                <span>Порт</span>
+                <input bind:value={f.port} placeholder={String(DEFAULT_PORTS[f.protocol] ?? "")} inputmode="numeric" />
+              </label>
+            {/if}
           {/if}
         </div>
 

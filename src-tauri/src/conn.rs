@@ -91,7 +91,7 @@ pub fn split_user(raw: &str) -> (String, String) {
     (String::new(), raw.to_string())
 }
 
-pub const PROTOCOLS: [&str; 5] = ["rdp", "ssh", "telnet", "serial", "winbox"];
+pub const PROTOCOLS: [&str; 6] = ["rdp", "ssh", "telnet", "serial", "winbox", "vnc"];
 
 fn fields_map(fields: &[FieldV]) -> HashMap<String, String> {
     fields
@@ -275,6 +275,6 @@ mod tests {
     fn quick() {
         let c = from_quick("admin@srv", "ssh").unwrap();
         assert_eq!((c.protocol.as_str(), c.username.as_str(), c.host.as_str()), ("ssh", "admin", "srv"));
-        assert!(from_quick("vnc://x", "ssh").is_err());
+        assert!(from_quick("ftp://x", "ssh").is_err());
     }
 }

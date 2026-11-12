@@ -254,6 +254,12 @@ fn session_input(sessions: State<'_, Sessions>, id: u32, data: String) {
     sessions.send(id, TermCmd::Data(data.into_bytes()));
 }
 
+/// Двоичные данные в сеанс (VNC: сообщения клиента RFB)
+#[tauri::command]
+fn session_input_bytes(sessions: State<'_, Sessions>, id: u32, data: Vec<u8>) {
+    sessions.send(id, TermCmd::Data(data));
+}
+
 #[tauri::command]
 fn session_resize(sessions: State<'_, Sessions>, id: u32, cols: u32, rows: u32) {
     sessions.send(id, TermCmd::Resize(cols, rows));
@@ -459,7 +465,11 @@ async fn tool_run(
     command: String,
     args: String,
 ) -> Result<Option<String>, String> {
-    let p = conn::from_vault(&vault, &item_id).await?;
+    let mut p = conn::from_vault(&vault, &item_id).await?;
+    // WinBox для SSH/Telnet-подключения с отметкой «Это MikroTik»: порт WinBox, а не SSH
+    if command.eq_ignore_ascii_case("winbox") && p.protocol != "winbox" {
+        p.port = p.opt("winboxport").parse().ok();
+    }
     tools::run(&tools.dir, &command, &args, &p)
 }
 
@@ -643,6 +653,7 @@ pub fn run() {
             clipboard_get,
             session_open,
             session_input,
+            session_input_bytes,
             session_resize,
             session_close,
             rdp_place,

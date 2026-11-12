@@ -75,6 +75,7 @@ async fn check(addr: String, kind: &str, timeout: Duration) -> bool {
         Ok(Ok(n)) if n > 0 => match kind {
             "rdp" => buf[0] == 0x03,
             "ssh" => buf[..n].starts_with(b"SSH-"),
+            "vnc" => buf[..n].starts_with(b"RFB "),
             "tls" => buf[0] == 0x15 || buf[0] == 0x16,
             _ => true,
         },
@@ -82,7 +83,7 @@ async fn check(addr: String, kind: &str, timeout: Duration) -> bool {
         Ok(_) => false,
         // Тишина: для протоколов, где первым говорит сервер или ответ обязателен, — недоступен;
         // для прочих (telnet, WinBox) — соединение держится, считаем доступным
-        Err(_) => !matches!(kind, "rdp" | "ssh" | "tls"),
+        Err(_) => !matches!(kind, "rdp" | "ssh" | "tls" | "vnc"),
     }
 }
 

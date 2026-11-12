@@ -20,6 +20,7 @@
   import Overlays from "$lib/Overlays.svelte";
   import ExportDialog from "$lib/ExportDialog.svelte";
   import Tour from "$lib/Tour.svelte";
+  import VncView from "$lib/VncView.svelte";
   import Icon from "$lib/Icon.svelte";
 
   let sidebar = $state<ReturnType<typeof Sidebar>>();
@@ -290,6 +291,8 @@
           {#each app.tabs as t (t.key)}
             {#if t.protocol === "rdp"}
               <RdpView tab={t} active={app.activeTab === t.key} />
+            {:else if t.protocol === "vnc"}
+              <VncView tab={t} active={app.activeTab === t.key} />
             {:else}
               <TermView tab={t} active={app.activeTab === t.key} />
             {/if}

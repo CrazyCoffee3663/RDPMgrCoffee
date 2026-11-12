@@ -22,7 +22,7 @@
     startedGen = tab.gen;
     try {
       const r = await api.open({ itemId: tab.itemId, quick: tab.quick?.address, quickProtocol: "rdp",
-        quickUsername: tab.quick?.username, quickPassword: tab.quick?.password, cols: 0, rows: 0, rect: rect() },
+        quickUsername: tab.quick?.username, quickPassword: tab.quick?.password, cols: 0, rows: 0, rect: rect(), rdpLog: app.settings.rdpLog },
         makeChannel<ArrayBuffer>());
       app.bindSession(tab.key, r.id);
       place();

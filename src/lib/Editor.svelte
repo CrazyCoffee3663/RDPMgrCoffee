@@ -460,9 +460,9 @@
             </label>
             <label>
               <span>Проверка подлинности</span>
-              <select value={opt("auth") || "ntlm"} onchange={(e) => setOpt("auth", (e.target as HTMLSelectElement).value === "ntlm" ? "" : (e.target as HTMLSelectElement).value)}>
-                <option value="ntlm">NTLM — быстрее вне домена</option>
-                <option value="kerberos">Kerberos → NTLM (как mstsc)</option>
+              <select value={opt("auth") === "ntlm" ? "ntlm" : "kerberos"} onchange={(e) => setOpt("auth", (e.target as HTMLSelectElement).value === "ntlm" ? "ntlm" : "")}>
+                <option value="kerberos">Kerberos → NTLM (как mstsc, надёжнее)</option>
+                <option value="ntlm">Только NTLM — быстрее вне домена, слабее</option>
               </select>
             </label>
             <div class="checks full">

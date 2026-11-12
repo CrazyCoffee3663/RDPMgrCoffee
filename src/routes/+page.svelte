@@ -18,6 +18,7 @@
   import ImportDialog from "$lib/ImportDialog.svelte";
   import SnippetsPopup from "$lib/SnippetsPopup.svelte";
   import Overlays from "$lib/Overlays.svelte";
+  import ExportDialog from "$lib/ExportDialog.svelte";
   import Icon from "$lib/Icon.svelte";
 
   let sidebar = $state<ReturnType<typeof Sidebar>>();
@@ -307,6 +308,7 @@
 
   {#if app.settingsOpen}<Settings onclose={() => (app.settingsOpen = false)} />{/if}
   {#if app.importOpen}<ImportDialog onclose={() => (app.importOpen = false)} />{/if}
+  {#if app.exportReq}<ExportDialog onclose={() => (app.exportReq = null)} />{/if}
   {#if app.snippetsOpen}<SnippetsPopup onclose={() => (app.snippetsOpen = false)} />{/if}
 {/if}
 

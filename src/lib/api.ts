@@ -134,6 +134,11 @@ export const api = {
     invoke<void>("sftp_op", { id, op, path, to }),
   /** Сохранить текстовый файл в «Загрузки» (без перезаписи), вернуть путь */
   saveDownload: (name: string, text: string) => invoke<string>("save_download", { name, text }),
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  exportEncrypted: (file: any, ids: string[], password: string, name: string) =>
+    invoke<string>("export_encrypted", { file, ids, password, name }),
+  /** Расшифровать файл зашифрованного экспорта — возвращает JSON с паролями */
+  importEncrypted: (text: string, password: string) => invoke<string>("import_encrypted", { text, password }),
   /** Показать файл в проводнике */
   reveal: (path: string) => (inTauri ? revealItemInDir(path) : Promise.resolve()),
   /** Возвращает подсказку, если пароль положен в буфер обмена */
@@ -153,6 +158,12 @@ export const api = {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   importMremotengFile: (path: string, password: string | null) => invoke<any>("import_mremoteng_file", { path, password }),
   mremotengDefaultFile: () => invoke<string | null>("mremoteng_default_file"),
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  importTerminals: (config: string, favorites: string, credentials: string, password: string | null) =>
+    invoke<any>("import_terminals", { config, favorites, credentials, password }),
+  terminalsDefaultDir: () => invoke<string | null>("terminals_default_dir"),
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  importTerminalsDir: (dir: string, password: string | null) => invoke<any>("import_terminals_dir", { dir, password }),
 };
 
 export function errText(e: unknown): string {
@@ -164,7 +175,7 @@ export function errText(e: unknown): string {
 export const PROTOCOLS = ["rdp", "ssh", "telnet", "serial", "winbox"] as const;
 export type Protocol = (typeof PROTOCOLS)[number];
 export const DEFAULT_PORTS: Record<Protocol, number | null> = { rdp: 3389, ssh: 22, telnet: 23, serial: null, winbox: 8291 };
-export const PROTOCOL_LABEL: Record<Protocol, string> = { rdp: "RDP", ssh: "SSH", telnet: "Telnet", serial: "COM", winbox: "WinBox" };
+export const PROTOCOL_LABEL: Record<Protocol, string> = { rdp: "RDP", ssh: "SSH", telnet: "Telnet", serial: "COM", winbox: "MikroTik" };
 /** Протоколы, которые открываются во вкладке (WinBox запускается отдельной программой) */
 export const TAB_PROTOCOLS = PROTOCOLS.filter((p) => p !== "winbox");
 

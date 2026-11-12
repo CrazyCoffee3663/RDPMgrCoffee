@@ -62,6 +62,24 @@ const H: Record<string, Handler> = {
     local
       ? { state, server: "", email: "", local: true }
       : { state, server: "https://vault.example.com", email: "admin@example.com", local: false },
+  terminals_default_dir: () => null,
+  import_terminals: ({ password }) => {
+    if (!password) throw "TERMINALS_PASSWORD";
+    return {
+      folders: [["Офис"]],
+      skipped: ["vnc01 (VNC)"],
+      conns: [
+        { path: ["Офис"], name: "dc01", protocol: "rdp", host: "10.1.0.10", port: null, username: "admin", password: "p1", domain: "CORP", notes: "", opts: {}, gateway: null },
+      ],
+    };
+  },
+  export_encrypted: ({ password }) => {
+    if (password.length < 12) throw "Пароль экспорта должен быть не короче 12 символов";
+    return "C:\Users\demo\Downloads\export.rdpexport";
+  },
+  import_encrypted: () => {
+    throw "Неверный пароль файла (или файл повреждён)";
+  },
   vault_create_local: ({ password }) => {
     if (password.length < 12) throw "Мастер-пароль должен быть не короче 12 символов";
     local = true;

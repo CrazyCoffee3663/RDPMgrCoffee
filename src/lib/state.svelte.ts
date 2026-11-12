@@ -54,7 +54,7 @@ export const DEFAULT_TOOLS: Tool[] = [
     args: `-NoProfile -Command "$ProgressPreference='SilentlyContinue'; Test-NetConnection %HOST% -Port %PORT% | Format-List"`,
     protocols: [], popup: true,
   },
-  { id: "t-winbox", name: "WinBox", command: "winbox", args: "%ADDR% %USER% %PASSWORD%", protocols: [] },
+  { id: "t-winbox", name: "WinBox", command: "winbox", args: "%ADDR% %USER% %PASSWORD%", protocols: ["winbox"] },
   { id: "t-web", name: "Веб-интерфейс", command: "url", args: "https://%HOST%", protocols: [] },
 ];
 
@@ -109,6 +109,12 @@ function migrateSettings(s: Settings): Settings {
     const def = DEFAULT_TOOLS.find((d) => d.id === t.id);
     return def && OLD_TOOL_ARGS[t.id]?.includes(t.args) ? { ...def, protocols: t.protocols } : t;
   });
+  // Версия 2: WinBox в меню — только у подключений типа MikroTik
+  const ss = s as Settings & { toolsRev?: number };
+  if ((ss.toolsRev ?? 0) < 2) {
+    ss.tools = ss.tools.map((t) => (t.id === "t-winbox" && !t.protocols.length ? { ...t, protocols: ["winbox"] } : t));
+    ss.toolsRev = 2;
+  }
   return s;
 }
 
@@ -191,6 +197,8 @@ class AppState {
   toasts = $state<Toast[]>([]);
   settingsOpen = $state(false);
   importOpen = $state(false);
+  /** Открытое окно экспорта: что выгружать */
+  exportReq = $state<{ items: Item[]; label: string; base: string } | null>(null);
   snippetsOpen = $state(false);
   /** Доступная новая версия WinBox (если установленная устарела) */
   winboxUpdate = $state<{ installed: string; latest: string } | null>(null);

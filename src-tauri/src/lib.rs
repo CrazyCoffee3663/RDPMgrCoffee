@@ -4,6 +4,8 @@ mod conn;
 mod mremoteng;
 mod net;
 mod tools;
+mod transfer;
+mod terminals;
 mod rdp;
 mod sessions;
 
@@ -331,6 +333,28 @@ fn save_download(app: AppHandle, name: String, text: String) -> Result<String, S
     Ok(path.display().to_string())
 }
 
+/// Зашифрованный экспорт с логинами и паролями в «Загрузки».
+#[tauri::command]
+async fn export_encrypted(
+    app: AppHandle,
+    vault: State<'_, Vault>,
+    file: serde_json::Value,
+    ids: Vec<String>,
+    password: String,
+    name: String,
+) -> Result<String, String> {
+    let text = transfer::export(&vault, file, ids, &password).await?;
+    save_download(app, name, text)
+}
+
+/// Расшифровать файл зашифрованного экспорта (для импорта).
+#[tauri::command]
+async fn import_encrypted(text: String, password: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || transfer::open(&text, &password))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 // ---------- SFTP ----------
 
 #[tauri::command]
@@ -478,6 +502,31 @@ fn import_mremoteng_file(path: String, password: Option<String>) -> Result<mremo
     mremoteng::parse(&xml, password.as_deref())
 }
 
+/// Разобрать файлы Terminals (тексты Terminals.config, Favorites.xml, Credentials.xml; любой может быть пустым).
+#[tauri::command]
+fn import_terminals(
+    config: String,
+    favorites: String,
+    credentials: String,
+    password: Option<String>,
+) -> Result<mremoteng::Import, String> {
+    terminals::parse(&config, &favorites, &credentials, password.as_deref())
+}
+
+/// Папка данных Terminals по умолчанию (если найдена)
+#[tauri::command]
+fn terminals_default_dir() -> Option<String> {
+    terminals::default_dir().map(|d| d.display().to_string())
+}
+
+/// Разобрать файлы Terminals из папки
+#[tauri::command]
+fn import_terminals_dir(dir: String, password: Option<String>) -> Result<mremoteng::Import, String> {
+    let d = std::path::Path::new(&dir);
+    let read = |f: &str| std::fs::read_to_string(d.join(f)).unwrap_or_default();
+    terminals::parse(&read("Terminals.config"), &read("Favorites.xml"), &read("Credentials.xml"), password.as_deref())
+}
+
 /// Разобрать confCons.xml mRemoteNG (записи создаёт интерфейс).
 #[tauri::command]
 fn import_mremoteng(xml: String, password: Option<String>) -> Result<mremoteng::Import, String> {
@@ -569,10 +618,15 @@ pub fn run() {
             prompt_answer,
             serial_ports,
             import_mremoteng,
+            import_terminals,
+            terminals_default_dir,
+            import_terminals_dir,
             mremoteng_default_file,
             probe_hosts,
             tool_run,
             save_download,
+            export_encrypted,
+            import_encrypted,
             tool_exec,
             tool_stop,
             sftp_list,

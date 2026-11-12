@@ -14,17 +14,17 @@ const NEVER = new Set(["credential", "sshkey", "jump", "gateway", "domain", "tot
 /** Поля с именами, похожими на секреты, — тоже не выгружаем */
 const SECRETISH = /pass|парол|secret|token|key|ключ|otp|pin/i;
 
-export type ExportedGw = { host: string; username: ""; password: ""; domain: string; same: boolean };
+export type ExportedGw = { host: string; username: string; password: string; domain: string; same: boolean };
 export type ExportedConn = {
   path: string[];
   name: string;
   protocol: string;
   host: string;
   port: number | null;
-  username: "";
-  password: "";
+  username: string;
+  password: string;
   domain: string;
-  notes: "";
+  notes: string;
   opts: Record<string, string>;
   gateway: ExportedGw | null;
 };
@@ -62,8 +62,9 @@ function domainOf(it: Item): string {
 }
 
 /** Собрать файл экспорта. base — путь папки, относительно которого строятся пути (её родитель) */
-export function buildExport(items: Item[], base = ""): ExportFile {
+export function buildExport(items: Item[], base = "", full = false): ExportFile & { ids: string[] } {
   const conns: ExportedConn[] = [];
+  const ids: string[] = [];
   const folders = new Set<string>();
   for (const it of items) {
     const c = parseConn(it);
@@ -92,10 +93,11 @@ export function buildExport(items: Item[], base = ""): ExportFile {
       username: "",
       password: "",
       domain: domainOf(it),
-      notes: "",
+      notes: full ? it.notes : "",
       opts,
       gateway: c.protocol === "rdp" ? gatewayOf(it) : null,
     });
+    ids.push(it.id);
   }
   return {
     format: EXPORT_FORMAT,
@@ -103,16 +105,42 @@ export function buildExport(items: Item[], base = ""): ExportFile {
     exported: new Date().toISOString(),
     folders: [...folders].sort().map((f) => f.split("/")),
     conns,
+    ids,
   };
 }
 
-/** Экспортировать записи в файл в «Загрузках» */
-export async function exportItems(items: Item[], label: string, base = "") {
-  const data = buildExport(items, base);
-  if (!data.conns.length) return app.toast("Нет подключений для экспорта", true);
+/** Открыть окно экспорта (выбор: без паролей или зашифрованный с паролями) */
+export function exportItems(items: Item[], label: string, base = "") {
+  const n = items.filter((i) => parseConn(i) && !app.gatewayIds.has(i.id)).length;
+  if (!n) return app.toast("Нет подключений для экспорта", true);
+  app.exportReq = { items, label, base };
+}
+
+export function exportFileName(label: string, encrypted: boolean) {
   const date = new Date().toISOString().slice(0, 10);
   const safe = label.replace(/[<>:"/\\|?*]+/g, "_").trim() || "подключения";
-  const name = `RDPMgrCoffee — ${safe} — ${date}.json`;
+  return `RDPMgrCoffee — ${safe} — ${date}${encrypted ? ".rdpexport" : ".json"}`;
+}
+
+/** Формат содержимого зашифрованного файла (после расшифровки) */
+export const ENCRYPTED_INNER = "rdpmgrcoffee-connections-full";
+export const ENCRYPTED_FORMAT = "rdpmgrcoffee-encrypted";
+
+/** Зашифрованный экспорт с логинами, паролями и заметками (логины и пароли подставляет Rust) */
+export async function exportEncrypted(items: Item[], label: string, base: string, password: string) {
+  const { ids, ...data } = buildExport(items, base, true);
+  const name = exportFileName(label, true);
+  const path = await api.exportEncrypted({ ...data, format: ENCRYPTED_INNER }, ids, password, name);
+  app.toast(`Экспортировано подключений: ${data.conns.length} (зашифровано паролем)`);
+  api.reveal(path).catch(() => {});
+}
+
+/** Обычный экспорт (без логинов и паролей) в файл в «Загрузках» */
+export async function exportPlain(items: Item[], label: string, base = "") {
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  const { ids, ...data } = buildExport(items, base);
+  if (!data.conns.length) return app.toast("Нет подключений для экспорта", true);
+  const name = exportFileName(label, false);
   const text = JSON.stringify(data, null, 2);
   try {
     if (inTauri) {
@@ -132,15 +160,18 @@ export async function exportItems(items: Item[], label: string, base = "") {
   }
 }
 
-/** Разобрать файл экспорта для импорта. Логины и пароли, если их кто-то дописал, отбрасываются. */
-export function parseExport(text: string): { conns: ExportedConn[]; folders: string[][]; skipped: string[] } {
+/** Разобрать файл экспорта для импорта. В обычном экспорте логины и пароли, если их кто-то
+ *  дописал, отбрасываются; secrets=true — содержимое расшифрованного файла (с паролями). */
+export function parseExport(text: string, secrets = false): { conns: ExportedConn[]; folders: string[][]; skipped: string[] } {
   let d: Partial<ExportFile>;
   try {
     d = JSON.parse(text);
   } catch {
     throw "Файл повреждён: это не JSON";
   }
-  if (d.format !== EXPORT_FORMAT || !Array.isArray(d.conns)) throw "Это не файл экспорта RDPMgrCoffee";
+  const fmt = d.format as string;
+  if (!(fmt === EXPORT_FORMAT || (secrets && fmt === ENCRYPTED_INNER)) || !Array.isArray(d.conns))
+    throw "Это не файл экспорта RDPMgrCoffee";
   const str = (v: unknown) => (typeof v === "string" ? v : "");
   const conns: ExportedConn[] = [];
   const skipped: string[] = [];
@@ -154,7 +185,7 @@ export function parseExport(text: string): { conns: ExportedConn[]; folders: str
     const opts: Record<string, string> = {};
     for (const [k, v] of Object.entries(c.opts ?? {})) {
       const n = k.trim().toLowerCase();
-      if (typeof v === "string" && !NEVER.has(n) && !(SECRETISH.test(n) && !KNOWN_FIELDS.includes(n))) opts[n] = v;
+      if (typeof v === "string" && !NEVER.has(n) && (secrets || !(SECRETISH.test(n) && !KNOWN_FIELDS.includes(n)))) opts[n] = v;
     }
     const g = c.gateway;
     conns.push({
@@ -163,12 +194,21 @@ export function parseExport(text: string): { conns: ExportedConn[]; folders: str
       protocol,
       host,
       port: typeof c.port === "number" && c.port > 0 && c.port < 65536 ? c.port : null,
-      username: "",
-      password: "",
+      username: secrets ? str(c.username) : "",
+      password: secrets ? str(c.password) : "",
       domain: str(c.domain),
-      notes: "",
+      notes: secrets ? str(c.notes) : "",
       opts,
-      gateway: g && str(g.host) ? { host: str(g.host), username: "", password: "", domain: str(g.domain), same: !!g.same } : null,
+      gateway:
+        g && str(g.host)
+          ? {
+              host: str(g.host),
+              username: secrets ? str(g.username) : "",
+              password: secrets ? str(g.password) : "",
+              domain: str(g.domain),
+              same: !!g.same,
+            }
+          : null,
     });
   }
   const folders = Array.isArray(d.folders) ? d.folders.filter(Array.isArray).map((p) => p.map(str).filter(Boolean)) : [];

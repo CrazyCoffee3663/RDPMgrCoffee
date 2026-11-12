@@ -1,7 +1,9 @@
 <script lang="ts">
   import { app, applyTheme, findTheme } from "./state.svelte";
   import { PRESETS, newThemeId, type CustomTheme } from "./themes";
-  import { createRootFolder, migrateToRoot, needsMigration, tidyGateways } from "./actions";
+  import { createRootFolder, migrateToRoot, needsMigration, tidyGateways, checkWinbox, installWinbox, newerVersion } from "./actions";
+  import { DEFAULT_TOOLS, type Tool } from "./state.svelte";
+  import { PROTOCOLS, PROTOCOL_LABEL } from "./api";
   import Icon from "./Icon.svelte";
 
   let { onclose }: { onclose: () => void } = $props();
@@ -17,6 +19,33 @@
   );
   let rootChoice = $state(s.rootFolder ? (app.view.folders.some((f) => f.name === s.rootFolder) ? s.rootFolder : "__new") : "");
   let newRoot = $state(s.rootFolder && !app.view.folders.some((f) => f.name === s.rootFolder) ? s.rootFolder : "Подключения");
+
+  // ---- Внешние инструменты и WinBox ----
+  let wb = $state<{ installed: string | null; latest: string | null; path: string } | null>(null);
+  let wbBusy = $state(false);
+  async function wbCheck() {
+    wbBusy = true;
+    wb = (await checkWinbox(true)) ?? null;
+    wbBusy = false;
+  }
+  async function wbInstall() {
+    if (!wb?.latest) return;
+    wbBusy = true;
+    if (await installWinbox(wb.latest, !!wb.installed)) await wbCheck();
+    wbBusy = false;
+  }
+  function addTool() {
+    s.tools = [...s.tools, { id: "t" + Date.now().toString(36), name: "Новый инструмент", command: "", args: "%HOST%", protocols: [] }];
+    changed();
+  }
+  function delTool(t: Tool) {
+    s.tools = s.tools.filter((x) => x.id !== t.id);
+    changed();
+  }
+  function toggleProto(t: Tool, p: string) {
+    t.protocols = t.protocols.includes(p) ? t.protocols.filter((x) => x !== p) : [...t.protocols, p];
+    changed();
+  }
 
   // ---- Темы ----
   const STOCK: [string, string, string, string, string][] = [
@@ -204,6 +233,94 @@
         <label class="row">
           <span>Ширина панели подключений</span>
           <input type="number" min="220" max="600" step="10" bind:value={s.sidebarWidth} onchange={changed} />
+        </label>
+
+        <label class="row">
+          <span>Подпись с логином у подключений</span>
+          <span><input type="checkbox" bind:checked={s.showLogin} onchange={changed} /></span>
+        </label>
+
+        <div class="sect">Индикатор доступности</div>
+        <p class="hint">
+          Точка у подключения: <b class="c-ok">зелёная</b> — подключено, <b class="c-warn">жёлтая</b> — хост отвечает,
+          <b class="c-bad">красная</b> — нет ответа. Проверка — короткая попытка TCP-соединения на порт подключения, без входа.
+        </p>
+        <label class="row">
+          <span>Проверять доступность хостов</span>
+          <span><input type="checkbox" bind:checked={s.probeEnabled} onchange={changed} /></span>
+        </label>
+        {#if s.probeEnabled}
+          <label class="row">
+            <span>Интервал проверки, мин</span>
+            <input type="number" min="0.5" max="60" step="0.5" bind:value={s.probeMinutes} onchange={changed} />
+          </label>
+          <label class="row">
+            <span>Ожидание ответа, мс</span>
+            <input type="number" min="200" max="10000" step="100" bind:value={s.probeTimeoutMs} onchange={changed} />
+          </label>
+          <label class="row">
+            <span>Проверок одновременно</span>
+            <input type="number" min="1" max="64" bind:value={s.probeParallel} onchange={changed} />
+          </label>
+          <label class="row">
+            <span>Только подключения в раскрытых папках</span>
+            <span><input type="checkbox" bind:checked={s.probeVisibleOnly} onchange={changed} /></span>
+          </label>
+          <label class="row">
+            <span>Для подключений через RD-шлюз проверять шлюз <small>(иначе не проверять)</small></span>
+            <span><input type="checkbox" bind:checked={s.probeViaGateway} onchange={changed} /></span>
+          </label>
+        {/if}
+
+        <div class="sect">Внешние инструменты</div>
+        <p class="hint">
+          Появляются в меню подключения (правый клик). Подстановки: <code>%HOST%</code> <code>%PORT%</code>
+          <code>%USER%</code> <code>%PASSWORD%</code> <code>%DOMAIN%</code> <code>%NAME%</code>. Программа:
+          путь к exe, <code>winbox</code> — встроенный WinBox, <code>url</code> — открыть ссылку в браузере.
+          <br />Пароль в командной строке виден другим программам вашего пользователя — подставляйте
+          <code>%PASSWORD%</code> только там, где это нужно.
+        </p>
+        {#each s.tools as t (t.id)}
+          <div class="tool">
+            <input class="tn" bind:value={t.name} onchange={changed} placeholder="Название" />
+            <input class="tc mono" bind:value={t.command} onchange={changed} placeholder="cmd / winbox / url / C:\путь\к.exe" />
+            <button class="icon-btn" title="Удалить" onclick={() => delTool(t)}><Icon name="trash" size={14} /></button>
+            <input class="ta mono" bind:value={t.args} onchange={changed} placeholder="Аргументы" />
+            <div class="tp">
+              {#each PROTOCOLS as p}
+                <label class="chk"
+                  ><input type="checkbox" checked={!t.protocols.length || t.protocols.includes(p)}
+                    onchange={() => (t.protocols.length ? toggleProto(t, p) : ((t.protocols = PROTOCOLS.filter((x) => x !== p)), changed()))}
+                  />{PROTOCOL_LABEL[p]}</label
+                >
+              {/each}
+            </div>
+          </div>
+        {/each}
+        <div class="row">
+          <button class="btn" onclick={() => ((s.tools = DEFAULT_TOOLS.map((x) => ({ ...x }))), changed())}>Вернуть стандартные</button>
+          <button class="btn" onclick={addTool}><Icon name="plus" size={14} /> Добавить</button>
+        </div>
+
+        <div class="sect">WinBox</div>
+        <div class="row">
+          <span>
+            {#if wb}
+              Установлен: <b>{wb.installed ?? "нет"}</b>, последняя: <b>{wb.latest ?? "не удалось узнать"}</b>
+            {:else}
+              Скачивается с download.mikrotik.com при первом запуске (с вашего согласия)
+            {/if}
+          </span>
+          <span class="btns">
+            <button class="btn" onclick={wbCheck} disabled={wbBusy}>Проверить</button>
+            {#if wb?.latest && (!wb.installed || wb.installed === "?" || newerVersion(wb.latest, wb.installed))}
+              <button class="btn primary" onclick={wbInstall} disabled={wbBusy}>{wb.installed ? "Обновить" : "Установить"}</button>
+            {/if}
+          </span>
+        </div>
+        <label class="row">
+          <span>Проверять обновления WinBox <small>(раз в сутки, установка — только после подтверждения)</small></span>
+          <span><input type="checkbox" bind:checked={s.winboxAutoCheck} onchange={changed} /></span>
         </label>
 
         <div class="sect">Безопасность</div>
@@ -399,6 +516,43 @@
   }
   .sp {
     flex: 1;
+  }
+  .c-ok {
+    color: var(--ok);
+  }
+  .c-warn {
+    color: var(--warn);
+  }
+  .c-bad {
+    color: var(--danger);
+  }
+  .tool {
+    display: grid;
+    grid-template-columns: 1fr 1.4fr auto;
+    gap: 6px;
+    padding: 8px;
+    margin-bottom: 6px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+  }
+  .ta,
+  .tp {
+    grid-column: 1 / 4;
+  }
+  .tp {
+    display: flex;
+    gap: 14px;
+    font-size: 12px;
+    color: var(--text-muted);
+  }
+  .btns {
+    display: flex;
+    gap: 6px;
+    justify-content: flex-end;
+  }
+  code {
+    font-family: var(--mono);
+    font-size: 11.5px;
   }
   .adv {
     margin-top: 14px;

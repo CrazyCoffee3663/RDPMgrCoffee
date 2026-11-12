@@ -1,5 +1,5 @@
 import { api, errText, fieldValue, parseConn, type Item, type Folder } from "./api";
-import { app, GATEWAY_FOLDER } from "./state.svelte";
+import { app, GATEWAY_FOLDER, type Tool } from "./state.svelte";
 import { dialogs, type MenuItem } from "./dialogs.svelte";
 
 export async function copyUsername(item: Item) {
@@ -56,6 +56,136 @@ export async function duplicateItem(item: Item) {
     app.upsert(created);
     app.selected = created.id;
     app.editing = created.id;
+  } catch (e) {
+    app.toast(errText(e), true);
+  }
+}
+
+// ---------- Внешние инструменты и WinBox ----------
+
+/** Сравнение версий вида 4.5 / 3.43 */
+export function newerVersion(a: string, b: string): boolean {
+  const pa = a.split(".").map(Number);
+  const pb = b.split(".").map(Number);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const x = pa[i] ?? 0;
+    const y = pb[i] ?? 0;
+    if (x !== y) return x > y;
+  }
+  return false;
+}
+
+/** Скачать и установить WinBox — только после подтверждения пользователя */
+export async function installWinbox(version: string, update: boolean): Promise<boolean> {
+  const ok = await dialogs.confirm(
+    update ? `Обновить WinBox до ${version}?` : `Установить WinBox ${version}?`,
+    `Будет скачан архив WinBox_Windows.zip (~21 МБ) с официального сайта download.mikrotik.com и распакован в папку программы.`,
+    update ? "Обновить" : "Скачать и установить",
+  );
+  if (!ok) return false;
+  app.toast(`Загрузка WinBox ${version}…`);
+  try {
+    await api.winboxInstall(version);
+    app.winboxUpdate = null;
+    app.toast(`WinBox ${version} установлен`);
+    return true;
+  } catch (e) {
+    app.toast(errText(e), true);
+    return false;
+  }
+}
+
+/** Проверка обновлений WinBox: раз в сутки (или сразу при force) */
+export async function checkWinbox(force = false) {
+  const key = "winboxChecked";
+  if (!force) {
+    if (!app.settings.winboxAutoCheck) return;
+    const last = Number(localStorage.getItem(key) ?? 0);
+    if (Date.now() - last < 24 * 3600_000) return;
+  }
+  try {
+    const st = await api.winboxStatus();
+    localStorage.setItem(key, String(Date.now()));
+    if (st.installed && st.latest && (st.installed === "?" || newerVersion(st.latest, st.installed)))
+      app.winboxUpdate = { installed: st.installed, latest: st.latest };
+    else app.winboxUpdate = null;
+    return st;
+  } catch {
+    return undefined;
+  }
+}
+
+export async function runTool(item: Item, tool: Tool) {
+  try {
+    await api.toolRun(item.id, tool.command, tool.args);
+  } catch (e) {
+    const t = errText(e);
+    if (t !== "WINBOX_MISSING") return app.toast(t, true);
+    // WinBox ещё не установлен — предложить скачать
+    const st = await api.winboxStatus().catch(() => null);
+    if (!st?.latest) return app.toast("WinBox не установлен, а сайт MikroTik недоступен", true);
+    if (await installWinbox(st.latest, false)) await runTool(item, tool);
+  }
+}
+
+// ---------- Действия над несколькими записями ----------
+
+export function multiMenu(items: Item[]): MenuItem[] {
+  const conns = items.filter((i) => parseConn(i));
+  const editable = items.filter((i) => i.edit);
+  return [
+    {
+      label: `Подключить (${conns.length})`,
+      icon: "play",
+      action: () => conns.forEach((c) => app.connect(c)),
+      disabled: !conns.length,
+    },
+    "sep",
+    { label: `Переместить в папку… (${editable.length})`, icon: "folder", action: () => moveMany(editable), disabled: !editable.length },
+    {
+      label: "В избранное",
+      icon: "star",
+      action: () => editable.filter((i) => !i.favorite).forEach((i) => toggleFavorite(i)),
+      disabled: !editable.some((i) => !i.favorite),
+    },
+    {
+      label: "Убрать из избранного",
+      icon: "star",
+      action: () => editable.filter((i) => i.favorite).forEach((i) => toggleFavorite(i)),
+      disabled: !editable.some((i) => i.favorite),
+    },
+    "sep",
+    { label: `Удалить (${editable.length})`, icon: "trash", danger: true, action: () => deleteMany(editable), disabled: !editable.length, hint: "Del" },
+  ];
+}
+
+export async function moveMany(items: Item[], folderId?: string | null) {
+  if (folderId === undefined) {
+    const opts: [string, string][] = [["__root", app.root ? `${app.root} (корень)` : "— Без папки —"]];
+    for (const { folder, rel } of app.scopedFolders) opts.push([folder.id, rel]);
+    const v = await dialogs.select("Переместить в папку", `Записей: ${items.length}`, opts, "", "Переместить");
+    if (v === null) return;
+    folderId = v === "__root" ? app.defaultFolderId() : v;
+  }
+  for (const it of items) await moveItem(it, folderId);
+}
+
+export async function deleteMany(items: Item[]) {
+  if (items.length === 1) return deleteItem(items[0]);
+  const ok = await dialogs.confirm(
+    `Удалить записи: ${items.length}?`,
+    items.slice(0, 8).map((i) => "• " + i.name).join("\n") + (items.length > 8 ? `\n… и ещё ${items.length - 8}` : "") +
+      "\n\nЗаписи уйдут в корзину Bitwarden.",
+    "Удалить",
+    true,
+  );
+  if (!ok) return;
+  try {
+    for (const it of items) {
+      await api.remove(it.id);
+      app.view.items = app.view.items.filter((i) => i.id !== it.id);
+    }
+    app.selection = [];
   } catch (e) {
     app.toast(errText(e), true);
   }
@@ -319,7 +449,7 @@ export function needsMigration(): number {
   if (!app.root) return 0;
   let n = app.outsideConnections.length;
   for (const c of app.connections) {
-    for (const k of ["credential", "gateway", "sshkey"]) {
+    for (const k of ["credential", "gateway", "sshkey", "jump"]) {
       const v = c.fields.find((f) => f.name.trim().toLowerCase() === k)?.value;
       const ref = v ? app.item(v) ?? app.view.items.find((i) => i.name === v) : undefined;
       if (ref && !app.inScope(ref)) n++;
@@ -335,7 +465,7 @@ export async function migrateToRoot() {
   const move = new Map<string, Item>(conns.map((c) => [c.id, c]));
   // Ссылки проверяем у всех подключений: и переносимых, и уже лежащих в рабочей папке
   for (const c of [...conns, ...app.connections]) {
-    for (const k of ["credential", "gateway", "sshkey"]) {
+    for (const k of ["credential", "gateway", "sshkey", "jump"]) {
       const v = c.fields.find((f) => f.name.trim().toLowerCase() === k)?.value;
       if (!v) continue;
       const ref = app.item(v) ?? app.view.items.find((i) => i.name === v);
@@ -399,5 +529,10 @@ export function itemMenu(item: Item): MenuItem[] {
     disabled: !item.edit,
   });
   m.push({ label: "Удалить", icon: "trash", danger: true, action: () => deleteItem(item), disabled: !item.edit, hint: "Del" });
+  if (conn) {
+    const tools = app.settings.tools.filter((t) => !t.protocols.length || t.protocols.includes(conn.protocol));
+    if (tools.length) m.push("sep");
+    for (const t of tools) m.push({ label: t.name, icon: t.command === "winbox" ? "cable" : t.command === "url" ? "cloud" : "terminal", action: () => runTool(item, t) });
+  }
   return m;
 }

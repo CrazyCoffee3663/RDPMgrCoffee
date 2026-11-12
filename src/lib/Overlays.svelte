@@ -83,11 +83,15 @@
 
 {#each dialogs.list as d (d.id)}
   <div class="backdrop">
-    <form class="dialog" onsubmit={(e) => (e.preventDefault(), d.resolve(d.kind === "input" ? d.value : "ok"))}>
+    <form class="dialog" onsubmit={(e) => (e.preventDefault(), d.resolve(d.kind === "confirm" ? "ok" : d.value))}>
       <div class="dh">{d.title}</div>
       {#if d.message}<div class="dm">{d.message}</div>{/if}
       {#if d.kind === "input"}
         <input bind:value={d.value} use:focusOnMount />
+      {:else if d.kind === "select"}
+        <select bind:value={d.value}>
+          {#each d.options ?? [] as [v, label]}<option value={v}>{label}</option>{/each}
+        </select>
       {/if}
       <div class="da">
         <button type="button" class="btn" onclick={() => d.resolve(null)}>Отмена</button>

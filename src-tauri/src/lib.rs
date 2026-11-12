@@ -2,6 +2,8 @@ mod bw;
 mod clip;
 mod conn;
 mod mremoteng;
+mod net;
+mod tools;
 mod rdp;
 mod sessions;
 
@@ -222,6 +224,16 @@ fn rdp_place(app: AppHandle, id: u32, x: i32, y: i32, w: i32, h: i32, visible: b
 }
 
 #[tauri::command]
+fn rdp_detach(app: AppHandle, id: u32, title: String) -> Result<(), String> {
+    rdp::detach(&app, id, title)
+}
+
+#[tauri::command]
+fn rdp_attach(app: AppHandle, id: u32) {
+    rdp::attach(&app, id);
+}
+
+#[tauri::command]
 fn prompt_answer(sessions: State<'_, Sessions>, id: u64, value: Option<String>) {
     sessions.answer(id, value);
 }
@@ -259,6 +271,91 @@ fn cleanup_stale_files() {
     }
 }
 
+
+// ---------- SFTP ----------
+
+#[tauri::command]
+async fn sftp_list(sessions: State<'_, Sessions>, id: u32, path: String) -> Result<sessions::SftpListing, String> {
+    sessions::sftp_list(&sessions, id, &path).await
+}
+
+/// Скачать файл в папку «Загрузки». Возвращает локальный путь.
+#[tauri::command]
+async fn sftp_download(app: AppHandle, sessions: State<'_, Sessions>, id: u32, path: String) -> Result<String, String> {
+    let dir = app.path().download_dir().map_err(|e| e.to_string())?;
+    let p = sessions::sftp_download(&sessions, id, &path, &dir).await?;
+    Ok(p.display().to_string())
+}
+
+/// Загрузка файла: тело запроса — содержимое, заголовки x-sid и x-path (urlencoded).
+#[tauri::command]
+async fn sftp_upload(sessions: State<'_, Sessions>, request: tauri::ipc::Request<'_>) -> Result<(), String> {
+    let tauri::ipc::InvokeBody::Raw(data) = request.body() else {
+        return Err("Ожидалось содержимое файла".into());
+    };
+    let h = |k: &str| request.headers().get(k).and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+    let id: u32 = h("x-sid").parse().map_err(|_| "Нет id сеанса")?;
+    let path = urlencoding_decode(&h("x-path"));
+    if path.is_empty() {
+        return Err("Не указан путь".into());
+    }
+    sessions::sftp_upload(&sessions, id, &path, data).await
+}
+
+fn urlencoding_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            let hex = std::str::from_utf8(&b[i + 1..i + 3]).unwrap_or("");
+            if let Ok(v) = u8::from_str_radix(hex, 16) {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+#[tauri::command]
+async fn sftp_op(sessions: State<'_, Sessions>, id: u32, op: String, path: String, to: Option<String>) -> Result<(), String> {
+    sessions::sftp_op(&sessions, id, &op, &path, to.as_deref().unwrap_or("")).await
+}
+
+/// Папка внешних инструментов (WinBox) и HTTP-клиент для их загрузки
+pub struct Tools {
+    dir: PathBuf,
+    http: reqwest::Client,
+}
+
+/// Запустить внешний инструмент для подключения (подстановки — в tools.rs).
+#[tauri::command]
+async fn tool_run(vault: State<'_, Vault>, tools: State<'_, Tools>, item_id: String, command: String, args: String) -> Result<(), String> {
+    let p = conn::from_vault(&vault, &item_id).await?;
+    tools::run(&tools.dir, &command, &args, &p)
+}
+
+#[tauri::command]
+async fn winbox_status(tools: State<'_, Tools>) -> Result<tools::WinboxStatus, String> {
+    Ok(tools::status(&tools.http, &tools.dir).await)
+}
+
+/// Установить/обновить WinBox (только после подтверждения пользователя в интерфейсе).
+#[tauri::command]
+async fn winbox_install(tools: State<'_, Tools>, version: String) -> Result<(), String> {
+    std::fs::create_dir_all(&tools.dir).map_err(|e| e.to_string())?;
+    tools::install(&tools.http, &tools.dir, &version).await
+}
+
+/// Проверка доступности хостов (индикатор в дереве).
+#[tauri::command]
+async fn probe_hosts(targets: Vec<net::Target>, timeout_ms: u64, parallel: usize) -> Vec<net::Reach> {
+    net::probe(targets, timeout_ms, parallel).await
+}
 
 /// Файл подключений mRemoteNG по умолчанию (%APPDATA%\mRemoteNG\confCons.xml), если он есть.
 #[tauri::command]
@@ -298,6 +395,14 @@ pub fn run() {
             let _ = std::fs::create_dir_all(&dir);
             *app.state::<Sessions>().known_hosts.lock().unwrap() = dir.join("known_hosts");
             app.manage(Vault::new(dir.join("vault")));
+            app.manage(Tools {
+                dir: dir.join("tools"),
+                http: reqwest::Client::builder()
+                    .user_agent("RDPMgrCoffee")
+                    .timeout(std::time::Duration::from_secs(120))
+                    .build()
+                    .unwrap_or_default(),
+            });
             cleanup_stale_files();
             Ok(())
         })
@@ -336,12 +441,31 @@ pub fn run() {
             session_resize,
             session_close,
             rdp_place,
+            rdp_detach,
+            rdp_attach,
             prompt_answer,
             serial_ports,
             import_mremoteng,
             mremoteng_default_file,
+            probe_hosts,
+            tool_run,
+            sftp_list,
+            sftp_download,
+            sftp_upload,
+            sftp_op,
+            winbox_status,
+            winbox_install,
             import_mremoteng_file
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn urldecode() {
+        assert_eq!(super::urlencoding_decode("%2Fhome%2F%D1%84%20x"), "/home/ф x");
+        assert_eq!(super::urlencoding_decode("a%2"), "a%2");
+    }
 }

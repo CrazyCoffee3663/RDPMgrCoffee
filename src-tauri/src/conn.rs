@@ -29,6 +29,8 @@ pub struct ConnParams {
     pub opts: HashMap<String, String>,
     /// Параметры RD-шлюза: адрес, логин, домен, пароль
     pub gateway: Option<(String, String, String, String)>,
+    /// Промежуточный SSH-хост (jump host)
+    pub jump: Option<Box<ConnParams>>,
 }
 
 impl ConnParams {
@@ -105,6 +107,11 @@ fn fields_map(fields: &[FieldV]) -> HashMap<String, String> {
 
 /// Собрать параметры подключения из записи хранилища.
 pub async fn from_vault(vault: &Vault, id: &str) -> Result<ConnParams, String> {
+    from_vault_depth(vault, id, 0).await
+}
+
+/// depth > 0 — это промежуточный хост: его собственный jump не раскрываем (без циклов).
+async fn from_vault_depth(vault: &Vault, id: &str, depth: u8) -> Result<ConnParams, String> {
     let cs = vault.conn_secret(id).await?;
     let uri = cs
         .item
@@ -193,7 +200,24 @@ pub async fn from_vault(vault: &Vault, id: &str) -> Result<ConnParams, String> {
         }
     }
 
+    // Промежуточный SSH-хост
+    let mut jump = None;
+    if uri.scheme == "ssh" && depth == 0 {
+        if let Some(j) = opts.get("jump").filter(|j| !j.is_empty()) {
+            let jid = vault.resolve_ref(j).await?;
+            if jid == id {
+                return Err("Подключение не может быть промежуточным хостом само для себя".into());
+            }
+            let jp = Box::pin(from_vault_depth(vault, &jid, 1)).await?;
+            if jp.protocol != "ssh" {
+                return Err(format!("Промежуточный хост «{}» должен быть SSH-подключением", jp.name));
+            }
+            jump = Some(Box::new(jp));
+        }
+    }
+
     Ok(ConnParams {
+        jump,
         name: cs.item.name.clone(),
         protocol: uri.scheme,
         host: uri.host,

@@ -19,6 +19,7 @@
   import SnippetsPopup from "$lib/SnippetsPopup.svelte";
   import Overlays from "$lib/Overlays.svelte";
   import ExportDialog from "$lib/ExportDialog.svelte";
+  import Tour from "$lib/Tour.svelte";
   import Icon from "$lib/Icon.svelte";
 
   let sidebar = $state<ReturnType<typeof Sidebar>>();
@@ -80,6 +81,18 @@
   });
   $effect(() => {
     if (app.snippetsOpen) {
+      app.pushOverlay();
+      return () => app.popOverlay();
+    }
+  });
+  $effect(() => {
+    if (app.exportReq) {
+      app.pushOverlay();
+      return () => app.popOverlay();
+    }
+  });
+  $effect(() => {
+    if (app.tourOpen) {
       app.pushOverlay();
       return () => app.popOverlay();
     }
@@ -309,6 +322,7 @@
   {#if app.settingsOpen}<Settings onclose={() => (app.settingsOpen = false)} />{/if}
   {#if app.importOpen}<ImportDialog onclose={() => (app.importOpen = false)} />{/if}
   {#if app.exportReq}<ExportDialog onclose={() => (app.exportReq = null)} />{/if}
+  {#if app.tourOpen}<Tour onclose={() => (app.tourOpen = false)} />{/if}
   {#if app.snippetsOpen}<SnippetsPopup onclose={() => (app.snippetsOpen = false)} />{/if}
 {/if}
 

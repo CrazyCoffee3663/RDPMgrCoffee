@@ -94,6 +94,8 @@ export type Settings = {
   tools: Tool[];
   /** Проверять обновления WinBox (раз в сутки) */
   winboxAutoCheck: boolean;
+  /** Обучающий тур пройден (или пропущен) */
+  tourDone: boolean;
 };
 
 /** Старые стандартные инструменты (cmd /k …) → новые, с выводом в окне приложения */
@@ -144,6 +146,7 @@ const DEFAULT_SETTINGS: Settings = {
   ],
   tools: DEFAULT_TOOLS,
   winboxAutoCheck: true,
+  tourDone: false,
 };
 
 function loadJson<T>(key: string, def: T): T {
@@ -197,6 +200,8 @@ class AppState {
   toasts = $state<Toast[]>([]);
   settingsOpen = $state(false);
   importOpen = $state(false);
+  /** Открыт обучающий тур */
+  tourOpen = $state(false);
   /** Открытое окно экспорта: что выгружать */
   exportReq = $state<{ items: Item[]; label: string; base: string } | null>(null);
   snippetsOpen = $state(false);
@@ -389,6 +394,7 @@ class AppState {
   async afterUnlock(hasCache: boolean) {
     this.status = await api.status();
     this.phase = "unlocked";
+    if (!this.settings.tourDone) this.tourOpen = true;
     if (hasCache) await this.reload();
     await this.sync(!hasCache);
   }

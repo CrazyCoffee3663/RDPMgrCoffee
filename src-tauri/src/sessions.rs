@@ -96,7 +96,7 @@ impl Sessions {
 }
 
 /// Спросить пользователя (диалог в интерфейсе). None — отмена.
-async fn ask(
+pub(crate) async fn ask(
     app: &AppHandle,
     session: u32,
     kind: &str,
@@ -402,7 +402,7 @@ async fn run_ssh(
     let h = Arc::new(ssh_login(app, id, p, out, &mut keep).await?);
     let st = app.state::<Sessions>();
     st.ssh.lock().unwrap().insert(id, h.clone());
-    let tunnels = start_tunnels(h.clone(), p.opt("tunnels"), out).await;
+    let tunnels = start_tunnels(app, id, h.clone(), p.opt("tunnels"), out).await;
 
     let res = async {
         let mut ch = h.channel_open_session().await.map_err(|e| e.to_string())?;
@@ -490,7 +490,19 @@ fn parse_tunnels(spec: &str) -> Result<Vec<Tunnel>, String> {
     Ok(out)
 }
 
-async fn start_tunnels(h: Arc<SshHandle>, spec: &str, out: &Channel<InvokeResponseBody>) -> Vec<tokio::task::JoinHandle<()>> {
+/// Адрес только для этого компьютера
+fn is_loopback(bind: &str) -> bool {
+    bind.eq_ignore_ascii_case("localhost")
+        || bind.parse::<std::net::IpAddr>().map(|ip| ip.is_loopback()).unwrap_or(false)
+}
+
+async fn start_tunnels(
+    app: &AppHandle,
+    id: u32,
+    h: Arc<SshHandle>,
+    spec: &str,
+    out: &Channel<InvokeResponseBody>,
+) -> Vec<tokio::task::JoinHandle<()>> {
     let rules = match parse_tunnels(spec) {
         Ok(r) => r,
         Err(e) => {
@@ -504,6 +516,23 @@ async fn start_tunnels(h: Arc<SshHandle>, spec: &str, out: &Channel<InvokeRespon
             Tunnel::Local { bind, lport, host, port } => (bind.clone(), *lport, format!("{}:{} → {}:{}", bind, lport, host, port)),
             Tunnel::Dynamic { bind, lport } => (bind.clone(), *lport, format!("SOCKS5 {}:{}", bind, lport)),
         };
+        // Туннель, открытый для сети, пускает других людей во внутреннюю сеть за SSH-сервером
+        // от вашего имени. Правило могли вписать в общую запись — спрашиваем каждый раз.
+        if !is_loopback(&bind) {
+            let msg = format!(
+                "Туннель «{}» будет доступен другим компьютерам сети, а не только этому.
+
+Любой, кто дотянется до порта {}, попадёт во внутреннюю сеть за SSH-сервером от вашего имени.
+
+Открыть туннель для сети?",
+                desc, lport
+            );
+            if ask(app, id, "confirm", "Туннель для всей сети", &msg, true).await.is_none() {
+                send_text(out, &format!("[33mТуннель {} не открыт (не подтверждён)[0m
+", desc));
+                continue;
+            }
+        }
         let listener = match tokio::net::TcpListener::bind((bind.as_str(), lport)).await {
             Ok(l) => l,
             Err(e) => {
@@ -655,7 +684,14 @@ pub async fn sftp_list(st: &Sessions, id: u32, path: &str) -> Result<SftpListing
 pub async fn sftp_download(st: &Sessions, id: u32, remote: &str, dir: &std::path::Path) -> Result<PathBuf, String> {
     let sftp = st.sftp(id).await?;
     let name = remote.rsplit('/').next().filter(|n| !n.is_empty()).unwrap_or("file");
-    let name: String = name.chars().map(|c| if r#"<>:"/\|?*"#.contains(c) { '_' } else { c }).collect();
+    let name: String = name.chars().map(|c| if r#"<>:"/\|?*"#.contains(c) || c.is_control() { '_' } else { c }).collect();
+    // Имя приходит с сервера: «.», «..», зарезервированные имена Windows (CON, NUL, COM1…)
+    // и точки/пробелы в конце недопустимы
+    let name = name.trim_end_matches(['.', ' ']).to_string();
+    let stem_up = name.split('.').next().unwrap_or("").to_ascii_uppercase();
+    let reserved = ["CON", "PRN", "AUX", "NUL"].contains(&stem_up.as_str())
+        || ((stem_up.starts_with("COM") || stem_up.starts_with("LPT")) && stem_up.len() == 4 && stem_up.as_bytes()[3].is_ascii_digit());
+    let name = if name.is_empty() { "file".to_string() } else if reserved { format!("_{}", name) } else { name };
     let mut local = dir.join(&name);
     let (stem, ext) = match name.rsplit_once('.') {
         Some((s, e)) if !s.is_empty() => (s.to_string(), format!(".{}", e)),
@@ -829,6 +865,8 @@ async fn run_telnet(
     .map_err(|e| format!("Не удалось подключиться: {}", e))?;
     let _ = stream.set_nodelay(true);
     let (mut rd, mut wr) = stream.into_split();
+    send_text(out, "[33mВнимание: Telnet не шифрует соединение — логин, пароль и всё, что вы вводите, видны в сети.[0m
+");
     emit_status(app, id, "connected", "");
 
     let mut parser = TelnetParser::new();

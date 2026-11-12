@@ -383,12 +383,17 @@ impl Vault {
         self.write_file("account.json", serde_json::to_string_pretty(a).unwrap().as_bytes())
     }
 
-    fn save_cache(&self, sync: &Value) {
+    /// Сохранить кеш/хранилище и его контрольную сумму (HMAC ключом пользователя):
+    /// зашифрованные поля можно переставить между записями (адрес одной — пароль другой),
+    /// контрольная сумма всего файла не даёт сделать это незаметно.
+    fn save_cache(&self, sync: &Value, key: &SymKey) {
         if let Ok(t) = serde_json::to_vec(sync) {
             // У локального хранилища этот файл — единственная копия: держим предыдущую версию
             if self.dir.join("local.flag").exists() {
                 let _ = std::fs::copy(self.dir.join("cache.json"), self.dir.join("cache.json.bak"));
+                let _ = std::fs::copy(self.dir.join("cache.mac"), self.dir.join("cache.mac.bak"));
             }
+            let _ = self.write_file("cache.mac", crypto::file_mac(key, &t).as_bytes());
             let _ = self.write_file("cache.json", &t);
         }
     }
@@ -401,7 +406,7 @@ impl Vault {
     fn stash_local(&self) -> VResult<PathBuf> {
         let dir = self.dir.join(format!("local-backup-{}", now_ms()));
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-        for f in ["account.json", "cache.json", "cache.json.bak", "local.flag"] {
+        for f in ["account.json", "cache.json", "cache.json.bak", "cache.mac", "cache.mac.bak", "local.flag"] {
             let p = self.dir.join(f);
             if p.exists() {
                 std::fs::rename(&p, dir.join(f)).map_err(|e| format!("Не удалось сохранить {}: {}", f, e))?;
@@ -459,7 +464,7 @@ impl Vault {
         let _ = std::fs::remove_file(self.dir.join("cache.json"));
         self.write_file("local.flag", b"1")?;
         self.save_account(&account)?;
-        self.save_cache(&sync);
+        self.save_cache(&sync, &user_key);
         let mut g = self.inner.lock().await;
         g.account = Some(account);
         g.unlocked = Some(Unlocked {
@@ -514,12 +519,14 @@ impl Vault {
         let g = self.inner.lock().await;
         let a = g.account.clone().filter(|a| a.local).ok_or("Это не локальное хранилище")?;
         let u = g.unlocked.as_ref().ok_or("Хранилище заблокировано")?;
+        let data = serde_json::to_vec(&u.sync).unwrap();
         Ok(serde_json::to_string_pretty(&json!({
             "format": "rdpmgrcoffee-vault",
             "version": 1,
             "created": now_iso(),
             "account": a,
             "data": u.sync,
+            "mac": crypto::file_mac(&u.user_key, &data),
         }))
         .unwrap())
     }
@@ -546,6 +553,8 @@ impl Vault {
         }
         let _ = std::fs::remove_file(self.dir.join("cache.json"));
         self.write_file("local.flag", b"1")?;
+        let mac = v["mac"].as_str().ok_or("В резервной копии нет контрольной суммы — она создана старой версией программы")?;
+        self.write_file("cache.mac", mac.as_bytes())?;
         self.write_file("cache.json", &serde_json::to_vec(&v["data"]).unwrap())?;
         self.save_account(&account)?;
         let mut g = self.inner.lock().await;
@@ -597,9 +606,21 @@ impl Vault {
         self.store_cipher(c).await
     }
 
-    fn load_cache(&self) -> Option<Value> {
-        let t = std::fs::read(self.dir.join("cache.json")).ok()?;
-        serde_json::from_slice(&t).ok()
+    /// Загрузить кеш с проверкой контрольной суммы. Кеш Bitwarden без суммы или с неверной
+    /// суммой отбрасывается (данные заново придут с сервера); локальное хранилище — ошибка.
+    fn load_cache(&self, key: &SymKey, local: bool) -> VResult<Option<Value>> {
+        let Ok(t) = std::fs::read(self.dir.join("cache.json")) else { return Ok(None) };
+        let mac = std::fs::read_to_string(self.dir.join("cache.mac")).unwrap_or_default();
+        if !crypto::file_mac_ok(key, &t, &mac) {
+            if local {
+                return Err(format!(
+                    "Файл хранилища изменён вне программы или повреждён ({}) — данные не загружены. Восстановите хранилище из резервной копии.",
+                    self.dir.join("cache.json").display()
+                ));
+            }
+            return Ok(None);
+        }
+        Ok(serde_json::from_slice(&t).ok())
     }
 
     pub async fn status(&self) -> Status {
@@ -909,7 +930,7 @@ impl Vault {
             .refresh_token
             .as_deref()
             .and_then(|t| user_key.decrypt_str(t).ok());
-        let cache = self.load_cache();
+        let cache = self.load_cache(&user_key, account.local)?;
         let has_cache = cache.is_some();
         if account.local && !has_cache {
             return Err(format!(
@@ -1090,10 +1111,10 @@ impl Vault {
         if !data["ciphers"].is_array() {
             return Err("Сервер вернул неожиданный ответ на синхронизацию".into());
         }
-        self.save_cache(&data);
         let mut g = self.inner.lock().await;
         let g = &mut *g;
         if let Some(u) = g.unlocked.as_mut() {
+            self.save_cache(&data, &u.user_key);
             u.sync = data;
             compute_org_keys(u);
         }
@@ -1269,7 +1290,7 @@ impl Vault {
             if let Some(arr) = u.sync["ciphers"].as_array_mut() {
                 arr.retain(|c| c["id"].as_str() != Some(id));
             }
-            self.save_cache(&u.sync);
+            self.save_cache(&u.sync, &u.user_key);
         }
         Ok(())
     }
@@ -1286,7 +1307,7 @@ impl Vault {
             Some(c) => *c = resp.clone(),
             None => arr.push(resp.clone()),
         }
-        self.save_cache(&u.sync);
+        self.save_cache(&u.sync, &u.user_key);
         decrypt_item(u, &resp).ok_or_else(|| "Не удалось расшифровать сохранённую запись".into())
     }
 
@@ -1327,7 +1348,7 @@ impl Vault {
             Some(f) => *f = resp,
             None => arr.push(resp),
         }
-        self.save_cache(&u.sync);
+        self.save_cache(&u.sync, &u.user_key);
         Ok(FolderV { id: fid, name: name.to_string() })
     }
 
@@ -1349,7 +1370,7 @@ impl Vault {
                     }
                 }
             }
-            self.save_cache(&u.sync);
+            self.save_cache(&u.sync, &u.user_key);
         }
         Ok(())
     }
@@ -1799,6 +1820,14 @@ mod local_tests {
         v.delete_item(&view.items[0].id).await.unwrap();
         v.delete_folder(&f.id).await.unwrap();
         assert!(v.view().await.unwrap().items.is_empty());
+
+        // Подмена файла хранилища вне программы обнаруживается
+        v.save_folder(None, "ещё").await.unwrap();
+        v.lock().await;
+        let mut t = std::fs::read_to_string(dir.join("cache.json")).unwrap();
+        t = t.replacen("\"folders\"", "\"folders\" ", 1);
+        std::fs::write(dir.join("cache.json"), t).unwrap();
+        assert!(v.unlock("new strong password").await.unwrap_err().contains("изменён"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

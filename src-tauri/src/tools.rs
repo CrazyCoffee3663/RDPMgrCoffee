@@ -100,9 +100,116 @@ pub fn prepare(args: &str, p: &ConnParams) -> (Vec<String>, bool) {
 /// Путь к программе инструмента
 pub fn resolve(tools: &Path, command: &str, p: &ConnParams) -> Result<PathBuf, String> {
     if command.eq_ignore_ascii_case("winbox") {
-        winbox_exe(tools).ok_or_else(|| "WINBOX_MISSING".to_string())
+        let exe = winbox_exe(tools).ok_or_else(|| "WINBOX_MISSING".to_string())?;
+        verify_winbox(&exe)?;
+        Ok(exe)
     } else {
-        Ok(PathBuf::from(expand(command, p)))
+        find_exe(&expand(command, p))
+    }
+}
+
+/// Найти программу по имени. Windows при запуске по одному имени сначала ищет в текущей
+/// папке — подложенный туда ping.exe запустился бы вместо системного. Поэтому ищем сами:
+/// System32, папка Windows, затем только абсолютные пути из PATH.
+pub fn find_exe(cmd: &str) -> Result<PathBuf, String> {
+    let cmd = cmd.trim().trim_matches('"');
+    if cmd.is_empty() {
+        return Err("Не указана программа".into());
+    }
+    let p = Path::new(cmd);
+    if p.is_absolute() {
+        return Ok(p.to_path_buf());
+    }
+    if cmd.contains(['\\', '/']) {
+        return Err(format!("Укажите полный путь к программе: «{}»", cmd));
+    }
+    let name = if p.extension().is_some() { cmd.to_string() } else { format!("{}.exe", cmd) };
+    let mut dirs: Vec<PathBuf> = vec![];
+    if let Some(root) = std::env::var_os("SystemRoot") {
+        let root = PathBuf::from(root);
+        dirs.push(root.join("System32"));
+        dirs.push(root.clone());
+        dirs.push(root.join("System32").join("WindowsPowerShell").join("v1.0"));
+    }
+    if let Some(path) = std::env::var_os("PATH") {
+        dirs.extend(std::env::split_paths(&path).filter(|d| d.is_absolute()));
+    }
+    dirs.into_iter()
+        .map(|d| d.join(&name))
+        .find(|f| f.is_file())
+        .ok_or_else(|| format!("Программа «{}» не найдена", cmd))
+}
+
+/// WinBox запускается, только если он подписан MikroTik (SIA «Mikrotīkls») и подпись верна.
+#[cfg(windows)]
+pub fn verify_winbox(exe: &Path) -> Result<(), String> {
+    let signer = authenticode_signer(exe)
+        .map_err(|e| format!("WinBox не прошёл проверку подписи ({}): {}. Переустановите его в настройках.", exe.display(), e))?;
+    if !signer.to_lowercase().contains("mikrot") {
+        return Err(format!("WinBox подписан не MikroTik, а «{}» — запуск отменён", signer));
+    }
+    Ok(())
+}
+#[cfg(not(windows))]
+pub fn verify_winbox(_: &Path) -> Result<(), String> {
+    Ok(())
+}
+
+/// Проверить цифровую подпись файла (Authenticode) и вернуть имя подписавшего.
+#[cfg(windows)]
+pub fn authenticode_signer(file: &Path) -> Result<String, String> {
+    use windows::core::{GUID, PCWSTR, PWSTR};
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::Security::Cryptography::{CertGetNameStringW, CERT_NAME_SIMPLE_DISPLAY_TYPE};
+    use windows::Win32::Security::WinTrust::*;
+    let path: Vec<u16> = file.as_os_str().encode_wide_z();
+    let mut fi = WINTRUST_FILE_INFO {
+        cbStruct: std::mem::size_of::<WINTRUST_FILE_INFO>() as u32,
+        pcwszFilePath: PCWSTR(path.as_ptr()),
+        ..Default::default()
+    };
+    let mut wd = WINTRUST_DATA {
+        cbStruct: std::mem::size_of::<WINTRUST_DATA>() as u32,
+        dwUIChoice: WTD_UI_NONE,
+        fdwRevocationChecks: WTD_REVOKE_NONE,
+        dwUnionChoice: WTD_CHOICE_FILE,
+        Anonymous: WINTRUST_DATA_0 { pFile: &mut fi },
+        dwStateAction: WTD_STATEACTION_VERIFY,
+        ..Default::default()
+    };
+    let mut action: GUID = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+    let st = unsafe { WinVerifyTrust(HWND(std::ptr::null_mut()), &mut action, &mut wd as *mut _ as *mut _) };
+    let result = (|| {
+        if st != 0 {
+            return Err(format!("подпись недействительна (код 0x{:08X})", st as u32));
+        }
+        unsafe {
+            let prov = WTHelperProvDataFromStateData(wd.hWVTStateData);
+            let signer = WTHelperGetProvSignerFromChain(prov, 0, false, 0);
+            if signer.is_null() || (*signer).pasCertChain.is_null() {
+                return Err("нет данных о подписавшем".to_string());
+            }
+            let cert = (*(*signer).pasCertChain).pCert;
+            let mut buf = [0u16; 256];
+            let n = CertGetNameStringW(cert, CERT_NAME_SIMPLE_DISPLAY_TYPE, 0, None, Some(&mut buf));
+            Ok(String::from_utf16_lossy(&buf[..(n as usize).saturating_sub(1)]))
+        }
+    })();
+    wd.dwStateAction = WTD_STATEACTION_CLOSE;
+    unsafe {
+        let _ = WinVerifyTrust(HWND(std::ptr::null_mut()), &mut action, &mut wd as *mut _ as *mut _);
+    }
+    let _ = PWSTR::null();
+    result
+}
+
+trait WideZ {
+    fn encode_wide_z(&self) -> Vec<u16>;
+}
+impl WideZ for std::ffi::OsStr {
+    fn encode_wide_z(&self) -> Vec<u16> {
+        use std::os::windows::ffi::OsStrExt;
+        self.encode_wide().chain(std::iter::once(0)).collect()
     }
 }
 
@@ -374,6 +481,20 @@ pub async fn install(http: &reqwest::Client, tools: &Path, version: &str) -> Res
         }
     }
     std::fs::write(tmp.join("version.txt"), version).map_err(|e| e.to_string())?;
+    // Скачанный WinBox должен быть подписан MikroTik — иначе не устанавливаем
+    let new_exe = ["WinBox.exe", "winbox64.exe", "winbox.exe"].iter().map(|n| tmp.join(n)).find(|p| p.is_file());
+    match new_exe {
+        Some(e) => {
+            if let Err(err) = verify_winbox(&e) {
+                let _ = std::fs::remove_dir_all(&tmp);
+                return Err(err);
+            }
+        }
+        None => {
+            let _ = std::fs::remove_dir_all(&tmp);
+            return Err("В архиве не найден WinBox.exe".into());
+        }
+    }
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::rename(&tmp, &dir).map_err(|e| format!("Не удалось заменить WinBox (он запущен?): {}", e))?;
     if winbox_exe(tools).is_none() {
@@ -427,5 +548,36 @@ mod exec_tests {
         assert_eq!(code, Some(0));
         assert!(out.contains("127.0.0.1"));
         assert!(!out.contains('\u{FFFD}'));
+    }
+}
+
+#[cfg(all(test, windows))]
+mod trust_tests {
+    use super::*;
+
+    #[test]
+    fn find_exe_never_uses_current_dir() {
+        let p = find_exe("ping").unwrap();
+        assert!(p.to_string_lossy().to_lowercase().contains("system32"), "{}", p.display());
+        assert!(find_exe(r".\ping.exe").is_err());
+        assert!(find_exe("no-such-program-xyz").is_err());
+    }
+
+    #[test]
+    fn unsigned_file_rejected() {
+        let f = std::env::temp_dir().join(format!("unsigned-{}.exe", std::process::id()));
+        std::fs::write(&f, b"MZ not really").unwrap();
+        assert!(verify_winbox(&f).is_err());
+        let _ = std::fs::remove_file(&f);
+    }
+
+    /// Установленный WinBox: cargo test winbox_signed -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn winbox_signed() {
+        let f = std::path::PathBuf::from(std::env::var("APPDATA").unwrap()).join(r"io.github.connmgr\tools\winbox\WinBox.exe");
+        let s = authenticode_signer(&f).unwrap();
+        eprintln!("signer: {}", s);
+        verify_winbox(&f).unwrap();
     }
 }

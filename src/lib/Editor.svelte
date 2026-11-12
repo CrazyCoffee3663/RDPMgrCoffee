@@ -454,8 +454,8 @@
             <label>
               <span>Сертификат</span>
               <select value={opt("cert") || "tofu"} onchange={(e) => setOpt("cert", (e.target as HTMLSelectElement).value === "tofu" ? "" : (e.target as HTMLSelectElement).value)}>
-                <option value="tofu">Запомнить при первом входе</option>
-                <option value="ignore">Не проверять</option>
+                <option value="tofu">Проверять отпечаток (спросить при первом входе)</option>
+                <option value="ignore">Не проверять — небезопасно</option>
               </select>
             </label>
             <label>

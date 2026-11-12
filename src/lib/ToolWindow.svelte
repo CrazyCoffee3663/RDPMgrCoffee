@@ -38,7 +38,7 @@
     const ch = makeChannel<string>();
     ch.onmessage = (s) => append(s);
     try {
-      const code = await api.toolExec(itemId, cmd, args, app.settings.toolPasswordClipboard, ch);
+      const code = await api.toolExec(itemId, cmd, args, ch);
       status = code === null ? "Остановлено" : code === 0 ? "Завершено" : `Завершено с кодом ${code}`;
     } catch (e) {
       const t = errText(e);

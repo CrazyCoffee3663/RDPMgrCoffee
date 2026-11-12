@@ -24,23 +24,43 @@ mod win {
         Err("Буфер обмена занят другой программой".into())
     }
 
-    pub fn set(text: &str) -> Result<(), String> {
+    /// Положить блок данных в буфер (буфер уже открыт).
+    unsafe fn put(format: u32, data: &[u8]) -> Result<(), String> {
+        let h = GlobalAlloc(GMEM_MOVEABLE, data.len().max(1)).map_err(|e| e.to_string())?;
+        let p = GlobalLock(h) as *mut u8;
+        std::ptr::copy_nonoverlapping(data.as_ptr(), p, data.len());
+        let _ = GlobalUnlock(h);
+        SetClipboardData(format, Some(HANDLE(h.0))).map(|_| ()).map_err(|e| e.to_string())
+    }
+
+    fn format(name: &str) -> u32 {
+        let w: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+        unsafe { RegisterClipboardFormatW(windows::core::PCWSTR(w.as_ptr())) }
+    }
+
+    /// secret: пометки Windows, чтобы значение не попало в журнал буфера (Win+V),
+    /// облачный буфер обмена и программы-менеджеры буфера.
+    pub fn set(text: &str, secret: bool) -> Result<(), String> {
         let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+        let bytes: Vec<u8> = wide.iter().flat_map(|c| c.to_le_bytes()).collect();
         open()?;
         let r = unsafe {
             let _ = EmptyClipboard();
-            let bytes = wide.len() * 2;
-            match GlobalAlloc(GMEM_MOVEABLE, bytes) {
-                Ok(h) => {
-                    let p = GlobalLock(h) as *mut u16;
-                    std::ptr::copy_nonoverlapping(wide.as_ptr(), p, wide.len());
-                    let _ = GlobalUnlock(h);
-                    SetClipboardData(CF_UNICODETEXT.0 as u32, Some(HANDLE(h.0)))
-                        .map(|_| ())
-                        .map_err(|e| e.to_string())
+            let mut r = Ok(());
+            if secret {
+                let zero = 0u32.to_le_bytes();
+                for (name, data) in [
+                    ("ExcludeClipboardContentFromMonitorProcessing", &zero[..]),
+                    ("CanIncludeInClipboardHistory", &zero[..]),
+                    ("CanUploadToCloudClipboard", &zero[..]),
+                ] {
+                    let f = format(name);
+                    if f != 0 {
+                        r = r.and(put(f, data));
+                    }
                 }
-                Err(e) => Err(e.to_string()),
             }
+            r.and(put(CF_UNICODETEXT.0 as u32, &bytes))
         };
         unsafe {
             let _ = CloseClipboard();
@@ -77,10 +97,10 @@ mod win {
     }
 }
 
-pub fn set(text: &str, clear_after: Option<u64>) -> Result<(), String> {
+pub fn set(text: &str, clear_after: Option<u64>, secret: bool) -> Result<(), String> {
     #[cfg(windows)]
     {
-        win::set(text)?;
+        win::set(text, secret)?;
         let gen = GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
         if let Some(secs) = clear_after.filter(|s| *s > 0) {
             let copied = text.to_string();
@@ -89,7 +109,7 @@ pub fn set(text: &str, clear_after: Option<u64>) -> Result<(), String> {
                 if GENERATION.load(Ordering::SeqCst) == gen
                     && win::get().map(|t| t == copied).unwrap_or(false)
                 {
-                    let _ = win::set("");
+                    let _ = win::set("", false);
                 }
             });
         }
@@ -97,7 +117,7 @@ pub fn set(text: &str, clear_after: Option<u64>) -> Result<(), String> {
     }
     #[cfg(not(windows))]
     {
-        let _ = (text, clear_after);
+        let _ = (text, clear_after, secret);
         Err("Буфер обмена пока поддерживается только в Windows".into())
     }
 }
@@ -110,5 +130,28 @@ pub fn get() -> Result<String, String> {
     #[cfg(not(windows))]
     {
         Err("Буфер обмена пока поддерживается только в Windows".into())
+    }
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use windows::Win32::System::DataExchange::{IsClipboardFormatAvailable, RegisterClipboardFormatW};
+
+    fn has(name: &str) -> bool {
+        let w: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+        unsafe { IsClipboardFormatAvailable(RegisterClipboardFormatW(windows::core::PCWSTR(w.as_ptr()))).is_ok() }
+    }
+
+    /// Трогает буфер обмена (прежний текст возвращается): cargo test secret_flags -- --ignored
+    #[test]
+    #[ignore]
+    fn secret_flags() {
+        let old = super::get().unwrap_or_default();
+        super::set("секрет-тест", None, true).unwrap();
+        let flags = (has("CanIncludeInClipboardHistory"), has("CanUploadToCloudClipboard"), has("ExcludeClipboardContentFromMonitorProcessing"));
+        let text = super::get().unwrap();
+        super::set(&old, None, false).unwrap();
+        assert_eq!(text, "секрет-тест");
+        assert_eq!(flags, (true, true, true));
     }
 }

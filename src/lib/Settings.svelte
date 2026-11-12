@@ -276,10 +276,10 @@
         <p class="hint">
           Появляются в меню подключения (правый клик). Подстановки: <code>%HOST%</code> <code>%PORT%</code>
           <code>%ADDR%</code> (хост[:порт])
-          <code>%USER%</code> <code>%PASSWORD%</code> <code>%DOMAIN%</code> <code>%NAME%</code>. Программа:
+          <code>%USER%</code> <code>%DOMAIN%</code> <code>%NAME%</code>. Программа:
           путь к exe, <code>winbox</code> — встроенный WinBox, <code>url</code> — открыть ссылку в браузере.
-          <br />Пароль в командной строке виден другим программам вашего пользователя — подставляйте
-          <code>%PASSWORD%</code> только там, где это нужно.
+          <br /><code>%PASSWORD%</code> в командную строку не попадает никогда: такой аргумент отбрасывается, а
+          пароль копируется в буфер обмена (без журнала Win+V и облачной синхронизации) и стирается через 45 с.
         </p>
         {#each s.tools as t (t.id)}
           <div class="tool">
@@ -326,17 +326,6 @@
         <label class="row">
           <span>Проверять обновления WinBox <small>(раз в сутки, установка — только после подтверждения)</small></span>
           <span><input type="checkbox" bind:checked={s.winboxAutoCheck} onchange={changed} /></span>
-        </label>
-        <label class="row">
-          <span
-            >Передавать пароль через буфер обмена
-            <small
-              >(WinBox и другие программы получают только адрес и логин, пароль вставляется Ctrl+V и стирается из
-              буфера через 45 с. Если выключить — пароль попадёт в командную строку, которую видят другие программы и
-              журналы аудита Windows)</small
-            ></span
-          >
-          <span><input type="checkbox" bind:checked={s.toolPasswordClipboard} onchange={changed} /></span>
         </label>
 
         <div class="sect">Безопасность</div>

@@ -94,8 +94,6 @@ export type Settings = {
   tools: Tool[];
   /** Проверять обновления WinBox (раз в сутки) */
   winboxAutoCheck: boolean;
-  /** Пароль внешним программам — через буфер обмена, а не в командной строке */
-  toolPasswordClipboard: boolean;
 };
 
 /** Старые стандартные инструменты (cmd /k …) → новые, с выводом в окне приложения */
@@ -106,6 +104,7 @@ const OLD_TOOL_ARGS: Record<string, string[]> = {
   "t-winbox": ["%HOST% %USER% %PASSWORD%"],
 };
 function migrateSettings(s: Settings): Settings {
+  delete (s as Record<string, unknown>).toolPasswordClipboard;
   s.tools = s.tools.map((t) => {
     const def = DEFAULT_TOOLS.find((d) => d.id === t.id);
     return def && OLD_TOOL_ARGS[t.id]?.includes(t.args) ? { ...def, protocols: t.protocols } : t;
@@ -139,7 +138,6 @@ const DEFAULT_SETTINGS: Settings = {
   ],
   tools: DEFAULT_TOOLS,
   winboxAutoCheck: true,
-  toolPasswordClipboard: true,
 };
 
 function loadJson<T>(key: string, def: T): T {

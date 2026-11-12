@@ -118,7 +118,7 @@ export async function checkWinbox(force = false) {
 export async function runTool(item: Item, tool: Tool) {
   if (tool.popup) return openToolWindow(item, tool);
   try {
-    const note = await api.toolRun(item.id, tool.command, tool.args, app.settings.toolPasswordClipboard);
+    const note = await api.toolRun(item.id, tool.command, tool.args);
     if (note) app.toast(note);
   } catch (e) {
     const t = errText(e);

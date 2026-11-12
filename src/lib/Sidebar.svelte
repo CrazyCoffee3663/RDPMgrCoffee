@@ -242,7 +242,7 @@
         disabled: !f || app.mode !== "logins",
       },
       { label: "Новая папка внутри", icon: "folderPlus", action: () => act.newFolder(n.path), disabled: n.org },
-      { label: "Экспорт папки без паролей", icon: "download", action: () => act.exportFolder(n.path), disabled: app.mode !== "conn" },
+      { label: "Экспорт папки…", icon: "download", action: () => act.exportFolder(n.path), disabled: app.mode !== "conn" },
       "sep",
       n.hidden
         ? { label: "Показывать в дереве", icon: "eye", action: () => app.setHidden(n.path, false), disabled: !app.settings.hiddenFolders.includes(n.path) }
@@ -263,7 +263,7 @@
       { label: "Новый RD-шлюз", icon: "building", action: () => act.newItem("gateway") },
       { label: "Новая папка", icon: "folderPlus", action: () => act.newFolder(null) },
       { label: "Объединить дубли шлюзов", icon: "building", action: () => act.tidyGateways(), disabled: !app.gateways.length },
-      { label: "Экспорт всех подключений без паролей", icon: "download", action: () => act.exportAll(), disabled: !app.connections.length },
+      { label: "Экспорт всех подключений…", icon: "download", action: () => act.exportAll(), disabled: !app.connections.length },
       { label: "Импорт подключений…", icon: "download", action: () => (app.importOpen = true) },
       "sep",
       {
@@ -734,7 +734,7 @@
     font-size: 9.5px;
     font-weight: 700;
     letter-spacing: 0.03em;
-    width: 38px;
+    width: 46px;
     text-align: center;
     padding: 2px 0;
     border-radius: 4px;

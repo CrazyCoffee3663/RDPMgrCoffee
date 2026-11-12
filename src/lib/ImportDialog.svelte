@@ -3,7 +3,7 @@
   import { app, GATEWAY_FOLDER } from "./state.svelte";
   import { createRootFolder, ensureFolder, gwKey as makeKey, itemGwKey } from "./actions";
   import Icon from "./Icon.svelte";
-  import { parseExport } from "./exporter";
+  import { parseExport, ENCRYPTED_FORMAT } from "./exporter";
 
   let { onclose }: { onclose: () => void } = $props();
 
@@ -30,9 +30,34 @@
   let found = $state<string | null>(null);
   // Файл mRemoteNG по умолчанию — чтобы не открывать проводник
   api.mremotengDefaultFile().then((p) => (found = p)).catch(() => {});
+  /** Данные Terminals: папка по умолчанию или выбранные файлы */
+  let termFound = $state<string | null>(null);
+  api.terminalsDefaultDir().then((p) => (termFound = p)).catch(() => {});
+  let termDir = $state("");
+  let termFiles = $state<{ config: string; favorites: string; credentials: string } | null>(null);
+  async function useTermFound() {
+    if (!termFound) return;
+    resetSource();
+    termDir = termFound;
+    fileName = termFound;
+    await parse();
+  }
+  function resetSource() {
+    filePath = "";
+    xml = "";
+    termDir = "";
+    termFiles = null;
+    fromExport = false;
+    encrypted = false;
+    filePw = "";
+    needPw = false;
+    parsed = null;
+    error = "";
+  }
 
   async function useFound() {
     if (!found) return;
+    resetSource();
     filePath = found;
     xml = "";
     fileName = found;
@@ -43,6 +68,22 @@
   let needPw = $state(false);
   /** Выбран файл экспорта RDPMgrCoffee (а не mRemoteNG) */
   let fromExport = $state(false);
+  /** Выбран зашифрованный экспорт — нужен пароль файла */
+  let encrypted = $state(false);
+  let encPw = $state("");
+  async function openEncrypted() {
+    error = "";
+    busy = true;
+    try {
+      parsed = parseExport(await api.importEncrypted(xml, encPw), true);
+      encrypted = false;
+    } catch (e) {
+      error = errText(e);
+    } finally {
+      encPw = "";
+      busy = false;
+    }
+  }
   let filePw = $state("");
   let parsed = $state<Parsed | null>(null);
   let error = $state("");
@@ -96,13 +137,42 @@
   }
 
   async function pick(e: Event) {
-    const file = (e.currentTarget as HTMLInputElement).files?.[0];
+    const files = Array.from((e.currentTarget as HTMLInputElement).files ?? []);
+    (e.currentTarget as HTMLInputElement).value = "";
+    const file = files[0];
     if (!file) return;
+    resetSource();
+    // Файлы Terminals: Favorites.xml, Credentials.xml, Terminals.config (можно выбрать сразу несколько)
+    const isTerm = (f: File) => /^(favorites|credentials)\.xml$/i.test(f.name) || /\.config$/i.test(f.name);
+    if (files.some(isTerm)) {
+      const get = async (re: RegExp) => {
+        const f = files.find((x) => re.test(x.name));
+        return f ? await f.text() : "";
+      };
+      termFiles = {
+        config: await get(/\.config$/i),
+        favorites: await get(/^favorites\.xml$/i),
+        credentials: await get(/^credentials\.xml$/i),
+      };
+      fileName = files.map((f) => f.name).join(", ");
+      await parse();
+      return;
+    }
     fileName = file.name;
     filePath = "";
     xml = await file.text();
     filePw = "";
     needPw = false;
+    encrypted = false;
+    if (xml.includes(`"${ENCRYPTED_FORMAT}"`)) {
+      // Зашифрованный экспорт: сначала пароль файла
+      parsed = null;
+      error = "";
+      encrypted = true;
+      fromExport = true;
+      if (target === "mRemoteNG") target = "Импорт";
+      return;
+    }
     if (/\.json$/i.test(file.name) || xml.trimStart().startsWith("{")) {
       // Файл экспорта RDPMgrCoffee: логинов и паролей в нём нет
       error = "";
@@ -125,11 +195,13 @@
     parsed = null;
     try {
       const pw = needPw ? filePw : null;
-      parsed = filePath ? await api.importMremotengFile(filePath, pw) : await api.importMremoteng(xml, pw);
+      if (termDir) parsed = await api.importTerminalsDir(termDir, pw);
+      else if (termFiles) parsed = await api.importTerminals(termFiles.config, termFiles.favorites, termFiles.credentials, pw);
+      else parsed = filePath ? await api.importMremotengFile(filePath, pw) : await api.importMremoteng(xml, pw);
       needPw = false;
     } catch (e) {
       const t = errText(e);
-      if (t === "MREMOTENG_PASSWORD") needPw = true;
+      if (t === "MREMOTENG_PASSWORD" || t === "TERMINALS_PASSWORD") needPw = true;
       else error = t;
     }
   }
@@ -249,9 +321,18 @@
         <p class="hint">
           Файл mRemoteNG <code>confCons.xml</code> (обычно лежит в
           <code class="selectable">%APPDATA%\mRemoteNG</code>; пароли расшифровываются локально и сохраняются в
-          Bitwarden) или файл экспорта RDPMgrCoffee <code>.json</code> — в нём нет логинов и паролей, их нужно будет
-          указать после импорта.
+          Bitwarden), файл экспорта RDPMgrCoffee <code>.json</code> (без логинов и паролей — их нужно будет указать
+          после импорта) зашифрованный экспорт <code>.rdpexport</code> (с паролями, нужен пароль файла) или данные Terminals — выберите
+          сразу <code>Favorites.xml</code>, <code>Credentials.xml</code> и <code>Terminals.config</code> (обычно в
+          <code class="selectable">%LOCALAPPDATA%\Robert_Chartier\Terminals\Data</code> или в папке Data рядом с
+          программой).
         </p>
+        {#if termFound && fileName !== termFound}
+          <div class="found">
+            <span>Найдены данные Terminals:<br /><code class="selectable">{termFound}</code></span>
+            <button class="btn primary" onclick={useTermFound}>Открыть их</button>
+          </div>
+        {/if}
         {#if found && fileName !== found}
           <div class="found">
             <span>Найден файл mRemoteNG:<br /><code class="selectable">{found}</code></span>
@@ -261,13 +342,20 @@
         <label class="file btn">
           <Icon name="folder" size={14} />
           {fileName || (found ? "Выбрать другой файл…" : "Выбрать файл…")}
-          <input type="file" accept=".xml,.json" onchange={pick} hidden />
+          <input type="file" accept=".xml,.json,.rdpexport,.config" multiple onchange={pick} hidden />
         </label>
 
+        {#if encrypted}
+          <div class="row">
+            <span>Файл зашифрован паролем экспорта</span>
+            <input type="password" bind:value={encPw} placeholder="Пароль файла" onkeydown={(e) => e.key === "Enter" && encPw && openEncrypted()} />
+          </div>
+          <div class="actions"><button class="btn primary" onclick={openEncrypted} disabled={!encPw || busy}>{busy ? "Расшифровка…" : "Открыть"}</button></div>
+        {/if}
         {#if needPw}
           <div class="row">
-            <span>Файл защищён паролем</span>
-            <input type="password" bind:value={filePw} placeholder="Пароль mRemoteNG" onkeydown={(e) => e.key === "Enter" && parse()} />
+            <span>{termDir || termFiles ? "Мастер-пароль Terminals" : "Файл защищён паролем"}</span>
+            <input type="password" bind:value={filePw} placeholder={termDir || termFiles ? "Мастер-пароль Terminals" : "Пароль mRemoteNG"} onkeydown={(e) => e.key === "Enter" && parse()} />
           </div>
           <div class="actions"><button class="btn primary" onclick={parse} disabled={!filePw}>Открыть</button></div>
         {/if}
@@ -295,7 +383,7 @@
             </details>
             <label class="chk"><input type="checkbox" bind:checked={skipDupes} /> Не импортировать дубли</label>
           {/if}
-          <label class="chk"><input type="checkbox" bind:checked={keepTree} /> Сохранить структуру папок {fromExport ? "из файла" : "mRemoteNG"}</label>
+          <label class="chk"><input type="checkbox" bind:checked={keepTree} /> Сохранить структуру папок {fromExport ? "из файла" : termDir || termFiles ? "(группы Terminals)" : "mRemoteNG"}</label>
           {#if busy}
             <div class="bar"><div style="width: {progress.total ? (progress.done / progress.total) * 100 : 0}%"></div></div>
             <div class="faint">{progress.done} из {progress.total}…</div>
@@ -321,6 +409,7 @@
     background: rgba(10, 12, 18, 0.45);
     display: grid;
     place-items: center;
+    backdrop-filter: blur(6px);
   }
   .dialog {
     width: min(540px, 94vw);

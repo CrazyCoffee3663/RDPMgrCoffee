@@ -188,7 +188,7 @@ export function multiMenu(items: Item[]): MenuItem[] {
       disabled: !conns.length,
     },
     {
-      label: `Экспорт без паролей (${conns.length})`,
+      label: `Экспорт (${conns.length})…`,
       icon: "download",
       action: () => exportItems(conns, `выбранные (${conns.length})`),
       disabled: !conns.length,
@@ -574,7 +574,7 @@ export function itemMenu(item: Item): MenuItem[] {
   m.push({ label: "Копировать логин", icon: "user", action: () => copyUsername(item), disabled: !item.username });
   m.push({ label: "Копировать пароль", icon: "key", action: () => copyPassword(item), disabled: !item.hasPassword });
   if (conn) m.push({ label: "Копировать адрес", icon: "copy", action: () => api.clipboardSet(conn.host) });
-  if (conn) m.push({ label: "Экспорт без пароля", icon: "download", action: () => exportItems([item], item.name) });
+  if (conn) m.push({ label: "Экспорт…", icon: "download", action: () => exportItems([item], item.name) });
   m.push("sep");
   m.push({
     label: item.favorite ? "Убрать из избранного" : "В избранное",

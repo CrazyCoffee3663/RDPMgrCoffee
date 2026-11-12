@@ -373,6 +373,21 @@ async fn import_encrypted(text: String, password: String) -> Result<String, Stri
         .map_err(|e| e.to_string())?
 }
 
+/// Время без ввода с клавиатуры/мыши во всей системе (для автоблокировки).
+#[tauri::command]
+fn idle_ms() -> u64 {
+    #[cfg(windows)]
+    unsafe {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
+        let mut li = LASTINPUTINFO { cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32, dwTime: 0 };
+        if GetLastInputInfo(&mut li).as_bool() {
+            let now = windows::Win32::System::SystemInformation::GetTickCount();
+            return now.wrapping_sub(li.dwTime) as u64;
+        }
+    }
+    0
+}
+
 // ---------- SFTP ----------
 
 #[tauri::command]
@@ -643,6 +658,7 @@ pub fn run() {
             probe_hosts,
             tool_run,
             save_download,
+            idle_ms,
             export_encrypted,
             import_encrypted,
             tool_exec,

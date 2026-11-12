@@ -63,6 +63,7 @@ const H: Record<string, Handler> = {
       ? { state, server: "", email: "", local: true }
       : { state, server: "https://vault.example.com", email: "admin@example.com", local: false },
   terminals_default_dir: () => null,
+  idle_ms: () => 0,
   import_terminals: ({ password }) => {
     if (!password) throw "TERMINALS_PASSWORD";
     return {

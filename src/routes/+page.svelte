@@ -44,12 +44,18 @@
     // Автоблокировка, фоновая синхронизация и проверка доступности хостов
     let lastSync = Date.now();
     let lastProbe = 0;
-    const timer = setInterval(() => {
+    const timer = setInterval(async () => {
       if (app.phase !== "unlocked") return;
       const lockMin = app.settings.autoLockMinutes;
       if (lockMin > 0 && Date.now() - lastActivity > lockMin * 60_000) {
-        app.lock();
-        return;
+        // Бездействие — по всей системе: работа в RDP-окне или другой программе не видна странице.
+        // Если системное время ввода недоступно — по событиям страницы.
+        const idle = await api.idleMs().catch(() => Date.now() - lastActivity);
+        if (idle > lockMin * 60_000) {
+          app.lock();
+          return;
+        }
+        lastActivity = Date.now() - idle;
       }
       if (Date.now() - lastSync > Math.max(1, app.settings.syncMinutes) * 60_000) {
         lastSync = Date.now();

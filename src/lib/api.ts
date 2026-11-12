@@ -141,6 +141,8 @@ export const api = {
     invoke<string>("export_encrypted", { file, ids, password, name }),
   /** Расшифровать файл зашифрованного экспорта — возвращает JSON с паролями */
   importEncrypted: (text: string, password: string) => invoke<string>("import_encrypted", { text, password }),
+  /** Сколько миллисекунд не было ввода с клавиатуры и мыши во всей системе */
+  idleMs: () => invoke<number>("idle_ms"),
   /** Показать файл в проводнике */
   reveal: (path: string) => (inTauri ? revealItemInDir(path) : Promise.resolve()),
   /** Возвращает подсказку, если пароль положен в буфер обмена */

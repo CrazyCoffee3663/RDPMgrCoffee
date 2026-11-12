@@ -3,7 +3,7 @@
   import { PRESETS, newThemeId, type CustomTheme } from "./themes";
   import { createRootFolder, migrateToRoot, needsMigration, tidyGateways, exportAll, checkWinbox, installWinbox, newerVersion } from "./actions";
   import { DEFAULT_TOOLS, type Tool } from "./state.svelte";
-  import { PROTOCOLS, PROTOCOL_LABEL } from "./api";
+  import { api, errText, PROTOCOLS, PROTOCOL_LABEL } from "./api";
   import Icon from "./Icon.svelte";
 
   let { onclose }: { onclose: () => void } = $props();
@@ -19,6 +19,35 @@
   );
   let rootChoice = $state(s.rootFolder ? (app.view.folders.some((f) => f.name === s.rootFolder) ? s.rootFolder : "__new") : "");
   let newRoot = $state(s.rootFolder && !app.view.folders.some((f) => f.name === s.rootFolder) ? s.rootFolder : "Подключения");
+
+  // ---- Локальное хранилище ----
+  let pwOpen = $state(false);
+  let pwOld = $state("");
+  let pwNew = $state("");
+  let pwNew2 = $state("");
+  let pwBusy = $state(false);
+  async function changePw() {
+    pwBusy = true;
+    try {
+      await api.changeLocalPassword(pwOld, pwNew);
+      app.toast("Мастер-пароль изменён. Сделайте новую резервную копию — старые открываются старым паролем.");
+      pwOpen = false;
+    } catch (e) {
+      app.toast(errText(e), true);
+    } finally {
+      pwOld = pwNew = pwNew2 = "";
+      pwBusy = false;
+    }
+  }
+  async function backup() {
+    try {
+      const p = await api.localBackup();
+      app.toast("Резервная копия сохранена");
+      api.reveal(p).catch(() => {});
+    } catch (e) {
+      app.toast(errText(e), true);
+    }
+  }
 
   // ---- Внешние инструменты и WinBox ----
   let wb = $state<{ installed: string | null; latest: string | null; path: string } | null>(null);
@@ -354,16 +383,39 @@
         </label>
       </details>
 
-      <div class="sect">Учётная запись</div>
-      <div class="acc">
-        <div>
-          <div class="selectable">{app.status.email}</div>
-          <div class="faint selectable">{app.status.server}</div>
+      <div class="sect">{app.status.local ? "Хранилище" : "Учётная запись"}</div>
+      {#if app.status.local}
+        <div class="acc">
+          <span class="hint"
+            >Локальное хранилище на этом компьютере, зашифровано мастер-паролем (AES-256, Argon2id). Резервная копия
+            — тот же зашифрованный файл: без мастер-пароля его не прочитать.</span
+          >
+          <span class="btns">
+            <button class="btn" onclick={backup}><Icon name="download" size={14} /> Резервная копия</button>
+            <button class="btn" onclick={() => (pwOpen = !pwOpen)}><Icon name="key" size={14} /> Сменить мастер-пароль</button>
+          </span>
         </div>
-        <button class="btn danger" onclick={() => (onclose(), app.logout())}>
-          <Icon name="logout" size={14} /> Выйти
-        </button>
-      </div>
+        {#if pwOpen}
+          <form class="pwform" onsubmit={(e) => (e.preventDefault(), changePw())}>
+            <input type="password" placeholder="Текущий мастер-пароль" bind:value={pwOld} autocomplete="current-password" />
+            <input type="password" placeholder="Новый (не короче 12 символов)" bind:value={pwNew} autocomplete="new-password" />
+            <input type="password" placeholder="Повторите новый" bind:value={pwNew2} autocomplete="new-password" />
+            <button class="btn primary" disabled={pwBusy || !pwOld || pwNew.length < 12 || pwNew !== pwNew2}>
+              {pwBusy ? "Смена…" : "Сменить"}
+            </button>
+          </form>
+        {/if}
+      {:else}
+        <div class="acc">
+          <div>
+            <div class="selectable">{app.status.email}</div>
+            <div class="faint selectable">{app.status.server}</div>
+          </div>
+          <button class="btn danger" onclick={() => (onclose(), app.logout())}>
+            <Icon name="logout" size={14} /> Выйти
+          </button>
+        </div>
+      {/if}
     </div>
   </div>
 </div>
@@ -539,6 +591,15 @@
   }
   .c-bad {
     color: var(--danger);
+  }
+  .pwform {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin: 4px 0 8px;
+  }
+  .pwform button {
+    align-self: flex-end;
   }
   .tool {
     display: grid;

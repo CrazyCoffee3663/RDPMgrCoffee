@@ -36,6 +36,9 @@ pub struct Account {
     pub remember_token: Option<String>,
     /// Время последней синхронизации (мс)
     pub last_sync: i64,
+    /// Локальное хранилище без сервера. Поле email тогда хранит случайную соль для KDF.
+    #[serde(default)]
+    pub local: bool,
 }
 
 struct Unlocked {
@@ -97,6 +100,7 @@ pub struct Status {
     pub state: String,
     pub server: String,
     pub email: String,
+    pub local: bool,
 }
 
 #[derive(Serialize, Clone)]
@@ -381,8 +385,216 @@ impl Vault {
 
     fn save_cache(&self, sync: &Value) {
         if let Ok(t) = serde_json::to_vec(sync) {
+            // У локального хранилища этот файл — единственная копия: держим предыдущую версию
+            if self.dir.join("local.flag").exists() {
+                let _ = std::fs::copy(self.dir.join("cache.json"), self.dir.join("cache.json.bak"));
+            }
             let _ = self.write_file("cache.json", &t);
         }
+    }
+
+    async fn is_local(&self) -> bool {
+        self.inner.lock().await.account.as_ref().is_some_and(|a| a.local)
+    }
+
+    /// Убрать файлы локального хранилища в папку резервной копии (ничего не удаляется).
+    fn stash_local(&self) -> VResult<PathBuf> {
+        let dir = self.dir.join(format!("local-backup-{}", now_ms()));
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        for f in ["account.json", "cache.json", "cache.json.bak", "local.flag"] {
+            let p = self.dir.join(f);
+            if p.exists() {
+                std::fs::rename(&p, dir.join(f)).map_err(|e| format!("Не удалось сохранить {}: {}", f, e))?;
+            }
+        }
+        Ok(dir)
+    }
+
+    // ---------- Локальное хранилище (без сервера) ----------
+
+    /// Создать новое локальное хранилище с мастер-паролем.
+    pub async fn create_local(&self, password: &str) -> VResult<()> {
+        if password.chars().count() < 12 {
+            return Err("Мастер-пароль должен быть не короче 12 символов".into());
+        }
+        let device_id = {
+            let g = self.inner.lock().await;
+            if g.account.as_ref().is_some_and(|a| !a.protected_key.is_empty()) {
+                return Err("Хранилище уже настроено".into());
+            }
+            g.account.as_ref().map(|a| a.device_id.clone()).filter(|d| !d.is_empty())
+        }
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        // Argon2id с параметрами Bitwarden по умолчанию; соль случайная
+        let kdf = Kdf { kind: 1, iterations: 3, memory: Some(64), parallelism: Some(4) };
+        let salt = uuid::Uuid::new_v4().to_string();
+        let (pw, s2, k2) = (password.to_string(), salt.clone(), kdf.clone());
+        let (protected, user_key) = tokio::task::spawn_blocking(move || -> VResult<(String, SymKey)> {
+            let mut mk = crypto::master_key(&pw, &s2, &k2)?;
+            let uk = SymKey::generate();
+            let p = crypto::protect_user_key(&mk, &uk);
+            mk.zeroize();
+            Ok((p, uk))
+        })
+        .await
+        .map_err(|e| e.to_string())??;
+        let account = Account {
+            server: String::new(),
+            email: salt,
+            device_id,
+            kdf: Some(kdf),
+            protected_key: protected,
+            refresh_token: None,
+            remember_token: None,
+            last_sync: 0,
+            local: true,
+        };
+        let sync = json!({
+            "object": "sync",
+            "profile": { "id": uuid::Uuid::new_v4().to_string() },
+            "folders": [],
+            "collections": [],
+            "ciphers": [],
+        });
+        let _ = std::fs::remove_file(self.dir.join("cache.json"));
+        self.write_file("local.flag", b"1")?;
+        self.save_account(&account)?;
+        self.save_cache(&sync);
+        let mut g = self.inner.lock().await;
+        g.account = Some(account);
+        g.unlocked = Some(Unlocked {
+            user_key,
+            org_keys: HashMap::new(),
+            access_token: None,
+            token_expiry: None,
+            refresh_token: None,
+            master_hash: String::new(),
+            sync,
+        });
+        Ok(())
+    }
+
+    /// Сменить мастер-пароль локального хранилища: перешифровывается только ключ пользователя.
+    pub async fn change_local_password(&self, old: &str, new: &str) -> VResult<()> {
+        if new.chars().count() < 12 {
+            return Err("Новый мастер-пароль должен быть не короче 12 символов".into());
+        }
+        let account = {
+            let g = self.inner.lock().await;
+            g.unlocked.as_ref().ok_or("Хранилище заблокировано")?;
+            g.account.clone().filter(|a| a.local).ok_or("Это не локальное хранилище")?
+        };
+        let kdf = account.kdf.clone().ok_or("Нет параметров ключа")?;
+        let (old, new) = (old.to_string(), new.to_string());
+        let (salt, protected) = (account.email.clone(), account.protected_key.clone());
+        let new_salt = uuid::Uuid::new_v4().to_string();
+        let (ns, k2) = (new_salt.clone(), kdf.clone());
+        let new_protected = tokio::task::spawn_blocking(move || -> VResult<String> {
+            let mut mk = crypto::master_key(&old, &salt, &k2)?;
+            let uk = crypto::decrypt_user_key(&mk, &protected).map_err(|_| "Текущий мастер-пароль неверен".to_string());
+            mk.zeroize();
+            let uk = uk?;
+            let mut nk = crypto::master_key(&new, &ns, &k2)?;
+            let p = crypto::protect_user_key(&nk, &uk);
+            nk.zeroize();
+            Ok(p)
+        })
+        .await
+        .map_err(|e| e.to_string())??;
+        let mut g = self.inner.lock().await;
+        let a = g.account.as_mut().ok_or("Учётная запись не настроена")?;
+        a.email = new_salt;
+        a.protected_key = new_protected;
+        let acc = a.clone();
+        self.save_account(&acc)
+    }
+
+    /// Резервная копия локального хранилища: те же зашифрованные данные одним файлом.
+    pub async fn local_backup(&self) -> VResult<String> {
+        let g = self.inner.lock().await;
+        let a = g.account.clone().filter(|a| a.local).ok_or("Это не локальное хранилище")?;
+        let u = g.unlocked.as_ref().ok_or("Хранилище заблокировано")?;
+        Ok(serde_json::to_string_pretty(&json!({
+            "format": "rdpmgrcoffee-vault",
+            "version": 1,
+            "created": now_iso(),
+            "account": a,
+            "data": u.sync,
+        }))
+        .unwrap())
+    }
+
+    /// Восстановить локальное хранилище из резервной копии (только на экране настройки).
+    pub async fn local_restore(&self, text: &str) -> VResult<()> {
+        let v: Value = serde_json::from_str(text).map_err(|_| "Файл повреждён: это не JSON".to_string())?;
+        if v["format"] != json!("rdpmgrcoffee-vault") {
+            return Err("Это не резервная копия хранилища RDPMgrCoffee".into());
+        }
+        let mut account: Account =
+            serde_json::from_value(v["account"].clone()).map_err(|_| "В копии нет данных хранилища".to_string())?;
+        if !account.local || account.protected_key.is_empty() || account.kdf.is_none() || !v["data"]["ciphers"].is_array() {
+            return Err("В копии нет данных хранилища".into());
+        }
+        {
+            let g = self.inner.lock().await;
+            if g.account.as_ref().is_some_and(|a| !a.protected_key.is_empty()) {
+                return Err("Хранилище уже настроено".into());
+            }
+            if let Some(d) = g.account.as_ref().map(|a| a.device_id.clone()).filter(|d| !d.is_empty()) {
+                account.device_id = d;
+            }
+        }
+        let _ = std::fs::remove_file(self.dir.join("cache.json"));
+        self.write_file("local.flag", b"1")?;
+        self.write_file("cache.json", &serde_json::to_vec(&v["data"]).unwrap())?;
+        self.save_account(&account)?;
+        let mut g = self.inner.lock().await;
+        g.account = Some(account);
+        g.unlocked = None;
+        Ok(())
+    }
+
+    /// Записать изменённую/новую запись локального хранилища.
+    async fn local_save(&self, input: ItemInput) -> VResult<ItemV> {
+        if input.org_id.is_some() {
+            return Err("В локальном хранилище нет организаций".into());
+        }
+        let body = {
+            let g = self.inner.lock().await;
+            let u = g.unlocked.as_ref().ok_or("Хранилище заблокировано")?;
+            match &input.id {
+                Some(id) => {
+                    let raw = find_cipher(&u.sync, id)?.clone();
+                    let key = cipher_key(u, &raw)?;
+                    let mut b = build_cipher(&key, Some(&raw), &input);
+                    b["id"] = json!(id);
+                    b["creationDate"] = raw["creationDate"].clone();
+                    b
+                }
+                None => {
+                    let mut b = build_cipher(&u.user_key, None, &input);
+                    b["id"] = json!(uuid::Uuid::new_v4().to_string());
+                    b["creationDate"] = json!(now_iso());
+                    b
+                }
+            }
+        };
+        self.local_store(body).await
+    }
+
+    async fn local_store(&self, mut c: Value) -> VResult<ItemV> {
+        if let Some(m) = c.as_object_mut() {
+            m.remove("lastKnownRevisionDate");
+            m.remove("encryptedFor");
+        }
+        c["object"] = json!("cipher");
+        c["revisionDate"] = json!(now_iso());
+        c["edit"] = json!(true);
+        c["viewPassword"] = json!(true);
+        c["organizationId"] = Value::Null;
+        c["deletedDate"] = Value::Null;
+        c["collectionIds"] = json!([]);
+        self.store_cipher(c).await
     }
 
     fn load_cache(&self) -> Option<Value> {
@@ -397,11 +609,13 @@ impl Vault {
                 state: "setup".into(),
                 server: String::new(),
                 email: String::new(),
+                local: false,
             },
             Some(a) => Status {
                 state: if g.unlocked.is_some() { "unlocked" } else { "locked" }.into(),
-                server: a.server.clone(),
-                email: a.email.clone(),
+                server: if a.local { String::new() } else { a.server.clone() },
+                email: if a.local { String::new() } else { a.email.clone() },
+                local: a.local,
             },
         }
     }
@@ -618,6 +832,7 @@ impl Vault {
             refresh_token: refresh.as_ref().map(|r| user_key.encrypt_str(r)),
             remember_token: remember,
             last_sync: 0,
+            local: false,
         };
         self.save_account(&account)?;
         let expires = tok["expires_in"].as_u64().unwrap_or(3600);
@@ -630,7 +845,10 @@ impl Vault {
             master_hash: pending.hash.clone(),
             sync: json!({}),
         };
-        // Старый кеш принадлежит другой учётной записи
+        // Старый кеш принадлежит другой учётной записи. Локальное хранилище не стираем никогда.
+        if self.dir.join("local.flag").exists() {
+            self.stash_local()?;
+        }
         let _ = std::fs::remove_file(self.dir.join("cache.json"));
         let mut g = self.inner.lock().await;
         g.account = Some(account);
@@ -643,6 +861,14 @@ impl Vault {
         let mut g = self.inner.lock().await;
         g.unlocked = None;
         g.pending = None;
+        // Локальное хранилище не удаляем — убираем в папку резервной копии
+        if g.account.as_ref().is_some_and(|a| a.local) {
+            let device_id = g.account.take().map(|a| a.device_id).unwrap_or_default();
+            if self.stash_local().is_ok() {
+                let _ = self.save_account(&Account { device_id, ..Default::default() });
+            }
+            return;
+        }
         // device_id сохраняем, чтобы сервер не считал компьютер новым устройством
         if let Some(a) = g.account.take() {
             let keep = Account {
@@ -685,6 +911,12 @@ impl Vault {
             .and_then(|t| user_key.decrypt_str(t).ok());
         let cache = self.load_cache();
         let has_cache = cache.is_some();
+        if account.local && !has_cache {
+            return Err(format!(
+                "Не найден файл данных локального хранилища ({}). Восстановите его из резервной копии.",
+                self.dir.join("cache.json").display()
+            ));
+        }
         let mut u = Unlocked {
             user_key,
             org_keys: HashMap::new(),
@@ -828,6 +1060,9 @@ impl Vault {
 
     /// Синхронизация с сервером. Без force — только если на сервере есть изменения.
     pub async fn sync(&self, force: bool) -> VResult<bool> {
+        if self.is_local().await {
+            return Ok(false);
+        }
         if !force {
             let last = {
                 let g = self.inner.lock().await;
@@ -933,6 +1168,9 @@ impl Vault {
     // ---------- Изменение ----------
 
     pub async fn save_item(&self, input: ItemInput) -> VResult<ItemV> {
+        if self.is_local().await {
+            return self.local_save(input).await;
+        }
         let (body, path, method, create_org, profile_id) = {
             let g = self.inner.lock().await;
             let u = g.unlocked.as_ref().ok_or("Хранилище заблокировано")?;
@@ -1000,6 +1238,16 @@ impl Vault {
             Some(f) => Some(f),
             None => cur_folder,
         };
+        if self.is_local().await {
+            let mut c = {
+                let g = self.inner.lock().await;
+                let u = g.unlocked.as_ref().ok_or("Хранилище заблокировано")?;
+                find_cipher(&u.sync, id)?.clone()
+            };
+            c["folderId"] = json!(folder);
+            c["favorite"] = json!(favorite.unwrap_or(cur_fav));
+            return self.local_store(c).await;
+        }
         let resp = self
             .api(
                 reqwest::Method::PUT,
@@ -1012,8 +1260,10 @@ impl Vault {
 
     /// Удалить в корзину.
     pub async fn delete_item(&self, id: &str) -> VResult<()> {
-        self.api(reqwest::Method::PUT, &format!("/ciphers/{}/delete", id), None)
-            .await?;
+        if !self.is_local().await {
+            self.api(reqwest::Method::PUT, &format!("/ciphers/{}/delete", id), None)
+                .await?;
+        }
         let mut g = self.inner.lock().await;
         if let Some(u) = g.unlocked.as_mut() {
             if let Some(arr) = u.sync["ciphers"].as_array_mut() {
@@ -1050,12 +1300,21 @@ impl Vault {
             let u = g.unlocked.as_ref().ok_or("Хранилище заблокировано")?;
             u.user_key.encrypt_str(name)
         };
-        let resp = match &id {
-            Some(id) => {
-                self.api(reqwest::Method::PUT, &format!("/folders/{}", id), Some(json!({ "name": enc })))
-                    .await?
+        let resp = if self.is_local().await {
+            json!({
+                "id": id.clone().unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+                "name": enc,
+                "revisionDate": now_iso(),
+                "object": "folder",
+            })
+        } else {
+            match &id {
+                Some(id) => {
+                    self.api(reqwest::Method::PUT, &format!("/folders/{}", id), Some(json!({ "name": enc })))
+                        .await?
+                }
+                None => self.api(reqwest::Method::POST, "/folders", Some(json!({ "name": enc }))).await?,
             }
-            None => self.api(reqwest::Method::POST, "/folders", Some(json!({ "name": enc }))).await?,
         };
         let fid = s(&resp["id"]).ok_or("Сервер не вернул папку")?.to_string();
         let mut g = self.inner.lock().await;
@@ -1073,8 +1332,10 @@ impl Vault {
     }
 
     pub async fn delete_folder(&self, id: &str) -> VResult<()> {
-        self.api(reqwest::Method::DELETE, &format!("/folders/{}", id), None)
-            .await?;
+        if !self.is_local().await {
+            self.api(reqwest::Method::DELETE, &format!("/folders/{}", id), None)
+                .await?;
+        }
         let mut g = self.inner.lock().await;
         if let Some(u) = g.unlocked.as_mut() {
             if let Some(arr) = u.sync["folders"].as_array_mut() {
@@ -1466,5 +1727,78 @@ mod tests {
             u.user_key.decrypt_str(body3["login"]["password"].as_str().unwrap()).unwrap(),
             "new"
         );
+    }
+}
+
+#[cfg(test)]
+mod local_tests {
+    use super::*;
+
+    fn input(name: &str, pw: &str, folder: Option<String>) -> ItemInput {
+        ItemInput {
+            id: None,
+            kind: Some(1),
+            org_id: None,
+            collection_ids: vec![],
+            folder_id: folder,
+            name: name.into(),
+            notes: "заметка-секрет".into(),
+            username: "CORP\\admin".into(),
+            password: Some(pw.into()),
+            uris: vec!["rdp://10.9.8.7".into()],
+            fields: vec![FieldV { name: "domain".into(), value: Some("CORP".into()), kind: 0 }],
+            favorite: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn local_vault_lifecycle() {
+        let dir = std::env::temp_dir().join(format!("rdpmgr-local-{}", uuid::Uuid::new_v4()));
+        let v = Vault::new(dir.clone());
+        assert!(v.create_local("short").await.is_err());
+        v.create_local("correct horse battery").await.unwrap();
+        assert!(v.status().await.local);
+
+        let f = v.save_folder(None, "Офис-папка").await.unwrap();
+        let it = v.save_item(input("Сервер-тайный", "P@ss-Секрет-42", Some(f.id.clone()))).await.unwrap();
+        assert_eq!(v.secret(&it.id).await.unwrap().password, "P@ss-Секрет-42");
+        let it = v.move_item(&it.id, None, Some(true)).await.unwrap();
+        assert!(it.favorite);
+        assert!(!v.sync(true).await.unwrap());
+
+        // На диске — только шифротекст
+        let disk = std::fs::read_to_string(dir.join("cache.json")).unwrap()
+            + &std::fs::read_to_string(dir.join("account.json")).unwrap();
+        for plain in ["P@ss-Секрет-42", "Сервер-тайный", "Офис-папка", "заметка-секрет", "admin", "10.9.8.7", "CORP"] {
+            assert!(!disk.contains(plain), "на диске открытый текст: {}", plain);
+        }
+
+        v.lock().await;
+        assert!(v.unlock("wrong password!!").await.is_err());
+        assert!(v.unlock("correct horse battery").await.unwrap());
+        assert_eq!(v.view().await.unwrap().items.len(), 1);
+
+        assert!(v.change_local_password("wrong password!!", "new strong password").await.is_err());
+        v.change_local_password("correct horse battery", "new strong password").await.unwrap();
+        v.lock().await;
+        assert!(v.unlock("correct horse battery").await.is_err());
+        v.unlock("new strong password").await.unwrap();
+
+        let backup = v.local_backup().await.unwrap();
+        assert!(!backup.contains("P@ss-Секрет-42"));
+        // «Сменить хранилище» — файлы уходят в папку копии, а не удаляются
+        v.logout().await;
+        assert!(!dir.join("cache.json").exists());
+        assert!(std::fs::read_dir(&dir).unwrap().any(|e| e.unwrap().file_name().to_string_lossy().starts_with("local-backup-")));
+
+        v.local_restore(&backup).await.unwrap();
+        v.unlock("new strong password").await.unwrap();
+        let view = v.view().await.unwrap();
+        assert_eq!(view.items[0].name, "Сервер-тайный");
+        assert_eq!(v.secret(&view.items[0].id).await.unwrap().password, "P@ss-Секрет-42");
+        v.delete_item(&view.items[0].id).await.unwrap();
+        v.delete_folder(&f.id).await.unwrap();
+        assert!(v.view().await.unwrap().items.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

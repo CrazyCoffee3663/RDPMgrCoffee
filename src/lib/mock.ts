@@ -43,6 +43,7 @@ function login(id: string, name: string, folderId: string | null, username: stri
 }
 
 let state: "setup" | "locked" | "unlocked" = "locked";
+let local = false;
 const channels = new Map<number, (d: ArrayBuffer) => void>();
 const enc = new TextEncoder();
 const listeners = new Map<string, ((e: any) => void)[]>();
@@ -57,11 +58,22 @@ export function mockListen(event: string, f: (e: any) => void) {
 
 let sid = 0;
 const H: Record<string, Handler> = {
-  vault_status: () => ({ state, server: "https://vault.example.com", email: "admin@example.com" }),
+  vault_status: () =>
+    local
+      ? { state, server: "", email: "", local: true }
+      : { state, server: "https://vault.example.com", email: "admin@example.com", local: false },
+  vault_create_local: ({ password }) => {
+    if (password.length < 12) throw "Мастер-пароль должен быть не короче 12 символов";
+    local = true;
+    state = "unlocked";
+  },
+  vault_change_local_password: () => {},
+  vault_local_backup: () => "C:\Users\demo\Downloads\backup.rdpvault",
+  vault_local_restore: () => ((local = true), (state = "locked")),
   vault_login: () => ((state = "unlocked"), { status: "ok", providers: [] }),
   vault_unlock: () => ((state = "unlocked"), true),
   vault_lock: () => (state = "locked"),
-  vault_logout: () => (state = "setup"),
+  vault_logout: () => ((state = "setup"), (local = false)),
   vault_sync: () => false,
   vault_view: () => ({ folders, collections: [], orgs: [], items }),
   item_secret: () => ({ password: "S3cr3t-P@ss", totp: "", fields: [], sshPrivateKey: "" }),

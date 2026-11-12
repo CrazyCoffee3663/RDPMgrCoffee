@@ -136,7 +136,15 @@
       <button class="icon-btn" onclick={() => (cancelEdit(), onclose())}><Icon name="x" /></button>
     </header>
     <div class="body">
-      <div class="sect">Рабочая папка Bitwarden</div>
+      <div class="sect">Обучение</div>
+      <div class="acc">
+        <span class="hint">Короткий тур по возможностям и настройкам программы.</span>
+        <button class="btn" onclick={() => (onclose(), (app.tourOpen = true))}>
+          <Icon name="play" size={14} /> Пройти обучение
+        </button>
+      </div>
+
+      <div class="sect">Рабочая папка</div>
       <p class="hint">
         Менеджер показывает только записи из этой папки и вложенных в неё. Остальное хранилище (личные логины, карты
         и т.п.) не попадает в дерево, поиск и списки выбора. Новые записи создаются внутри неё.
@@ -172,20 +180,6 @@
         </div>
       {/if}
 
-      <div class="sect">RD-шлюзы</div>
-      <div class="acc">
-        <span class="hint">Объединить одинаковые шлюзы и сложить все в папку «RDG» (скрыта в дереве).</span>
-        <button class="btn" onclick={() => (onclose(), tidyGateways())}>Навести порядок</button>
-      </div>
-
-      <div class="sect">Обучение</div>
-      <div class="acc">
-        <span class="hint">Короткий тур по возможностям и настройкам программы.</span>
-        <button class="btn" onclick={() => (onclose(), (app.tourOpen = true))}>
-          <Icon name="play" size={14} /> Пройти обучение
-        </button>
-      </div>
-
       <div class="sect">Импорт и экспорт</div>
       <div class="acc">
         <span class="hint"
@@ -205,6 +199,12 @@
         <button class="btn" onclick={() => exportAll()} disabled={!app.connections.length}>
           <Icon name="download" size={14} /> Экспорт…
         </button>
+      </div>
+
+      <div class="sect">RD-шлюзы</div>
+      <div class="acc">
+        <span class="hint">Объединить одинаковые шлюзы и сложить все в папку «RDG» (скрыта в дереве).</span>
+        <button class="btn" onclick={() => (onclose(), tidyGateways())}>Навести порядок</button>
       </div>
 
       <div class="sect">Внешний вид</div>
@@ -271,6 +271,53 @@
 
       <details class="adv">
         <summary>Расширенные</summary>
+        <div class="sect">Безопасность</div>
+        <label class="row">
+          <span>Блокировать хранилище при бездействии, мин <small>(0 — никогда)</small></span>
+          <input type="number" min="0" max="1440" bind:value={s.autoLockMinutes} onchange={changed} />
+        </label>
+        <label class="row">
+          <span>Очищать скопированный пароль через, сек <small>(0 — не очищать)</small></span>
+          <input type="number" min="0" max="600" bind:value={s.clipboardClearSeconds} onchange={changed} />
+        </label>
+        <label class="row">
+          <span
+            >Журнал RDP для диагностики
+            <small
+              >(этапы подключения FreeRDP в %TEMP%\connmgr-rdp-last.log — там адреса серверов и логины; включайте только
+              для поиска проблем)</small
+            ></span
+          >
+          <span><input type="checkbox" bind:checked={s.rdpLog} onchange={changed} /></span>
+        </label>
+
+        <div class="sect">Синхронизация</div>
+        <label class="row">
+          <span>Проверять изменения на сервере каждые, мин</span>
+          <input type="number" min="1" max="120" bind:value={s.syncMinutes} onchange={changed} />
+        </label>
+
+        <div class="sect">WinBox</div>
+        <div class="row">
+          <span>
+            {#if wb}
+              Установлен: <b>{wb.installed ?? "нет"}</b>, последняя: <b>{wb.latest ?? "не удалось узнать"}</b>
+            {:else}
+              Скачивается с download.mikrotik.com при первом запуске (с вашего согласия)
+            {/if}
+          </span>
+          <span class="btns">
+            <button class="btn" onclick={wbCheck} disabled={wbBusy}>Проверить</button>
+            {#if wb?.latest && (!wb.installed || wb.installed === "?" || newerVersion(wb.latest, wb.installed))}
+              <button class="btn primary" onclick={wbInstall} disabled={wbBusy}>{wb.installed ? "Обновить" : "Установить"}</button>
+            {/if}
+          </span>
+        </div>
+        <label class="row">
+          <span>Проверять обновления WinBox <small>(раз в сутки, установка — только после подтверждения)</small></span>
+          <span><input type="checkbox" bind:checked={s.winboxAutoCheck} onchange={changed} /></span>
+        </label>
+
         <div class="sect">Терминал и панели</div>
         <label class="row">
           <span>Размер шрифта терминала</span>
@@ -293,7 +340,7 @@
         <div class="sect">Индикатор доступности</div>
         <p class="hint">
           Точка у подключения: <b class="c-ok">зелёная</b> — подключено, <b class="c-warn">жёлтая</b> — хост отвечает,
-          <b class="c-bad">красная</b> — нет ответа. Проверка — короткая попытка TCP-соединения на порт подключения, без входа.
+          <b class="c-bad">красная</b> — нет ответа. Проверка — короткое соединение, в котором сервер должен ответить по своему протоколу (RDP, SSH, TLS шлюза), без входа.
         </p>
         <label class="row">
           <span>Проверять доступность хостов</span>
@@ -356,53 +403,6 @@
           <button class="btn" onclick={() => ((s.tools = DEFAULT_TOOLS.map((x) => ({ ...x }))), changed())}>Вернуть стандартные</button>
           <button class="btn" onclick={addTool}><Icon name="plus" size={14} /> Добавить</button>
         </div>
-
-        <div class="sect">WinBox</div>
-        <div class="row">
-          <span>
-            {#if wb}
-              Установлен: <b>{wb.installed ?? "нет"}</b>, последняя: <b>{wb.latest ?? "не удалось узнать"}</b>
-            {:else}
-              Скачивается с download.mikrotik.com при первом запуске (с вашего согласия)
-            {/if}
-          </span>
-          <span class="btns">
-            <button class="btn" onclick={wbCheck} disabled={wbBusy}>Проверить</button>
-            {#if wb?.latest && (!wb.installed || wb.installed === "?" || newerVersion(wb.latest, wb.installed))}
-              <button class="btn primary" onclick={wbInstall} disabled={wbBusy}>{wb.installed ? "Обновить" : "Установить"}</button>
-            {/if}
-          </span>
-        </div>
-        <label class="row">
-          <span>Проверять обновления WinBox <small>(раз в сутки, установка — только после подтверждения)</small></span>
-          <span><input type="checkbox" bind:checked={s.winboxAutoCheck} onchange={changed} /></span>
-        </label>
-
-        <div class="sect">Безопасность</div>
-        <label class="row">
-          <span>Блокировать хранилище при бездействии, мин <small>(0 — никогда)</small></span>
-          <input type="number" min="0" max="1440" bind:value={s.autoLockMinutes} onchange={changed} />
-        </label>
-        <label class="row">
-          <span>Очищать скопированный пароль через, сек <small>(0 — не очищать)</small></span>
-          <input type="number" min="0" max="600" bind:value={s.clipboardClearSeconds} onchange={changed} />
-        </label>
-        <label class="row">
-          <span
-            >Журнал RDP для диагностики
-            <small
-              >(этапы подключения FreeRDP в %TEMP%\connmgr-rdp-last.log — там адреса серверов и логины; включайте только
-              для поиска проблем)</small
-            ></span
-          >
-          <span><input type="checkbox" bind:checked={s.rdpLog} onchange={changed} /></span>
-        </label>
-
-        <div class="sect">Синхронизация</div>
-        <label class="row">
-          <span>Проверять изменения на сервере каждые, мин</span>
-          <input type="number" min="1" max="120" bind:value={s.syncMinutes} onchange={changed} />
-        </label>
       </details>
 
       <div class="sect">{app.status.local ? "Хранилище" : "Учётная запись"}</div>

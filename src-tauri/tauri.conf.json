@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "RDPMgrCoffee",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "identifier": "io.github.connmgr",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -38,7 +38,9 @@
     ],
     "windows": {
       "nsis": {
-        "installMode": "currentUser"
+        "installMode": "currentUser",
+        "languages": ["Russian"],
+        "displayLanguageSelector": false
       }
     },
     "icon": [
@@ -48,7 +50,7 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "shortDescription": "Менеджер RDP/SSH-подключений с хранилищем Bitwarden",
+    "shortDescription": "Менеджер RDP/SSH-подключений с зашифрованным хранилищем",
     "category": "Utility"
   }
 }

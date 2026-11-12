@@ -294,6 +294,7 @@
   }
   .files-btn {
     position: absolute;
+    z-index: 20;
     top: 8px;
     right: 18px;
     display: flex;

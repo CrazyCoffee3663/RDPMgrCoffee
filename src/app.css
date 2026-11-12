@@ -26,6 +26,7 @@
   --p-ssh: #10b981;
   --p-telnet: #f59e0b;
   --p-serial: #a855f7;
+  --p-winbox: #e11d48;
   --term-bg: #ffffff;
   color-scheme: light;
 }
@@ -235,6 +236,9 @@ button:disabled {
 }
 .proto-serial {
   --pc: var(--p-serial);
+}
+.proto-winbox {
+  --pc: var(--p-winbox);
 }
 
 kbd {

@@ -1,6 +1,6 @@
 import { untrack } from "svelte";
 import { PRESETS, THEME_VARS, themeVars, type CustomTheme } from "./themes";
-import { api, errText, listen, parseConn, fieldValue, type Item, type Protocol, type Status, type VaultView } from "./api";
+import { api, errText, listen, parseConn, fieldValue, DEFAULT_PORTS, type Item, type Protocol, type Status, type VaultView } from "./api";
 
 export type TabState = "connecting" | "connected" | "closed" | "error";
 export type Tab = {
@@ -35,6 +35,9 @@ export const GATEWAY_FOLDER = "RDG";
 /** Внешний инструмент. command: путь к программе, "winbox" или "url" */
 export type Tool = { id: string; name: string; command: string; args: string; protocols: string[] };
 
+/** Как запускается подключение типа WinBox: адрес[:порт] логин пароль */
+export const WINBOX_CONNECT: Tool = { id: "winbox-connect", name: "WinBox", command: "winbox", args: "%ADDR% %USER% %PASSWORD%", protocols: [] };
+
 export const DEFAULT_TOOLS: Tool[] = [
   { id: "t-ping", name: "Ping", command: "cmd", args: "/k ping -t %HOST%", protocols: [] },
   { id: "t-tracert", name: "Tracert", command: "cmd", args: "/k tracert %HOST%", protocols: [] },
@@ -42,7 +45,7 @@ export const DEFAULT_TOOLS: Tool[] = [
     id: "t-port", name: "Проверить порт", command: "powershell",
     args: "-NoExit -Command Test-NetConnection %HOST% -Port %PORT%", protocols: [],
   },
-  { id: "t-winbox", name: "WinBox", command: "winbox", args: "%HOST% %USER% %PASSWORD%", protocols: [] },
+  { id: "t-winbox", name: "WinBox", command: "winbox", args: "%ADDR% %USER% %PASSWORD%", protocols: [] },
   { id: "t-web", name: "Веб-интерфейс", command: "url", args: "https://%HOST%", protocols: [] },
 ];
 
@@ -273,7 +276,7 @@ class AppState {
   }
 
   /** Куда стучаться для проверки: сам хост или RD-шлюз */
-  probeTarget(it: Item): { host: string; port: number } | null {
+  probeTarget(it: Item): { host: string; port: number; kind: string } | null {
     const c = parseConn(it);
     if (!c || c.protocol === "serial") return null;
     const gw = fieldValue(it, "gateway");
@@ -281,16 +284,17 @@ class AppState {
       if (!this.settings.probeViaGateway) return null;
       const g = this.item(gw) ?? this.view.items.find((i) => i.name === gw);
       const m = /^(?:[a-z]+:\/\/)?(\[[^\]]+\]|[^:/?#]+)(?::(\d+))?/i.exec((g?.uris[0] ?? "").trim());
-      return m ? { host: m[1], port: Number(m[2] ?? 443) } : null;
+      return m ? { host: m[1], port: Number(m[2] ?? 443), kind: "tls" } : null;
     }
-    return { host: c.host, port: c.port ?? (c.protocol === "rdp" ? 3389 : c.protocol === "ssh" ? 22 : 23) };
+    const kind = c.protocol === "rdp" || c.protocol === "ssh" ? c.protocol : "tcp";
+    return { host: c.host, port: c.port ?? DEFAULT_PORTS[c.protocol] ?? 0, kind };
   }
 
   async probe() {
     const s = this.settings;
     if (!s.probeEnabled || this.probing || this.phase !== "unlocked") return;
     const ids = s.probeVisibleOnly ? new Set(this.visibleIds) : null;
-    const targets: { id: string; host: string; port: number }[] = [];
+    const targets: { id: string; host: string; port: number; kind: string }[] = [];
     for (const it of this.connections) {
       if (ids && !ids.has(it.id)) continue;
       const t = this.probeTarget(it);
@@ -408,6 +412,11 @@ class AppState {
     }
     this.recent = [item.id, ...this.recent.filter((r) => r !== item.id)].slice(0, 12);
     save("recent", this.recent);
+    if (c.protocol === "winbox") {
+      // WinBox — отдельная программа, не вкладка
+      import("./actions").then((m) => m.runTool(item, WINBOX_CONNECT));
+      return;
+    }
     this.addTab({ protocol: c.protocol, title: item.name, itemId: item.id });
   }
 

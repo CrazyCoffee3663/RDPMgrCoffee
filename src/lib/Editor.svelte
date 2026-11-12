@@ -367,6 +367,12 @@
           {/if}
         </div>
 
+        {#if f.protocol === "winbox"}
+          <p class="faint wbhint">
+            Откроется во внешнем WinBox (скачивается с сайта MikroTik при первом запуске). Адрес — IP или DNS-имя
+            роутера; порт по умолчанию 8291. Логин и пароль WinBox получает в командной строке.
+          </p>
+        {/if}
         {#if f.protocol !== "serial"}
           <div class="sect">Учётные данные</div>
           <div class="grp">
@@ -656,6 +662,11 @@
     text-transform: uppercase;
     letter-spacing: 0.06em;
     color: var(--text-faint);
+  }
+  .wbhint {
+    margin: 2px 0 10px;
+    font-size: 12px;
+    line-height: 1.45;
   }
   .grp {
     display: grid;

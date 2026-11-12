@@ -47,11 +47,19 @@ pub fn expand(arg: &str, p: &ConnParams) -> String {
             "rdp" => "3389",
             "ssh" => "22",
             "telnet" => "23",
+            "winbox" => "8291",
             _ => "",
         }
         .to_string()
     });
-    arg.replace("%HOST%", &p.host)
+    // %ADDR% — хост, а порт только если он задан явно (для WinBox: «10.0.0.1:8292»)
+    let host = if p.host.contains(':') && !p.host.starts_with('[') { format!("[{}]", p.host) } else { p.host.clone() };
+    let addr = match p.port {
+        Some(port) => format!("{}:{}", host, port),
+        None => p.host.clone(),
+    };
+    arg.replace("%ADDR%", &addr)
+        .replace("%HOST%", &p.host)
         .replace("%PORT%", &port)
         .replace("%USER%", &p.username)
         .replace("%PASSWORD%", &p.password)
@@ -84,16 +92,75 @@ pub fn run(tools: &Path, command: &str, args: &str, p: &ConnParams) -> Result<()
     } else {
         PathBuf::from(expand(command, p))
     };
-    let mut cmd = Command::new(&exe);
-    cmd.args(&args);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        // Консольные программы (ping, tracert) — в своём окне консоли
-        cmd.creation_flags(0x00000010); // CREATE_NEW_CONSOLE
+    spawn_console(&exe, &args).map_err(|e| format!("Не удалось запустить {}: {}", exe.display(), e))
+}
+
+/// Склеить аргументы в командную строку Windows (правила CommandLineToArgvW).
+pub fn quote_args(exe: &str, args: &[String]) -> String {
+    let mut line = format!("\"{}\"", exe);
+    for a in args {
+        line.push(' ');
+        if !a.is_empty() && !a.chars().any(|c| c == ' ' || c == '\t' || c == '"') {
+            line.push_str(a);
+            continue;
+        }
+        line.push('"');
+        let mut bs = 0;
+        for c in a.chars() {
+            match c {
+                '\\' => bs += 1,
+                '"' => {
+                    line.extend(std::iter::repeat_n('\\', bs * 2 + 1));
+                    line.push('"');
+                    bs = 0;
+                }
+                c => {
+                    line.extend(std::iter::repeat_n('\\', bs));
+                    line.push(c);
+                    bs = 0;
+                }
+            }
+        }
+        line.extend(std::iter::repeat_n('\\', bs * 2));
+        line.push('"');
     }
-    cmd.spawn().map_err(|e| format!("Не удалось запустить {}: {}", exe.display(), e))?;
+    line
+}
+
+/// Запуск в собственном окне консоли. Через CreateProcessW, а не std::process::Command:
+/// Command всегда передаёт дочернему процессу наши stdin/stdout (STARTF_USESTDHANDLES),
+/// и консольная программа пишет не в своё окно, а в никуда; cmd /k при этом сразу закрывается.
+#[cfg(windows)]
+fn spawn_console(exe: &Path, args: &[String]) -> Result<(), String> {
+    use windows::core::{PCWSTR, PWSTR};
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{CreateProcessW, CREATE_NEW_CONSOLE, PROCESS_INFORMATION, STARTUPINFOW};
+    let mut line: Vec<u16> = quote_args(&exe.display().to_string(), args).encode_utf16().chain([0]).collect();
+    let si = STARTUPINFOW { cb: std::mem::size_of::<STARTUPINFOW>() as u32, ..Default::default() };
+    let mut pi = PROCESS_INFORMATION::default();
+    unsafe {
+        CreateProcessW(
+            PCWSTR::null(),
+            Some(PWSTR(line.as_mut_ptr())),
+            None,
+            None,
+            false,
+            CREATE_NEW_CONSOLE,
+            None,
+            PCWSTR::null(),
+            &si,
+            &mut pi,
+        )
+        .map_err(|e| e.message().to_string())?;
+        let _ = CloseHandle(pi.hThread);
+        let _ = CloseHandle(pi.hProcess);
+    }
     Ok(())
+}
+
+#[cfg(not(windows))]
+fn spawn_console(exe: &Path, args: &[String]) -> Result<(), String> {
+    Command::new(exe).args(args).spawn().map(|_| ()).map_err(|e| e.to_string())
 }
 
 fn open_url(url: &str) -> Result<(), String> {
@@ -196,5 +263,9 @@ mod tests {
         };
         assert_eq!(expand("%USER%@%HOST%:%PORT%", &p), "admin@10.0.0.1:22");
         assert_eq!(expand("%PASSWORD%", &p), "p w");
+        assert_eq!(
+            quote_args("cmd", &["/k".into(), "ping".into(), "a b".into(), r#"x"y"#.into(), r"c:\d e\".into()]),
+            r#""cmd" /k ping "a b" "x\"y" "c:\d e\\""#
+        );
     }
 }

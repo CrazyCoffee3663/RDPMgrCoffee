@@ -91,7 +91,7 @@ pub fn split_user(raw: &str) -> (String, String) {
     (String::new(), raw.to_string())
 }
 
-pub const PROTOCOLS: [&str; 4] = ["rdp", "ssh", "telnet", "serial"];
+pub const PROTOCOLS: [&str; 5] = ["rdp", "ssh", "telnet", "serial", "winbox"];
 
 fn fields_map(fields: &[FieldV]) -> HashMap<String, String> {
     fields
@@ -118,7 +118,7 @@ async fn from_vault_depth(vault: &Vault, id: &str, depth: u8) -> Result<ConnPara
         .uris
         .iter()
         .find_map(|u| parse_uri(u).filter(|p| PROTOCOLS.contains(&p.scheme.as_str())))
-        .ok_or("У записи нет адреса вида rdp://, ssh://, telnet:// или serial://")?;
+        .ok_or("У записи нет адреса вида rdp://, ssh://, telnet://, serial:// или winbox://")?;
     let opts = fields_map(&cs.fields);
 
     let mut username = if cs.item.username.is_empty() { uri.user.clone() } else { cs.item.username.clone() };

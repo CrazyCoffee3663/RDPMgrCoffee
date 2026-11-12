@@ -1,9 +1,15 @@
-//! Проверка доступности хостов: короткая попытка TCP-соединения на порт подключения.
-//! Без авторизации и передачи данных — соединение сразу закрывается.
+//! Проверка доступности хостов.
+//!
+//! Одного TCP-рукопожатия мало: VPN/прокси в режиме TUN и некоторые антивирусы принимают
+//! соединение к любому адресу сами. Поэтому хост считается доступным, только если он
+//! ответил по своему протоколу: SSH присылает баннер, RDP отвечает на X.224 Connection
+//! Request, HTTPS (RD-шлюз) — на TLS ClientHello. Без авторизации, соединение сразу закрывается.
 
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 use tokio::sync::Semaphore;
 
 #[derive(Deserialize)]
@@ -11,12 +17,73 @@ pub struct Target {
     pub id: String,
     pub host: String,
     pub port: u16,
+    /// rdp | ssh | tls | tcp (по умолчанию tcp)
+    #[serde(default)]
+    pub kind: String,
 }
 
 #[derive(Serialize)]
 pub struct Reach {
     pub id: String,
     pub up: bool,
+}
+
+/// X.224 Connection Request с RDP_NEG_REQ (TLS | CredSSP)
+const RDP_CR: [u8; 19] = [
+    0x03, 0x00, 0x00, 0x13, 0x0e, 0xe0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x08, 0x00, 0x03, 0x00, 0x00, 0x00,
+];
+
+/// Минимальный TLS 1.2 ClientHello. Любой ответ (ServerHello или alert) значит, что сервер жив.
+fn tls_hello() -> Vec<u8> {
+    let mut body = vec![0x03, 0x03];
+    body.extend((0..32u8).map(|i| i.wrapping_mul(37).wrapping_add(11)));
+    body.push(0); // session id
+    let suites: [u16; 6] = [0xc02f, 0xc030, 0xc02b, 0xc02c, 0x009c, 0x003c];
+    body.extend(((suites.len() * 2) as u16).to_be_bytes());
+    for s in suites {
+        body.extend(s.to_be_bytes());
+    }
+    body.extend([1, 0]); // compression: null
+    let mut hs = vec![0x01, 0, (body.len() >> 8) as u8, body.len() as u8];
+    hs.extend(body);
+    let mut rec = vec![0x16, 0x03, 0x01];
+    rec.extend((hs.len() as u16).to_be_bytes());
+    rec.extend(hs);
+    rec
+}
+
+async fn check(addr: String, kind: &str, timeout: Duration) -> bool {
+    let start = tokio::time::Instant::now();
+    let Ok(Ok(mut s)) = tokio::time::timeout(timeout, TcpStream::connect(addr)).await else {
+        return false;
+    };
+    // На ответ — оставшееся время, но не меньше секунды: через прокси он приходит дольше
+    let left = timeout.saturating_sub(start.elapsed()).max(Duration::from_millis(1000));
+    let hello: Option<Vec<u8>> = match kind {
+        "rdp" => Some(RDP_CR.to_vec()),
+        "tls" => Some(tls_hello()),
+        _ => None,
+    };
+    if let Some(h) = hello {
+        if s.write_all(&h).await.is_err() {
+            return false;
+        }
+    }
+    let mut buf = [0u8; 64];
+    match tokio::time::timeout(left, s.read(&mut buf)).await {
+        // Пришли данные: у RDP ответ начинается с TPKT 0x03, у SSH — с «SSH-», у TLS — 0x15/0x16
+        Ok(Ok(n)) if n > 0 => match kind {
+            "rdp" => buf[0] == 0x03,
+            "ssh" => buf[..n].starts_with(b"SSH-"),
+            "tls" => buf[0] == 0x15 || buf[0] == 0x16,
+            _ => true,
+        },
+        // Соединение закрыли — за адресом никого нет (так отвечает прокси)
+        Ok(_) => false,
+        // Тишина: для протоколов, где первым говорит сервер или ответ обязателен, — недоступен;
+        // для прочих (telnet, WinBox) — соединение держится, считаем доступным
+        Err(_) => !matches!(kind, "rdp" | "ssh" | "tls"),
+    }
 }
 
 /// Проверить хосты параллельно (не больше `parallel` одновременно).
@@ -29,10 +96,7 @@ pub async fn probe(targets: Vec<Target>, timeout_ms: u64, parallel: usize) -> Ve
         tasks.push(tokio::spawn(async move {
             let _permit = sem.acquire_owned().await;
             let addr = format!("{}:{}", t.host.trim_start_matches('[').trim_end_matches(']'), t.port);
-            let up = matches!(
-                tokio::time::timeout(timeout, tokio::net::TcpStream::connect(addr)).await,
-                Ok(Ok(_))
-            );
+            let up = check(addr, &t.kind, timeout).await;
             Reach { id: t.id, up }
         }));
     }
@@ -48,21 +112,79 @@ pub async fn probe(targets: Vec<Target>, timeout_ms: u64, parallel: usize) -> Ve
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::net::TcpListener;
+
+    fn tgt(id: &str, port: u16, kind: &str) -> Target {
+        Target { id: id.into(), host: "127.0.0.1".into(), port, kind: kind.into() }
+    }
 
     #[tokio::test]
-    async fn probe_local() {
-        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = l.local_addr().unwrap().port();
+    async fn probe_kinds() {
+        // SSH-сервер, присылающий баннер
+        let ssh = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ssh_port = ssh.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut c, _)) = ssh.accept().await {
+                let _ = c.write_all(b"SSH-2.0-test\r\n").await;
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        });
+        // «Прокси»: принимает и молчит / сразу закрывает
+        let silent = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let silent_port = silent.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let mut keep = vec![];
+            while let Ok((c, _)) = silent.accept().await {
+                keep.push(c);
+            }
+        });
+        let closer = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let closer_port = closer.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((c, _)) = closer.accept().await {
+                drop(c);
+            }
+        });
         let r = probe(
             vec![
-                Target { id: "a".into(), host: "127.0.0.1".into(), port },
-                Target { id: "b".into(), host: "127.0.0.1".into(), port: 1 },
+                tgt("ssh", ssh_port, "ssh"),
+                tgt("ssh-silent", silent_port, "ssh"),
+                tgt("rdp-closed", closer_port, "rdp"),
+                tgt("tcp-silent", silent_port, "tcp"),
+                tgt("refused", 1, "tcp"),
             ],
             800,
-            4,
+            8,
         )
         .await;
-        assert!(r.iter().find(|x| x.id == "a").unwrap().up);
-        assert!(!r.iter().find(|x| x.id == "b").unwrap().up);
+        let up = |id: &str| r.iter().find(|x| x.id == id).unwrap().up;
+        assert!(up("ssh"));
+        assert!(!up("ssh-silent"));
+        assert!(!up("rdp-closed"));
+        assert!(up("tcp-silent"));
+        assert!(!up("refused"));
+        assert_eq!(tls_hello().len(), 5 + 4 + 2 + 32 + 1 + 2 + 12 + 2);
+    }
+
+    /// Ручная проверка через сеть этого ПК: cargo test probe_live -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn probe_live() {
+        let t = |id: &str, h: &str, p: u16, k: &str| Target { id: id.into(), host: h.into(), port: p, kind: k.into() };
+        let r = probe(
+            vec![
+                t("dead-rdp", "192.0.2.1", 3389, "rdp"),
+                t("dead-ssh", "203.0.113.5", 22, "ssh"),
+                t("dead-tls", "192.0.2.1", 443, "tls"),
+                t("rebex-ssh", "test.rebex.net", 22, "ssh"),
+                t("cf-tls", "1.1.1.1", 443, "tls"),
+            ],
+            1500,
+            8,
+        )
+        .await;
+        for x in &r {
+            eprintln!("{} {}", x.id, x.up);
+        }
     }
 }

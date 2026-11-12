@@ -612,11 +612,16 @@ impl Sessions {
             return Ok(s.clone());
         }
         let h = self.ssh.lock().unwrap().get(&id).cloned().ok_or("SSH-сеанс не найден или ещё не подключён")?;
-        let ch = h.channel_open_session().await.map_err(|e| e.to_string())?;
-        ch.request_subsystem(true, "sftp").await.map_err(|e| e.to_string())?;
-        let sftp = russh_sftp::client::SftpSession::new(ch.into_stream())
+        let open = async {
+            let ch = h.channel_open_session().await.map_err(|e| format!("Не удалось открыть канал: {}", e))?;
+            ch.request_subsystem(true, "sftp").await.map_err(|e| e.to_string())?;
+            russh_sftp::client::SftpSession::new(ch.into_stream())
+                .await
+                .map_err(|e| format!("Сервер не ответил по SFTP (подсистема sftp отключена?): {}", e))
+        };
+        let sftp = tokio::time::timeout(Duration::from_secs(15), open)
             .await
-            .map_err(|e| format!("Сервер не поддерживает SFTP: {}", e))?;
+            .map_err(|_| "Сервер не ответил по SFTP за 15 секунд".to_string())??;
         let sftp = Arc::new(sftp);
         g.insert(id, sftp.clone());
         Ok(sftp)
@@ -1022,5 +1027,35 @@ mod tunnel_tests {
         assert_eq!(r[1], Tunnel::Dynamic { bind: "0.0.0.0".into(), lport: 1080 });
         assert_eq!(r[2], Tunnel::Local { bind: "::1".into(), lport: 3390, host: "srv".into(), port: 3389 });
         assert!(parse_tunnels("X 1 2").is_err());
+    }
+}
+
+#[cfg(test)]
+mod sftp_live {
+    use super::*;
+    struct H;
+    impl client::Handler for H {
+        type Error = russh::Error;
+        async fn check_server_key(&mut self, _: &PublicKeyOrCertificate) -> Result<bool, Self::Error> {
+            Ok(true)
+        }
+    }
+    /// Ручная проверка против публичного тестового сервера: cargo test sftp_rebex -- --ignored
+    #[tokio::test]
+    #[ignore]
+    async fn sftp_rebex() {
+        let mut h = client::connect(Arc::new(client::Config::default()), ("test.rebex.net", 22), H).await.unwrap();
+        assert!(h.authenticate_password("demo", "password").await.unwrap().success());
+        let h = Arc::new(h);
+        let mut sh = h.channel_open_session().await.unwrap();
+        sh.request_pty(false, "xterm-256color", 80, 24, 0, 0, &[]).await.unwrap();
+        sh.request_shell(false).await.unwrap();
+        tokio::spawn(async move { while let Some(m) = sh.wait().await { eprintln!("shell msg {:?}", std::mem::discriminant(&m)); } });
+        let ch = h.channel_open_session().await.unwrap();
+        ch.request_subsystem(true, "sftp").await.unwrap();
+        let s = tokio::time::timeout(Duration::from_secs(15), russh_sftp::client::SftpSession::new(ch.into_stream())).await.expect("timeout").unwrap();
+        let p = s.canonicalize(".").await.unwrap();
+        let n = s.read_dir(p.clone()).await.unwrap().count();
+        eprintln!("path {} entries {}", p, n);
     }
 }

@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { app, applyTheme, setupEvents } from "$lib/state.svelte";
-  import { api, errText, PROTOCOL_LABEL, PROTOCOLS } from "$lib/api";
+  import { api, errText, PROTOCOL_LABEL, TAB_PROTOCOLS } from "$lib/api";
   import { getCurrentWindow } from "@tauri-apps/api/window";
 
   const inTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
@@ -207,7 +207,7 @@
       <form class="quick" onsubmit={(e) => (e.preventDefault(), doQuick())}>
         <Icon name="zap" size={14} />
         <select bind:value={quickProto} title="Протокол">
-          {#each PROTOCOLS as p}<option value={p}>{PROTOCOL_LABEL[p]}</option>{/each}
+          {#each TAB_PROTOCOLS as p}<option value={p}>{PROTOCOL_LABEL[p]}</option>{/each}
         </select>
         <input bind:this={quickEl} bind:value={quick} placeholder="Быстрое подключение: user@host:port  (Ctrl+K)" />
         <button class="go" type="submit" disabled={!quick.trim()} title="Подключиться"><Icon name="play" size={13} /></button>

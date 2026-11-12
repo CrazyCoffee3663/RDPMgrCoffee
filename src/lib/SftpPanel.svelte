@@ -160,7 +160,10 @@
   </form>
   <div class="list">
     {#if error}
-      <div class="msg err selectable">{error}</div>
+      <div class="msg err selectable">
+        {error}
+        <div><button class="btn" onclick={() => load(path)}>Повторить</button></div>
+      </div>
     {:else if loading && !entries.length}
       <div class="msg faint">Загрузка…</div>
     {/if}
@@ -196,6 +199,8 @@
 
 <style>
   .sftp {
+    position: relative;
+    z-index: 20;
     width: 340px;
     flex-shrink: 0;
     display: flex;
@@ -271,6 +276,9 @@
   }
   .err {
     color: var(--danger);
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
   }
   .foot {
     padding: 6px 10px;

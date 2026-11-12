@@ -541,10 +541,13 @@
             {#if login}<span class="login" title="Логин">{login}</span>{/if}
           {/if}
           {#if c}
+            <!-- Адрес — во всплывающей подсказке, индикатор — у правого края -->
             {@const d = dotState(it)}
-            {#if d}<span class="dot {d.cls}" title={d.title}></span>{/if}
-          {:else if live}<span class="dot {live}"></span>{/if}
-          <span class="sub">{subtitle(it)}</span>
+            <span class="dot right {d?.cls ?? 'none'}" title={[subtitle(it), d?.title].filter(Boolean).join(" — ")}></span>
+          {:else}
+            <span class="sub">{subtitle(it)}</span>
+            {#if live}<span class="dot {live}"></span>{/if}
+          {/if}
         </div>
       {/if}
     {/each}
@@ -750,6 +753,13 @@
     border-radius: 50%;
     flex-shrink: 0;
     background: var(--text-faint);
+  }
+  .dot.right {
+    margin-left: auto;
+    margin-right: 2px;
+  }
+  .dot.none {
+    background: transparent;
   }
   .dot.connected {
     background: var(--ok);

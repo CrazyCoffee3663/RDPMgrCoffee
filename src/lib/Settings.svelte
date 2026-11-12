@@ -275,6 +275,7 @@
         <div class="sect">Внешние инструменты</div>
         <p class="hint">
           Появляются в меню подключения (правый клик). Подстановки: <code>%HOST%</code> <code>%PORT%</code>
+          <code>%ADDR%</code> (хост[:порт])
           <code>%USER%</code> <code>%PASSWORD%</code> <code>%DOMAIN%</code> <code>%NAME%</code>. Программа:
           путь к exe, <code>winbox</code> — встроенный WinBox, <code>url</code> — открыть ссылку в браузере.
           <br />Пароль в командной строке виден другим программам вашего пользователя — подставляйте

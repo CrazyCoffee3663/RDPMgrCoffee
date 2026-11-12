@@ -131,7 +131,7 @@ export const api = {
   winboxInstall: (version: string) => invoke<void>("winbox_install", { version }),
   rdpDetach: (id: number, title: string) => invoke<void>("rdp_detach", { id, title }),
   rdpAttach: (id: number) => invoke<void>("rdp_attach", { id }),
-  probeHosts: (targets: { id: string; host: string; port: number }[], timeoutMs: number, parallel: number) =>
+  probeHosts: (targets: { id: string; host: string; port: number; kind: string }[], timeoutMs: number, parallel: number) =>
     invoke<{ id: string; up: boolean }[]>("probe_hosts", { targets, timeoutMs, parallel }),
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   importMremoteng: (xml: string, password: string | null) => invoke<any>("import_mremoteng", { xml, password }),
@@ -146,10 +146,12 @@ export function errText(e: unknown): string {
 
 // ---------- Модель подключений поверх записей Bitwarden ----------
 
-export const PROTOCOLS = ["rdp", "ssh", "telnet", "serial"] as const;
+export const PROTOCOLS = ["rdp", "ssh", "telnet", "serial", "winbox"] as const;
 export type Protocol = (typeof PROTOCOLS)[number];
-export const DEFAULT_PORTS: Record<Protocol, number | null> = { rdp: 3389, ssh: 22, telnet: 23, serial: null };
-export const PROTOCOL_LABEL: Record<Protocol, string> = { rdp: "RDP", ssh: "SSH", telnet: "Telnet", serial: "COM" };
+export const DEFAULT_PORTS: Record<Protocol, number | null> = { rdp: 3389, ssh: 22, telnet: 23, serial: null, winbox: 8291 };
+export const PROTOCOL_LABEL: Record<Protocol, string> = { rdp: "RDP", ssh: "SSH", telnet: "Telnet", serial: "COM", winbox: "WinBox" };
+/** Протоколы, которые открываются во вкладке (WinBox запускается отдельной программой) */
+export const TAB_PROTOCOLS = PROTOCOLS.filter((p) => p !== "winbox");
 
 /** Поля, которыми управляет редактор подключения. Остальные показываются как «дополнительные». */
 export const KNOWN_FIELDS = [

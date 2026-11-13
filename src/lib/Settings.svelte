@@ -1,7 +1,7 @@
 <script lang="ts">
   import { app, applyTheme, findTheme } from "./state.svelte";
   import { PRESETS, newThemeId, type CustomTheme } from "./themes";
-  import { createRootFolder, migrateToRoot, needsMigration, tidyGateways, exportAll, checkWinbox, installWinbox, newerVersion } from "./actions";
+  import { createRootFolder, migrateToRoot, needsMigration, tidyGateways, exportAll, checkWinbox, checkFreerdp, freerdpUpdateInfo, installWinbox, newerVersion } from "./actions";
   import { DEFAULT_TOOLS, type Tool } from "./state.svelte";
   import { api, errText, PROTOCOLS, PROTOCOL_LABEL } from "./api";
   import Icon from "./Icon.svelte";
@@ -47,6 +47,16 @@
     } catch (e) {
       app.toast(errText(e), true);
     }
+  }
+
+  // ---- FreeRDP ----
+  let fr = $state<{ installed: string | null; latest: string | null } | null>(null);
+  let frBusy = $state(false);
+  async function frCheck() {
+    frBusy = true;
+    fr = (await checkFreerdp(true)) ?? null;
+    frBusy = false;
+    if (app.freerdpUpdate) freerdpUpdateInfo();
   }
 
   // ---- Внешние инструменты и WinBox ----
@@ -289,6 +299,18 @@
             ></span
           >
           <span><input type="checkbox" bind:checked={s.rdpLog} onchange={changed} /></span>
+        </label>
+
+        <div class="row">
+          <span
+            >FreeRDP: <b>{fr?.installed ?? "?"}</b>{#if fr}, последняя: <b>{fr.latest ?? "не удалось узнать"}</b>{/if}
+            <small>(обновления FreeRDP закрывают уязвимости RDP-клиента — важно для безопасности; FreeRDP обновляется вместе с программой)</small></span
+          >
+          <span class="btns"><button class="btn" onclick={frCheck} disabled={frBusy}>Проверить</button></span>
+        </div>
+        <label class="row">
+          <span>Проверять выход новых версий FreeRDP <small>(раз в сутки, только уведомление)</small></span>
+          <span><input type="checkbox" bind:checked={s.freerdpAutoCheck} onchange={changed} /></span>
         </label>
 
         <div class="sect">Синхронизация</div>

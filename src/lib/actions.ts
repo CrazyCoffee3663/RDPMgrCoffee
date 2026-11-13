@@ -116,6 +116,42 @@ export async function checkWinbox(force = false) {
   }
 }
 
+/** Раз в сутки (или по кнопке) проверить, не вышла ли новая версия FreeRDP */
+export async function checkFreerdp(force = false) {
+  const key = "freerdpChecked";
+  if (!force) {
+    if (!app.settings.freerdpAutoCheck) return;
+    const last = Number(localStorage.getItem(key) ?? 0);
+    if (Date.now() - last < 24 * 3600_000) return;
+  }
+  try {
+    const st = await api.freerdpStatus();
+    localStorage.setItem(key, String(Date.now()));
+    app.freerdpUpdate =
+      st.installed && st.latest && newerVersion(st.latest, st.installed)
+        ? { installed: st.installed, latest: st.latest, url: st.url }
+        : null;
+    return st;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Новая версия FreeRDP: объяснить и, с согласия, открыть страницу выпуска */
+export async function freerdpUpdateInfo() {
+  const u = app.freerdpUpdate;
+  if (!u) return;
+  const ok = await dialogs.confirm(
+    `Вышел FreeRDP ${u.latest}`,
+    `Встроен FreeRDP ${u.installed}. Новые версии FreeRDP закрывают уязвимости RDP-клиента — для безопасности важно обновляться: ` +
+      `взломанный или подменённый сервер может атаковать компьютер через ошибки клиента.\n\n` +
+      `FreeRDP входит в состав RDPMgrCoffee и обновляется вместе с программой — установите её новую версию, когда она выйдет. ` +
+      `Открыть описание выпуска FreeRDP на GitHub?`,
+    "Открыть",
+  );
+  if (ok) api.openUrl(u.url).catch(() => {});
+}
+
 export async function runTool(item: Item, tool: Tool) {
   if (tool.popup) return openToolWindow(item, tool);
   try {

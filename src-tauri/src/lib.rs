@@ -212,6 +212,9 @@ struct OpenArgs {
     /// Писать журнал FreeRDP на диск (настройка «Журнал RDP»)
     #[serde(default)]
     rdp_log: bool,
+    /// Повтор после неудачи Kerberos: только NTLM
+    #[serde(default)]
+    force_ntlm: bool,
 }
 
 #[tauri::command]
@@ -241,6 +244,9 @@ async fn session_open(
     let title = p.name.clone();
     let protocol = p.protocol.clone();
     if p.protocol == "rdp" {
+        if args.force_ntlm {
+            p.opts.insert("auth".into(), "ntlm".into());
+        }
         let [x, y, w, h] = args.rect.unwrap_or([0, 0, 1024, 768]);
         rdp::open(&app, id, p, x, y, w, h, args.rdp_log).await?;
         Ok(Opened { id, kind: "rdp".into(), protocol, title })
@@ -548,6 +554,13 @@ async fn winbox_install(tools: State<'_, Tools>, version: String) -> Result<(), 
     tools::install(&tools.http, &tools.dir, &version).await
 }
 
+/// Версия встроенного FreeRDP и последняя на GitHub (уведомление об обновлении).
+#[tauri::command]
+async fn freerdp_status(tools: State<'_, Tools>) -> Result<tools::FreerdpStatus, String> {
+    let dir = rdp::FREERDP_EXE.get().and_then(|e| e.parent().map(|p| p.to_path_buf()));
+    Ok(tools::freerdp_status(&tools.http, dir.as_deref()).await)
+}
+
 /// Проверка доступности хостов (индикатор в дереве).
 #[tauri::command]
 async fn probe_hosts(targets: Vec<net::Target>, timeout_ms: u64, parallel: usize) -> Vec<net::Reach> {
@@ -706,6 +719,7 @@ pub fn run() {
             sftp_upload,
             sftp_op,
             winbox_status,
+            freerdp_status,
             winbox_install,
             import_mremoteng_file
         ])

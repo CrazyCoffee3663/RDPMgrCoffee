@@ -5,7 +5,7 @@
   import { getCurrentWindow } from "@tauri-apps/api/window";
 
   const inTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
-  import { newItem, checkWinbox, installWinbox } from "$lib/actions";
+  import { newItem, checkWinbox, installWinbox, checkFreerdp, freerdpUpdateInfo } from "$lib/actions";
   import { menu } from "$lib/dialogs.svelte";
   import Unlock from "$lib/Unlock.svelte";
   import Sidebar from "$lib/Sidebar.svelte";
@@ -77,7 +77,7 @@
 
   // Проверка обновлений WinBox после разблокировки (раз в сутки)
   $effect(() => {
-    if (app.phase === "unlocked") setTimeout(() => checkWinbox(), 5000);
+    if (app.phase === "unlocked") setTimeout(() => (checkWinbox(), checkFreerdp()), 5000);
   });
 
   // Окно настроек скрывает окна RDP
@@ -320,6 +320,11 @@
       {/if}
       <span class="faint">{app.status.email}</span>
       <span class="sp"></span>
+      {#if app.freerdpUpdate}
+        <button class="upd" onclick={() => freerdpUpdateInfo()} title="Встроен FreeRDP {app.freerdpUpdate.installed}">
+          <Icon name="alert" size={12} /> Вышел FreeRDP {app.freerdpUpdate.latest} — важно для безопасности
+        </button>
+      {/if}
       {#if app.winboxUpdate}
         {@const u = app.winboxUpdate}
         <button class="upd" onclick={() => installWinbox(u.latest, true)} title="Установлена {u.installed}">

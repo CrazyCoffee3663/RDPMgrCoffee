@@ -670,14 +670,47 @@ async fn cert_check(app: &AppHandle, id: u32, p: &ConnParams) -> Result<Option<S
             Some((h, pt)) if !h.ends_with(':') && pt.parse::<u16>().is_ok() => (h.to_string(), pt.parse().unwrap()),
             _ => (addr.clone(), 443u16),
         };
-        let fp = crate::rdpcert::fetch(&h, port, false).await?;
-        confirm("RD-шлюза".into(), format!("{}:{}", h, port), fp).await?;
+        let host_id = format!("{}:{}", h, port);
+        match crate::rdpcert::fetch(&h, port, false).await {
+            Ok(fp) => confirm("RD-шлюза".into(), host_id, fp).await?,
+            Err(e) if e.starts_with(crate::rdpcert::TLS_UNSUPPORTED) => {
+                unchecked(app, id, &path, "RD-шлюза", &host_id).await?
+            }
+            Err(e) => return Err(e),
+        }
         return Ok(None);
     }
     let port = p.port.unwrap_or(3389);
-    let fp = crate::rdpcert::fetch(&p.host, port, true).await?;
-    confirm("RDP-сервера".into(), format!("{}:{}", p.host, port), fp.clone()).await?;
-    Ok(Some(crate::rdpcert::freerdp_pin(&[&fp])))
+    let host_id = format!("{}:{}", p.host, port);
+    match crate::rdpcert::fetch(&p.host, port, true).await {
+        Ok(fp) => {
+            confirm("RDP-сервера".into(), host_id, fp.clone()).await?;
+            Ok(Some(crate::rdpcert::freerdp_pin(&[&fp])))
+        }
+        Err(e) if e.starts_with(crate::rdpcert::TLS_UNSUPPORTED) => {
+            unchecked(app, id, &path, "RDP-сервера", &host_id).await?;
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Сервер говорит только на старых версиях TLS/шифрах, сертификат заранее не получить.
+/// Один раз спросить и дальше доверить проверку FreeRDP (хранилище сертификатов Windows,
+/// иначе — запоминание при первом входе).
+async fn unchecked(app: &AppHandle, id: u32, path: &std::path::Path, what: &str, host_id: &str) -> Result<(), String> {
+    if crate::rdpcert::known(path, host_id).as_deref() == Some("UNCHECKED") {
+        return Ok(());
+    }
+    let msg = format!(
+        "Не удалось заранее проверить сертификат {} {}: сервер использует устаревшие параметры TLS.\n\nСертификат проверит сам FreeRDP — по доверенным центрам сертификации Windows, а самоподписанный запомнит при первом входе.\n\nПодключиться? Вопрос больше не появится для этого адреса.",
+        what, host_id
+    );
+    if crate::sessions::ask(app, id, "confirm", "Сертификат не проверен заранее", &msg, false).await.is_none() {
+        return Err("Подключение отменено".into());
+    }
+    crate::rdpcert::remember(path, host_id, "UNCHECKED");
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -785,6 +818,7 @@ pub async fn open(app: &AppHandle, id: u32, p: ConnParams, x: i32, y: i32, w: i3
         emit_status(app, id, "connected", "");
 
         let app2 = app.clone();
+        let p_auth = p.clone();
         std::thread::spawn(move || {
             let code = loop {
                 if let Ok(Some(st)) = child.lock().unwrap().try_wait() {
@@ -808,7 +842,15 @@ pub async fn open(app: &AppHandle, id: u32, p: ConnParams, x: i32, y: i32, w: i3
             } else {
                 mem_log.lock().unwrap().iter().cloned().collect::<Vec<_>>().join("\n")
             };
-            let errors = log_errors(&text);
+            let mut errors = log_errors(&text);
+            // Kerberos не договорился (сервер вне домена, нет KDC) — интерфейс повторит через NTLM,
+            // как делает mstsc. Только если Kerberos не выбран в записи явно.
+            if use_kerberos(&p_auth) && !p_auth.opt("auth").eq_ignore_ascii_case("kerberos") && !errors.is_empty()
+                && (errors.contains("SECURITY_NEGO_CONNECT_FAILED") || errors.contains("NEGO_FAILURE")
+                    || errors.to_ascii_lowercase().contains("kerberos"))
+            {
+                errors = format!("RDP_RETRY_NTLM\n{}", errors);
+            }
             let _ = app2.run_on_main_thread(move || win::destroy(hwnd));
             if killed || code == 0 || errors.is_empty() {
                 emit_status(&app2, id, "closed", "");

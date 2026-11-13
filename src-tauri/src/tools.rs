@@ -422,6 +422,38 @@ fn open_url(url: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Версия встроенного FreeRDP и последняя версия FreeRDP на GitHub.
+#[derive(Serialize)]
+pub struct FreerdpStatus {
+    pub installed: Option<String>,
+    pub latest: Option<String>,
+    pub url: String,
+}
+
+pub async fn freerdp_status(http: &reqwest::Client, freerdp_dir: Option<&Path>) -> FreerdpStatus {
+    let installed = freerdp_dir
+        .and_then(|d| std::fs::read_to_string(d.join("version.txt")).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let mut url = "https://github.com/FreeRDP/FreeRDP/releases".to_string();
+    let latest = match http
+        .get("https://api.github.com/repos/FreeRDP/FreeRDP/releases/latest")
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .await
+    {
+        Ok(r) if r.status().is_success() => r.json::<serde_json::Value>().await.ok().and_then(|v| {
+            if let Some(u) = v["html_url"].as_str().filter(|u| u.starts_with("https://github.com/FreeRDP/FreeRDP/")) {
+                url = u.to_string();
+            }
+            v["tag_name"].as_str().map(|t| t.trim_start_matches('v').to_string())
+        }),
+        _ => None,
+    }
+    .filter(|s| !s.is_empty() && s.len() < 16 && s.chars().all(|c| c.is_ascii_digit() || c == '.'));
+    FreerdpStatus { installed, latest, url }
+}
+
 #[derive(Serialize)]
 pub struct WinboxStatus {
     pub installed: Option<String>,

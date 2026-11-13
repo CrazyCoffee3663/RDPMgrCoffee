@@ -80,6 +80,8 @@ while [ -n "$queue" ]; do
 done
 # Плагины каналов FreeRDP (если собраны отдельными DLL)
 if [ -d "$PREFIX/lib/freerdp3" ]; then cp -r "$PREFIX/lib/freerdp3" "$OUT.new/"; fi
+# Версия — для проверки обновлений в программе
+echo "$VER" > "$OUT.new/version.txt"
 rm -rf "$OUT.old"; [ -d "$OUT" ] && mv "$OUT" "$OUT.old"
 mv "$OUT.new" "$OUT"
 echo "Готово: $OUT ($(du -sh "$OUT" | cut -f1)), прежняя версия — $OUT.old"

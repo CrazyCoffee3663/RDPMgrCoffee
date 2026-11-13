@@ -1,3 +1,8 @@
+<script module lang="ts">
+  /** Адреса, где Kerberos не сработал (до перезапуска программы) */
+  const ntlmOnly = new Set<string>();
+</script>
+
 <script lang="ts">
   import { onMount, onDestroy } from "svelte";
   import { api, errText, makeChannel } from "./api";
@@ -18,11 +23,16 @@
     return [Math.round(r.left * k), Math.round(r.top * k), Math.round(r.width * k), Math.round(r.height * k)];
   }
 
-  async function start() {
+  // Подключения, где Kerberos не сработал: до перезапуска программы сразу NTLM
+  const key = () => tab.itemId ?? tab.quick?.address ?? "";
+  let retried = false;
+
+  async function start(forceNtlm = false) {
     startedGen = tab.gen;
     try {
       const r = await api.open({ itemId: tab.itemId, quick: tab.quick?.address, quickProtocol: "rdp",
-        quickUsername: tab.quick?.username, quickPassword: tab.quick?.password, cols: 0, rows: 0, rect: rect(), rdpLog: app.settings.rdpLog },
+        quickUsername: tab.quick?.username, quickPassword: tab.quick?.password, cols: 0, rows: 0, rect: rect(), rdpLog: app.settings.rdpLog,
+        forceNtlm: forceNtlm || ntlmOnly.has(key()) },
         makeChannel<ArrayBuffer>());
       app.bindSession(tab.key, r.id);
       place();
@@ -58,7 +68,29 @@
   onDestroy(() => ro?.disconnect());
 
   $effect(() => {
-    if (mounted && tab.gen !== startedGen) start();
+    if (mounted && tab.gen !== startedGen) {
+      retried = false;
+      start();
+    }
+  });
+
+  // Kerberos не договорился — один раз повторить через NTLM (как mstsc)
+  const RETRY = "RDP_RETRY_NTLM\n";
+  $effect(() => {
+    if (tab.state === "error" && tab.message.startsWith(RETRY)) {
+      const msg = tab.message.slice(RETRY.length);
+      if (retried) {
+        tab.message = msg;
+        return;
+      }
+      retried = true;
+      ntlmOnly.add(key());
+      tab.sessionId = null;
+      tab.state = "connecting";
+      tab.message = "";
+      app.toast("Kerberos не сработал — подключаюсь через NTLM");
+      start(true);
+    }
   });
 
   // Позиция и видимость нативного окна

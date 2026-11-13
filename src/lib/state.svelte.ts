@@ -98,6 +98,8 @@ export type Settings = {
   tourDone: boolean;
   /** Писать журнал FreeRDP на диск (для диагностики; в нём адреса и логины) */
   rdpLog: boolean;
+  /** Проверять выход новых версий FreeRDP (раз в сутки) */
+  freerdpAutoCheck: boolean;
 };
 
 /** Старые стандартные инструменты (cmd /k …) → новые, с выводом в окне приложения */
@@ -150,6 +152,7 @@ const DEFAULT_SETTINGS: Settings = {
   winboxAutoCheck: true,
   tourDone: false,
   rdpLog: false,
+  freerdpAutoCheck: true,
 };
 
 function loadJson<T>(key: string, def: T): T {
@@ -210,6 +213,8 @@ class AppState {
   snippetsOpen = $state(false);
   /** Доступная новая версия WinBox (если установленная устарела) */
   winboxUpdate = $state<{ installed: string; latest: string } | null>(null);
+  /** Вышла новая версия FreeRDP (обновления закрывают уязвимости RDP-клиента) */
+  freerdpUpdate = $state<{ installed: string; latest: string; url: string } | null>(null);
 
   settings = $state<Settings>(migrateSettings(loadJson("settings", DEFAULT_SETTINGS)));
   recent = $state<string[]>(loadArr("recent"));

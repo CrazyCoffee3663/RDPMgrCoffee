@@ -1,5 +1,5 @@
 import { invoke as tauriInvoke, Channel } from "@tauri-apps/api/core";
-import { revealItemInDir } from "@tauri-apps/plugin-opener";
+import { revealItemInDir, openUrl as openerOpenUrl } from "@tauri-apps/plugin-opener";
 import { listen as tauriListen, type EventCallback, type UnlistenFn } from "@tauri-apps/api/event";
 
 // Вне Tauri (npm run dev в обычном браузере) работают демо-данные из mock.ts
@@ -79,6 +79,8 @@ export type OpenArgs = {
   rect?: [number, number, number, number];
   /** Писать журнал FreeRDP на диск */
   rdpLog?: boolean;
+  /** Повтор после неудачи Kerberos: только NTLM */
+  forceNtlm?: boolean;
 };
 
 export const api = {
@@ -152,6 +154,8 @@ export const api = {
     invoke<void>("web_place", { label, x, y, w, h, visible }),
   webClose: (label: string) => invoke<void>("web_close", { label }),
   webNav: (label: string, op: "back" | "forward" | "reload" | "stop") => invoke<void>("web_nav", { label, op }),
+  /** Открыть ссылку https в браузере по умолчанию */
+  openUrl: (url: string) => (inTauri ? openerOpenUrl(url) : Promise.resolve(void window.open(url, "_blank"))),
   /** Показать файл в проводнике */
   reveal: (path: string) => (inTauri ? revealItemInDir(path) : Promise.resolve()),
   /** Возвращает подсказку, если пароль положен в буфер обмена */
@@ -162,6 +166,7 @@ export const api = {
   toolStop: () => invoke<void>("tool_stop"),
   winboxStatus: () => invoke<{ installed: string | null; latest: string | null; path: string }>("winbox_status"),
   winboxInstall: (version: string) => invoke<void>("winbox_install", { version }),
+  freerdpStatus: () => invoke<{ installed: string | null; latest: string | null; url: string }>("freerdp_status"),
   rdpDetach: (id: number, title: string) => invoke<void>("rdp_detach", { id, title }),
   rdpAttach: (id: number) => invoke<void>("rdp_attach", { id }),
   probeHosts: (targets: { id: string; host: string; port: number; kind: string }[], timeoutMs: number, parallel: number) =>

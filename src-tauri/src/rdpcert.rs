@@ -13,6 +13,10 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
+/// Префикс ошибки: TCP-соединение есть, но TLS с сервером не договорился (старые версии
+/// протокола/шифров, которые не поддерживает rustls). Проверку тогда делает FreeRDP.
+pub const TLS_UNSUPPORTED: &str = "TLS_UNSUPPORTED:";
+
 /// X.224 Connection Request с RDP_NEG_REQ (TLS | CredSSP)
 const RDP_CR: [u8; 19] = [
     0x03, 0x00, 0x00, 0x13, 0x0e, 0xe0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x08, 0x00, 0x03, 0x00, 0x00, 0x00,
@@ -102,7 +106,7 @@ pub async fn fetch(host: &str, port: u16, rdp: bool) -> Result<String, String> {
             .unwrap_or_else(|_| rustls::pki_types::ServerName::try_from("rdp.invalid").unwrap())
             .to_owned();
         let conn = tokio_rustls::TlsConnector::from(Arc::new(cfg));
-        let _tls = conn.connect(name, s).await.map_err(|e| format!("TLS с {}:{} не установлен: {}", host, port, e))?;
+        let _tls = conn.connect(name, s).await.map_err(|e| format!("{}{}:{}: {}", TLS_UNSUPPORTED, host, port, e))?;
         let der = cap.cert.lock().unwrap().take().ok_or("Сервер не прислал сертификат")?;
         Ok::<String, String>(hex(&Sha256::digest(&der)))
     };

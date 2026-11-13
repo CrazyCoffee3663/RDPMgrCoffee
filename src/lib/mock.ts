@@ -66,6 +66,7 @@ const H: Record<string, Handler> = {
       ? { state, server: "", email: "", local: true }
       : { state, server: "https://vault.example.com", email: "admin@example.com", local: false },
   terminals_default_dir: () => null,
+  freerdp_status: () => ({ installed: "3.32.0", latest: "3.33.0", url: "https://github.com/FreeRDP/FreeRDP/releases" }),
   web_open: () => {},
   web_place: () => {},
   web_close: () => {},

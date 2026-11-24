@@ -52,7 +52,7 @@ github.com: api.github.com блокируют hosts-файлы некоторы�
 
     scripts/build-freerdp.sh 3.33.1     # в оболочке MSYS2 UCRT64
     scripts/publish-freerdp.sh 3.33.1   # релиз freerdp-3.33.1 с архивом и SHA-256
-    scripts/publish-app.sh 0.1.2        # релиз v0.1.2 с установщиком и SHA-256
+    scripts/publish-app.sh 0.1.3        # релиз v0.1.3 с установщиком и SHA-256
 
 Затем:
 

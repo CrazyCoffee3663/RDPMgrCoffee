@@ -77,6 +77,25 @@
     auBusy = false;
   }
 
+  // ---- Переход из popup обновления: раскрыть «Расширенные», проверить и подсветить строку ----
+  let advOpen = $state(false);
+  let flash = $state<string | null>(null);
+  $effect(() => {
+    const f = app.settingsFocus;
+    if (!f) return;
+    app.settingsFocus = null;
+    advOpen = true;
+    if (f === "app") auCheck();
+    else if (f === "freerdp") frCheck();
+    else wbCheck();
+    const id = "upd-" + f;
+    setTimeout(() => {
+      document.getElementById(id)?.scrollIntoView({ block: "center", behavior: "smooth" });
+      flash = id;
+      setTimeout(() => (flash = null), 1800);
+    }, 80);
+  });
+
   // ---- Внешние инструменты и WinBox ----
   let wb = $state<{ installed: string | null; latest: string | null; path: string } | null>(null);
   let wbBusy = $state(false);
@@ -297,7 +316,7 @@
         </div>
       {/if}
 
-      <details class="adv">
+      <details class="adv" bind:open={advOpen}>
         <summary>Расширенные</summary>
         <div class="sect">Безопасность</div>
         <label class="row">
@@ -319,7 +338,7 @@
           <span><input type="checkbox" bind:checked={s.rdpLog} onchange={changed} /></span>
         </label>
 
-        <div class="row">
+        <div class="row" id="upd-app" class:flash={flash === "upd-app"}>
           <span
             >Приложение: <b>{au?.current ?? "?"}</b>{#if au}, последняя: <b>{au.latest ?? "не удалось узнать"}</b>{/if}
             <small>(установщик с GitHub, проверка SHA-256)</small></span
@@ -341,7 +360,7 @@
           <span><input type="checkbox" bind:checked={s.appAutoCheck} onchange={changed} /></span>
         </label>
 
-        <div class="row">
+        <div class="row" id="upd-freerdp" class:flash={flash === "upd-freerdp"}>
           <span
             >FreeRDP: <b>{fr?.installed ?? "?"}</b>{#if fr}, последняя: <b>{fr.latest ?? "не удалось узнать"}</b>{/if}
             <small>(обновления FreeRDP закрывают уязвимости RDP-клиента — важно для безопасности)</small></span
@@ -370,7 +389,7 @@
         </label>
 
         <div class="sect">WinBox</div>
-        <div class="row">
+        <div class="row" id="upd-winbox" class:flash={flash === "upd-winbox"}>
           <span>
             {#if wb}
               Установлен: <b>{wb.installed ?? "нет"}</b>, последняя: <b>{wb.latest ?? "не удалось узнать"}</b>
@@ -560,6 +579,11 @@
     gap: 12px;
     align-items: center;
     padding: 5px 0;
+  }
+  .row.flash {
+    background: var(--accent-soft);
+    border-radius: var(--radius-sm);
+    box-shadow: 0 0 0 4px var(--accent-soft);
   }
   small {
     color: var(--text-faint);

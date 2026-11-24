@@ -224,6 +224,10 @@ class AppState {
   appUpdate = $state<{ current: string; latest: string; url: string } | null>(null);
   /** Идёт обновление приложения: этап и процент загрузки */
   appUpdating = $state<{ phase: string; percent: number } | null>(null);
+  /** Строка настроек, к которой перейти из popup обновления (раскрыть и подсветить) */
+  settingsFocus = $state<"app" | "freerdp" | "winbox" | null>(null);
+  /** Версии, уведомление о которых скрыли: popup не показывать до следующей новой */
+  updateDismissed = $state<string[]>(loadArr("updateDismissed"));
 
   settings = $state<Settings>(migrateSettings(loadJson("settings", DEFAULT_SETTINGS)));
   recent = $state<string[]>(loadArr("recent"));
@@ -406,6 +410,11 @@ class AppState {
     if (want && !has) this.expanded = [...this.expanded, key];
     if (!want && has) this.expanded = this.expanded.filter((k) => k !== key);
     save("expanded", this.expanded);
+  }
+
+  dismissUpdates(keys: string[]) {
+    this.updateDismissed = [...new Set([...this.updateDismissed, ...keys])];
+    save("updateDismissed", this.updateDismissed);
   }
 
   toast(text: string, error = false) {

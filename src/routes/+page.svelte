@@ -18,6 +18,7 @@
   import Overlays from "$lib/Overlays.svelte";
   import ExportDialog from "$lib/ExportDialog.svelte";
   import Tour from "$lib/Tour.svelte";
+  import UpdatePopup from "$lib/UpdatePopup.svelte";
   import Icon from "$lib/Icon.svelte";
 
   // Вьюхи с тяжёлыми зависимостями (xterm, noVNC) грузятся при первой вкладке своего
@@ -335,6 +336,8 @@
 
       {#if app.editing}<Editor />{/if}
     </div>
+
+    <UpdatePopup />
 
     <div class="status">
       {#if app.status.local}

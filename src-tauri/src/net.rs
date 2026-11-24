@@ -52,6 +52,66 @@ fn tls_hello() -> Vec<u8> {
     rec
 }
 
+/// ClientHello старого TLS (1.0/1.1) с классическими шифрами: ответ сервера
+/// (ServerHello 0x16 или alert 0x15) показывает, говорит ли он на этой версии.
+fn old_tls_hello(ver: [u8; 2]) -> Vec<u8> {
+    let mut body = ver.to_vec();
+    body.extend((0..32u8).map(|i| i.wrapping_mul(37).wrapping_add(11)));
+    body.push(0); // session id
+    let suites: [u16; 5] = [0x002f, 0x0035, 0x000a, 0x0005, 0x00ff];
+    body.extend(((suites.len() * 2) as u16).to_be_bytes());
+    for s in suites {
+        body.extend(s.to_be_bytes());
+    }
+    body.extend([1, 0]); // compression: null
+    let mut hs = vec![0x01, 0, (body.len() >> 8) as u8, body.len() as u8];
+    hs.extend(body);
+    let mut rec = vec![0x16, ver[0], ver[1]];
+    rec.extend((hs.len() as u16).to_be_bytes());
+    rec.extend(hs);
+    rec
+}
+
+/// ServerHello на ClientHello данной версии — сервер её принимает.
+async fn old_tls_accepts(addr: &str, ver: [u8; 2], rdp: bool) -> bool {
+    let timeout = Duration::from_millis(1500);
+    let Ok(Ok(mut s)) = tokio::time::timeout(timeout, TcpStream::connect(addr)).await else {
+        return false;
+    };
+    if rdp {
+        if s.write_all(&RDP_CR).await.is_err() {
+            return false;
+        }
+        let mut cc = [0u8; 19];
+        if tokio::time::timeout(timeout, s.read_exact(&mut cc)).await.is_err() {
+            return false;
+        }
+        // RDP_NEG_RSP с выбранным TLS/CredSSP; отказ negotiation — старого TLS нет
+        if cc[5] != 0xd0 || cc[11] != 0x02 || cc[15] == 0 {
+            return false;
+        }
+    }
+    if s.write_all(&old_tls_hello(ver)).await.is_err() {
+        return false;
+    }
+    let mut first = [0u8; 1];
+    matches!(tokio::time::timeout(timeout, s.read_exact(&mut first)).await, Ok(Ok(_)) if first[0] == 0x16)
+}
+
+/// Какую старую версию TLS принимает сервер: "1.1"/"1.0", либо "auto" — сервер
+/// говорит на современном TLS, но со слабыми шифрами (хватит понизить seclevel).
+/// rdp = true — сначала согласование RDP (X.224), иначе обычный TLS (RD-шлюз).
+pub async fn old_tls_version(host: &str, port: u16, rdp: bool) -> &'static str {
+    let h = host.trim_matches(['[', ']']);
+    let addr = if h.contains(':') { format!("[{}]:{}", h, port) } else { format!("{}:{}", h, port) };
+    for (ver, name) in [([0x03, 0x02], "1.1"), ([0x03, 0x01], "1.0")] {
+        if old_tls_accepts(&addr, ver, rdp).await {
+            return name;
+        }
+    }
+    "auto"
+}
+
 async fn check(addr: String, kind: &str, timeout: Duration) -> bool {
     let start = tokio::time::Instant::now();
     let Ok(Ok(mut s)) = tokio::time::timeout(timeout, TcpStream::connect(addr)).await else {
@@ -214,6 +274,45 @@ mod tests {
         });
         let r = probe(vec![Target { id: "v6".into(), host: "::1".into(), port, kind: "ssh".into() }], 800, 4).await;
         assert!(r[0].up, "IPv6 loopback должен проверяться");
+    }
+
+    /// Пробник старого TLS: ServerHello на 1.0 и alert на 1.1 → "1.0"; alert на оба → "auto"
+    #[tokio::test]
+    async fn old_tls_version_probe() {
+        const CC: [u8; 19] = [
+            0x03, 0x00, 0x00, 0x13, 0x0e, 0xd0, 0x00, 0x00, 0x00, 0x01, 0x00, 0x02, 0x00, 0x08, 0x00, 0x01, 0x00, 0x00, 0x00,
+        ];
+        let spawn = |only_tls10: bool| async move {
+            let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = l.local_addr().unwrap().port();
+            tokio::spawn(async move {
+                while let Ok((mut c, _)) = l.accept().await {
+                    let mut cr = [0u8; 19];
+                    if c.read_exact(&mut cr).await.is_err() {
+                        continue;
+                    }
+                    let _ = c.write_all(&CC).await;
+                    let mut rec = [0u8; 5];
+                    if c.read_exact(&mut rec).await.is_err() {
+                        continue;
+                    }
+                    let hello10 = rec[1..3] == [0x03, 0x01];
+                    let resp: &[u8] = if only_tls10 && hello10 {
+                        &[0x16, 0x03, 0x01, 0x00, 0x00]
+                    } else {
+                        &[0x15, 0x03, 0x01, 0x00, 0x02, 0x02, 0x46]
+                    };
+                    let _ = c.write_all(resp).await;
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                }
+            });
+            port
+        };
+        let port = spawn(true).await;
+        assert_eq!(old_tls_version("127.0.0.1", port, true).await, "1.0");
+        let mport = spawn(false).await;
+        assert_eq!(old_tls_version("127.0.0.1", mport, true).await, "auto");
+        assert_eq!(old_tls_version("127.0.0.1", 1, true).await, "auto");
     }
 
     /// Ручная проверка через сеть этого ПК: cargo test probe_live -- --ignored --nocapture

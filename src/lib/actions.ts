@@ -170,6 +170,57 @@ export async function updateFreerdp(version?: string): Promise<boolean> {
   }
 }
 
+/** Раз в сутки (или по кнопке) проверить, не вышла ли новая версия приложения на GitHub */
+export async function checkAppUpdate(force = false) {
+  const key = "appChecked";
+  if (!force) {
+    if (!app.settings.appAutoCheck) return;
+    const last = Number(localStorage.getItem(key) ?? 0);
+    if (Date.now() - last < 24 * 3600_000) return;
+  }
+  try {
+    const st = await api.appUpdateStatus();
+    localStorage.setItem(key, String(Date.now()));
+    app.appUpdate =
+      st.latest && newerVersion(st.latest, st.current) ? { current: st.current, latest: st.latest, url: st.url } : null;
+    return st;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Обновление приложения одной кнопкой: установщик с GitHub-релиза, SHA-256, запуск */
+export async function updateApp(): Promise<boolean> {
+  if (app.appUpdating) return false;
+  const ver = app.appUpdate?.latest;
+  const ok = await dialogs.confirm(
+    ver ? `Обновить приложение до ${ver}?` : "Обновить приложение?",
+    `Будет скачан установщик (~8 МБ) с релиза GitHub, проверен по SHA-256 и запущен. ` +
+      `Установщик попросит закрыть приложение и заменит его новой версией.`,
+    "Обновить",
+  );
+  if (!ok) return false;
+  app.appUpdating = { phase: "download", percent: 0 };
+  const un = await listen<{ phase: string; percent: number }>("app-update-progress", (e) => {
+    app.appUpdating = e.payload;
+  });
+  try {
+    const r = await api.appUpdateInstall();
+    if (r.already) app.toast(`Версия ${r.version} уже установлена`);
+    else {
+      app.toast(`Установщик ${r.version} запущен — подтвердите закрытие приложения`);
+      app.appUpdate = null;
+    }
+    return true;
+  } catch (e) {
+    app.toast(errText(e), true);
+    return false;
+  } finally {
+    un();
+    app.appUpdating = null;
+  }
+}
+
 export async function runTool(item: Item, tool: Tool) {
   if (tool.popup) return openToolWindow(item, tool);
   try {

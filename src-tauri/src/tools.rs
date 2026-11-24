@@ -487,9 +487,9 @@ pub struct FreerdpStatus {
     pub url: String,
 }
 
-/// Репозиторий с готовыми сборками FreeRDP: кнопка обновления качает его релизы.
+/// Наш репозиторий: релизы сборок FreeRDP (freerdp-…) и установщики приложения (v…).
 /// Всё через github.com: api.github.com блокируют hosts-файлы некоторых антивирусов.
-const FREERDP_REPO: &str = "CrazyCoffee3663/RDPMgrCoffee";
+const GH_REPO: &str = "CrazyCoffee3663/RDPMgrCoffee";
 
 /// Тег последнего релиза: github.com/releases/latest перенаправляет на /releases/tag/<tag>.
 pub fn tag_from_release_url(url: &str) -> Option<String> {
@@ -528,6 +528,62 @@ pub fn parse_asset_urls(html: &str, repo: &str, tag: &str) -> Vec<String> {
         }
     }
     out
+}
+
+/// Версии релизов приложения (теги v<версия>) со страницы releases.
+/// В репозитории живут и freerdp-релизы, поэтому releases/latest не подходит.
+pub fn parse_app_versions(html: &str, repo: &str) -> Vec<String> {
+    let needle = format!("/{repo}/releases/tag/v");
+    let mut out: Vec<String> = Vec::new();
+    let mut rest = html;
+    while let Some(i) = rest.find(&needle) {
+        rest = &rest[i + needle.len()..];
+        let end = rest.find('"').unwrap_or(rest.len());
+        let v = &rest[..end];
+        if !v.is_empty() && v.len() <= 16 && v.chars().all(|c| c.is_ascii_digit() || c == '.') && !out.iter().any(|x| x == v) {
+            out.push(v.to_string());
+        }
+    }
+    out
+}
+
+/// Сравнение версий вида 0.1.1 / 0.10.0 по числовым компонентам.
+pub fn cmp_versions(a: &str, b: &str) -> std::cmp::Ordering {
+    let mut ia = a.split('.');
+    let mut ib = b.split('.');
+    loop {
+        let (x, y) = (ia.next(), ib.next());
+        if x.is_none() && y.is_none() {
+            return std::cmp::Ordering::Equal;
+        }
+        let x = x.unwrap_or("0").parse::<u64>().unwrap_or(0);
+        let y = y.unwrap_or("0").parse::<u64>().unwrap_or(0);
+        if x != y {
+            return x.cmp(&y);
+        }
+    }
+}
+
+/// Последний релиз приложения: максимум среди v-тегов страницы releases.
+pub async fn app_latest(http: &reqwest::Client, repo: &str) -> Option<(String, String)> {
+    let html = http.get(format!("https://github.com/{repo}/releases")).send().await.ok()?.text().await.ok()?;
+    let v = parse_app_versions(&html, repo).into_iter().max_by(|a, b| cmp_versions(a, b))?;
+    Some((v.clone(), format!("https://github.com/{repo}/releases/tag/v{v}")))
+}
+
+#[derive(Serialize)]
+pub struct AppUpdateStatus {
+    pub current: String,
+    pub latest: Option<String>,
+    pub url: String,
+}
+
+pub async fn app_update_status(http: &reqwest::Client) -> AppUpdateStatus {
+    let (latest, url) = match app_latest(http, GH_REPO).await {
+        Some((v, u)) => (Some(v), u),
+        None => (None, format!("https://github.com/{GH_REPO}/releases")),
+    };
+    AppUpdateStatus { current: env!("CARGO_PKG_VERSION").to_string(), latest, url }
 }
 
 pub async fn freerdp_status(http: &reqwest::Client, freerdp_dir: Option<&Path>) -> FreerdpStatus {
@@ -602,13 +658,122 @@ pub async fn freerdp_update(
     res
 }
 
+#[derive(Serialize)]
+pub struct AppUpdateResult {
+    pub version: String,
+    pub already: bool,
+}
+
+static APP_UPDATING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Обновление приложения одной кнопкой: установщик с GitHub-релиза, SHA-256, запуск.
+/// Запущенную программу установщик закроет сам (RestartManager) после подтверждения.
+pub async fn app_update_install(
+    report: &(dyn Fn(&str, u8) + Sync),
+    http: &reqwest::Client,
+) -> Result<AppUpdateResult, String> {
+    use std::sync::atomic::Ordering;
+    if APP_UPDATING.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+        return Err("Обновление уже выполняется".into());
+    }
+    let res = app_update_inner(report, http).await;
+    APP_UPDATING.store(false, Ordering::SeqCst);
+    res
+}
+
+async fn app_update_inner(
+    report: &(dyn Fn(&str, u8) + Sync),
+    http: &reqwest::Client,
+) -> Result<AppUpdateResult, String> {
+    let (version, _url) = app_latest(http, GH_REPO).await.ok_or("Не удалось получить последний релиз с GitHub")?;
+    if cmp_versions(&version, env!("CARGO_PKG_VERSION")) != std::cmp::Ordering::Greater {
+        return Ok(AppUpdateResult { version, already: true });
+    }
+    let tag = format!("v{version}");
+    report("list", 0);
+    let html = http
+        .get(format!("https://github.com/{GH_REPO}/releases/expanded_assets/{tag}"))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .text()
+        .await
+        .map_err(|e| e.to_string())?;
+    let urls = parse_asset_urls(&html, GH_REPO, &tag);
+    let exe_url = urls.iter().find(|u| u.ends_with("_x64-setup.exe")).ok_or("В релизе нет установщика RDPMgrCoffee_…_x64-setup.exe")?;
+    let sha_url = urls.iter().find(|u| u.ends_with(".sha256")).cloned().unwrap_or_else(|| format!("{exe_url}.sha256"));
+    let expected = http
+        .get(&sha_url)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .text()
+        .await
+        .map_err(|e| e.to_string())?
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if expected.len() != 64 || !expected.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err("В релизе нет корректной SHA-256 установщика".into());
+    }
+    report("download", 0);
+    let exe_path = std::env::temp_dir().join(format!("connmgr-app-update-{version}.exe"));
+    download_verified(report, http, exe_url, &expected, &exe_path).await?;
+    report("install", 100);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // DETACHED_PROCESS: установщик переживает закрытие приложения
+        std::process::Command::new(&exe_path)
+            .creation_flags(0x00000008)
+            .spawn()
+            .map_err(|e| format!("Не удалось запустить установщик: {}", e))?;
+    }
+    #[cfg(not(windows))]
+    return Err("Обновление приложения поддерживается только в Windows".into());
+    Ok(AppUpdateResult { version, already: false })
+}
+
+/// Скачать файл с потоковой SHA-256 и прогрессом; несовпадение — файл удаляется.
+async fn download_verified(
+    report: &(dyn Fn(&str, u8) + Sync),
+    http: &reqwest::Client,
+    url: &str,
+    expected: &str,
+    dest: &Path,
+) -> Result<(), String> {
+    use sha2::Digest;
+    let mut resp = http.get(url).send().await.map_err(|e| format!("Не удалось скачать файл: {}", e))?;
+    if !resp.status().is_success() {
+        return Err(format!("GitHub вернул {}", resp.status()));
+    }
+    let total = resp.content_length().unwrap_or(0);
+    let mut file = std::fs::File::create(dest).map_err(|e| e.to_string())?;
+    let mut done: u64 = 0;
+    let mut hasher = sha2::Sha256::new();
+    while let Some(chunk) = resp.chunk().await.map_err(|e| e.to_string())? {
+        hasher.update(&chunk);
+        std::io::Write::write_all(&mut file, &chunk).map_err(|e| e.to_string())?;
+        done += chunk.len() as u64;
+        if total > 0 {
+            report("download", (done * 100 / total).min(100) as u8);
+        }
+    }
+    drop(file);
+    if format!("{:x}", hasher.finalize()) != expected {
+        let _ = std::fs::remove_file(dest);
+        return Err("SHA-256 файла не совпала с релизом — обновление отменено".into());
+    }
+    Ok(())
+}
+
 async fn freerdp_update_inner(
     report: &(dyn Fn(&str, u8) + Sync),
     http: &reqwest::Client,
     dir: &Path,
 ) -> Result<FreerdpUpdateResult, String> {
-    use sha2::Digest;
-    let (tag, _url) = latest_release(http, FREERDP_REPO).await.ok_or("Не удалось получить последний релиз с GitHub")?;
+    let (tag, _url) = latest_release(http, GH_REPO).await.ok_or("Не удалось получить последний релиз с GitHub")?;
     let version = tag.strip_prefix("freerdp-").unwrap_or(&tag).to_string();
     if version.is_empty() || version.len() > 16 || !version.chars().all(|c| c.is_ascii_digit() || c == '.') {
         return Err(format!("Неожиданный тег релиза: {}", tag));
@@ -619,14 +784,14 @@ async fn freerdp_update_inner(
     }
     report("list", 0);
     let html = http
-        .get(format!("https://github.com/{FREERDP_REPO}/releases/expanded_assets/{tag}"))
+        .get(format!("https://github.com/{GH_REPO}/releases/expanded_assets/{tag}"))
         .send()
         .await
         .map_err(|e| e.to_string())?
         .text()
         .await
         .map_err(|e| e.to_string())?;
-    let urls = parse_asset_urls(&html, FREERDP_REPO, &tag);
+    let urls = parse_asset_urls(&html, GH_REPO, &tag);
     let zip_url = urls.iter().find(|u| u.ends_with("-win-x64.zip")).ok_or("В релизе нет архива freerdp-…-win-x64.zip")?;
     let sha_url = urls.iter().find(|u| u.ends_with(".sha256")).cloned().unwrap_or_else(|| format!("{zip_url}.sha256"));
     let expected = http
@@ -645,28 +810,8 @@ async fn freerdp_update_inner(
         return Err("В релизе нет корректной SHA-256 архива".into());
     }
     report("download", 0);
-    let mut resp = http.get(zip_url).send().await.map_err(|e| format!("Не удалось скачать архив: {}", e))?;
-    if !resp.status().is_success() {
-        return Err(format!("GitHub вернул {}", resp.status()));
-    }
-    let total = resp.content_length().unwrap_or(0);
     let zip_path = std::env::temp_dir().join("connmgr-freerdp-update.zip");
-    let mut file = std::fs::File::create(&zip_path).map_err(|e| e.to_string())?;
-    let mut done: u64 = 0;
-    let mut hasher = sha2::Sha256::new();
-    while let Some(chunk) = resp.chunk().await.map_err(|e| e.to_string())? {
-        hasher.update(&chunk);
-        std::io::Write::write_all(&mut file, &chunk).map_err(|e| e.to_string())?;
-        done += chunk.len() as u64;
-        if total > 0 {
-            report("download", (done * 100 / total).min(100) as u8);
-        }
-    }
-    drop(file);
-    if format!("{:x}", hasher.finalize()) != expected {
-        let _ = std::fs::remove_file(&zip_path);
-        return Err("SHA-256 архива не совпала с релизом — обновление отменено".into());
-    }
+    download_verified(report, http, zip_url, &expected, &zip_path).await?;
     report("install", 100);
     let new = dir.with_file_name("freerdp.new");
     let _ = std::fs::remove_dir_all(&new);
@@ -844,6 +989,25 @@ mod tests {
                 "https://github.com/o/r/releases/download/freerdp-3.33.1/freerdp-3.33.1-win-x64.zip.sha256".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn app_versions_from_releases_html() {
+        let html = r#"<a href="/o/r/releases/tag/v0.1.1">x</a><a href="/o/r/releases/tag/freerdp-3.33.1">y</a>
+            <a href="/o/r/releases/tag/v0.1.0">z</a><a href="/o/r/releases/tag/v0.1.1">dup</a>
+            <a href="/o/r/releases/tag/v1.0.0-beta">bad</a><a href="/o/r/releases/tag/v">empty</a>"#;
+        assert_eq!(parse_app_versions(html, "o/r"), vec!["0.1.1".to_string(), "0.1.0".to_string()]);
+        assert_eq!(parse_app_versions(html, "other/repo"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn version_compare_numeric_components() {
+        use std::cmp::Ordering::*;
+        assert_eq!(cmp_versions("0.1.1", "0.1.0"), Greater);
+        assert_eq!(cmp_versions("0.10.0", "0.9.0"), Greater);
+        assert_eq!(cmp_versions("0.1", "0.1.0"), Equal);
+        assert_eq!(cmp_versions("0.1.0", "0.1.1"), Less);
+        assert_eq!(cmp_versions("1.0.0", "0.99.99"), Greater);
     }
 
     #[test]

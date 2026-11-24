@@ -1,7 +1,7 @@
 <script lang="ts">
   import { app, applyTheme, findTheme } from "./state.svelte";
   import { PRESETS, newThemeId, type CustomTheme } from "./themes";
-  import { createRootFolder, migrateToRoot, needsMigration, tidyGateways, exportAll, checkWinbox, checkFreerdp, updateFreerdp, installWinbox, newerVersion } from "./actions";
+  import { createRootFolder, migrateToRoot, needsMigration, tidyGateways, exportAll, checkWinbox, checkFreerdp, updateFreerdp, installWinbox, newerVersion, checkAppUpdate, updateApp } from "./actions";
   import { DEFAULT_TOOLS, type Tool } from "./state.svelte";
   import { api, errText, PROTOCOLS, PROTOCOL_LABEL } from "./api";
   import Icon from "./Icon.svelte";
@@ -61,6 +61,20 @@
     frBusy = true;
     if (await updateFreerdp(fr?.latest ?? undefined)) fr = (await checkFreerdp(true)) ?? null;
     frBusy = false;
+  }
+
+  // ---- Обновление приложения ----
+  let au = $state<{ current: string; latest: string | null } | null>(null);
+  let auBusy = $state(false);
+  async function auCheck() {
+    auBusy = true;
+    au = (await checkAppUpdate(true)) ?? null;
+    auBusy = false;
+  }
+  async function auUpdate() {
+    auBusy = true;
+    await updateApp();
+    auBusy = false;
   }
 
   // ---- Внешние инструменты и WinBox ----
@@ -303,6 +317,28 @@
             ></span
           >
           <span><input type="checkbox" bind:checked={s.rdpLog} onchange={changed} /></span>
+        </label>
+
+        <div class="row">
+          <span
+            >Приложение: <b>{au?.current ?? "?"}</b>{#if au}, последняя: <b>{au.latest ?? "не удалось узнать"}</b>{/if}
+            <small>(установщик с GitHub, проверка SHA-256)</small></span
+          >
+          <span class="btns">
+            <button class="btn" onclick={auCheck} disabled={auBusy}>Проверить</button>
+            <button class="btn" onclick={auUpdate} disabled={auBusy || !!app.appUpdating}>Обновить</button>
+          </span>
+        </div>
+        {#if app.appUpdating}
+          <div class="row">
+            <span>
+              {#if app.appUpdating.phase === "download"}Загрузка установщика… {app.appUpdating.percent}%{:else if app.appUpdating.phase === "install"}Проверка и запуск установщика…{:else}Обновление приложения…{/if}
+            </span>
+          </div>
+        {/if}
+        <label class="row">
+          <span>Проверять выход новых версий приложения <small>(раз в сутки, только уведомление)</small></span>
+          <span><input type="checkbox" bind:checked={s.appAutoCheck} onchange={changed} /></span>
         </label>
 
         <div class="row">

@@ -100,6 +100,8 @@ export type Settings = {
   rdpLog: boolean;
   /** Проверять выход новых версий FreeRDP (раз в сутки) */
   freerdpAutoCheck: boolean;
+  /** Проверять выход новых версий приложения (раз в сутки) */
+  appAutoCheck: boolean;
 };
 
 /** Старые стандартные инструменты (cmd /k …) → новые, с выводом в окне приложения */
@@ -153,6 +155,7 @@ const DEFAULT_SETTINGS: Settings = {
   tourDone: false,
   rdpLog: false,
   freerdpAutoCheck: true,
+  appAutoCheck: true,
 };
 
 function loadJson<T>(key: string, def: T): T {
@@ -217,6 +220,10 @@ class AppState {
   freerdpUpdate = $state<{ installed: string; latest: string; url: string } | null>(null);
   /** Идёт обновление FreeRDP: этап и процент загрузки */
   freerdpUpdating = $state<{ phase: string; percent: number } | null>(null);
+  /** Вышла новая версия приложения (установщик с GitHub) */
+  appUpdate = $state<{ current: string; latest: string; url: string } | null>(null);
+  /** Идёт обновление приложения: этап и процент загрузки */
+  appUpdating = $state<{ phase: string; percent: number } | null>(null);
 
   settings = $state<Settings>(migrateSettings(loadJson("settings", DEFAULT_SETTINGS)));
   recent = $state<string[]>(loadArr("recent"));

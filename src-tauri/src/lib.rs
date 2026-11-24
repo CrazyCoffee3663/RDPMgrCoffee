@@ -622,6 +622,22 @@ async fn freerdp_update(app: AppHandle, tools: State<'_, Tools>) -> Result<tools
     tools::freerdp_update(&report, &tools.http, &dir).await
 }
 
+/// Версия приложения и последний релиз на GitHub (уведомление об обновлении).
+#[tauri::command]
+async fn app_update_status(tools: State<'_, Tools>) -> Result<tools::AppUpdateStatus, String> {
+    Ok(tools::app_update_status(&tools.http).await)
+}
+
+/// Обновление приложения одной кнопкой: установщик с GitHub-релиза, SHA-256, запуск.
+#[tauri::command]
+async fn app_update_install(app: AppHandle, tools: State<'_, Tools>) -> Result<tools::AppUpdateResult, String> {
+    let report = move |phase: &str, percent: u8| {
+        use tauri::Emitter;
+        let _ = app.emit("app-update-progress", serde_json::json!({ "phase": phase, "percent": percent }));
+    };
+    tools::app_update_install(&report, &tools.http).await
+}
+
 /// Проверка доступности хостов (индикатор в дереве).
 #[tauri::command]
 async fn probe_hosts(targets: Vec<net::Target>, timeout_ms: u64, parallel: usize) -> Vec<net::Reach> {
@@ -808,6 +824,8 @@ pub fn run() {
             winbox_status,
             freerdp_status,
             freerdp_update,
+            app_update_status,
+            app_update_install,
             winbox_install,
             import_mremoteng_file,
             legacy_hint

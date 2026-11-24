@@ -5,7 +5,7 @@
   import { getCurrentWindow } from "@tauri-apps/api/window";
 
   const inTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
-  import { newItem, checkWinbox, installWinbox, checkFreerdp, updateFreerdp } from "$lib/actions";
+  import { newItem, checkWinbox, installWinbox, checkFreerdp, updateFreerdp, checkAppUpdate, updateApp } from "$lib/actions";
   import { menu } from "$lib/dialogs.svelte";
   import Unlock from "$lib/Unlock.svelte";
   import Sidebar from "$lib/Sidebar.svelte";
@@ -90,7 +90,7 @@
 
   // Проверка обновлений WinBox после разблокировки (раз в сутки)
   $effect(() => {
-    if (app.phase === "unlocked") setTimeout(() => (checkWinbox(), checkFreerdp()), 5000);
+    if (app.phase === "unlocked") setTimeout(() => (checkWinbox(), checkFreerdp(), checkAppUpdate()), 5000);
   });
 
   // Окно настроек скрывает окна RDP
@@ -349,6 +349,16 @@
       {/if}
       <span class="faint">{app.status.email}</span>
       <span class="sp"></span>
+      {#if app.appUpdate}
+        <button
+          class="upd"
+          onclick={() => updateApp()}
+          disabled={!!app.appUpdating}
+          title="Установлена {app.appUpdate.current} — установщик с GitHub, проверка SHA-256"
+        >
+          <Icon name="alert" size={12} /> Вышла версия {app.appUpdate.latest} — обновить
+        </button>
+      {/if}
       {#if app.freerdpUpdate}
         <button
           class="upd"

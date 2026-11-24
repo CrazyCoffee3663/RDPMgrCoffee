@@ -65,12 +65,27 @@ mod win {
                 // пропускает частые изменения и разрешение сервера не обновляется
                 SetTimer(Some(hwnd), RESIZE_TIMER, 200, None);
             }
-            // Фокус хоста отдаём окну FreeRDP: пока у него нет фокуса, FreeRDP
-            // держит ввод приостановленным (SuspendInput) и не шлёт мышь/клавиатуру.
-            // Хост получает фокус при щелчке по сеансу (активация окна).
+            // Системный фокус остаётся на хосте: LL-хук FreeRDP пересылает клавиши
+            // только когда hwndFocus потока foreground равен окну /parent-window.
+            // Окну FreeRDP о фокусе сообщаем письмом: без WM_SETFOCUS оно держит
+            // ввод приостановленным (SuspendInput) и не шлёт мышь.
             if msg == WM_SETFOCUS {
                 if let Ok(child) = GetWindow(hwnd, GW_CHILD) {
-                    let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(Some(child));
+                    let _ = PostMessageW(Some(child), WM_SETFOCUS, WPARAM(0), LPARAM(0));
+                }
+                return LRESULT(0);
+            }
+            // Щелчок по окну FreeRDP уводит фокус в его процесс — хук тогда глотает
+            // клавиатуру. Возвращаем фокус хосту, а сеансу снова сообщаем о фокусе.
+            // Фокус ушёл в другой контрол приложения или другую программу — глушим ввод сеанса.
+            if msg == WM_KILLFOCUS {
+                if let Ok(child) = GetWindow(hwnd, GW_CHILD) {
+                    if HWND(wp.0 as _) == child {
+                        let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(Some(hwnd));
+                        let _ = PostMessageW(Some(child), WM_SETFOCUS, WPARAM(0), LPARAM(0));
+                    } else {
+                        let _ = PostMessageW(Some(child), WM_KILLFOCUS, WPARAM(0), LPARAM(0));
+                    }
                 }
                 return LRESULT(0);
             }
@@ -201,10 +216,11 @@ mod win {
                 let mut cr = Default::default();
                 let _ = GetWindowRect(child, &mut cr);
                 let (cw, ch) = (cr.right - cr.left, cr.bottom - cr.top);
-                // Фокус у пустого хоста (окно FreeRDP появилось позже) — передать его сеансу
-                use windows::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus};
+                // Окно FreeRDP появилось позже, а фокус на хосте — сообщить сеансу о фокусе
+                // письмом (системный фокус не отдаём: его ждёт LL-хук клавиатуры)
+                use windows::Win32::UI::Input::KeyboardAndMouse::GetFocus;
                 if GetFocus() == host {
-                    let _ = SetFocus(Some(child));
+                    let _ = PostMessageW(Some(child), WM_SETFOCUS, WPARAM(0), LPARAM(0));
                 }
                 if cw != rc.right || ch != rc.bottom || !IsWindowVisible(child).as_bool() {
                     let _ = MoveWindow(child, 0, 0, rc.right, rc.bottom, true);
@@ -301,7 +317,7 @@ mod win {
         }
     }
 
-    /// Сделать сеанс активным: фокус хосту, он передаст его окну FreeRDP.
+    /// Сделать сеанс активным: фокус хосту (его ждёт LL-хук), хост сообщит окну FreeRDP о фокусе.
     pub fn focus(hwnd: isize) {
         unsafe {
             use windows::Win32::UI::Input::KeyboardAndMouse::{SetActiveWindow, SetFocus};
@@ -476,7 +492,7 @@ fn no_newlines(label: &str, v: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn build_args(p: &ConnParams, hwnd: isize, w: i32, h: i32, pin: Option<&str>) -> Result<Vec<String>, String> {
+fn build_args(p: &ConnParams, hwnd: isize, w: i32, h: i32, pin: Option<&str>, legacy: Option<&str>) -> Result<Vec<String>, String> {
     for (label, v) in [
         ("Адрес", &p.host),
         ("Логин", &p.username),
@@ -516,6 +532,15 @@ fn build_args(p: &ConnParams, hwnd: isize, w: i32, h: i32, pin: Option<&str>) ->
         // Панель подключения FreeRDP нужна только в полноэкранном режиме
         "/floatbar:sticky:off,default:hidden,show:fullscreen".into(),
     ];
+    // Старый TLS: OpenSSL 3 по умолчанию отвергает TLS < 1.2 и слабые шифры, а FreeRDP
+    // жёстко ставит минимум TLS 1.2 — mstsc/Schannel при этом подключается. Снижаем
+    // только когда rustls-проверка заранее увидела устаревшие параметры (unchecked);
+    // enforce — по пробе версии, иначе сервер со слабыми шифрами, но TLS 1.2, не примет 1.0
+    match legacy {
+        Some("auto") => a.push("/tls:seclevel:0".into()),
+        Some(v) => a.push(format!("/tls:seclevel:0,enforce:{}", v)),
+        None => {}
+    }
     // Проверка подлинности без Kerberos: вне домена Windows ищет контроллер домена
     // десятки секунд, прежде чем перейти на NTLM. auth=kerberos — как в mstsc.
     if !use_kerberos(p) {
@@ -644,14 +669,18 @@ fn log_errors(text: &str) -> String {
     if joined.contains("CONNECT_TRANSPORT_FAILED") || joined.contains("DNS_NAME_NOT_FOUND") {
         return format!("Сервер недоступен\n{}", joined);
     }
+    if joined.contains("TLS_CONNECT_FAILED") {
+        return format!("Сервер не согласовал TLS (устаревшие протокол/шифры или сертификат)\n{}", joined);
+    }
     joined
 }
 
 /// Проверить сертификаты RD-шлюза и сервера до запуска FreeRDP (с подтверждением пользователя).
-/// Возвращает значение /cert: для FreeRDP (None — оставить «tofu»).
-async fn cert_check(app: &AppHandle, id: u32, p: &ConnParams) -> Result<Option<String>, String> {
+/// Возвращает значение /cert: для FreeRDP (None — оставить «tofu») и признак старого TLS:
+/// None — современный, "auto" — понизить seclevel, "1.0"/"1.1" — плюс enforce версии.
+async fn cert_check(app: &AppHandle, id: u32, p: &ConnParams) -> Result<(Option<String>, Option<&'static str>), String> {
     if p.opt("cert").eq_ignore_ascii_case("ignore") {
-        return Ok(None);
+        return Ok((None, None));
     }
     let path = app
         .state::<crate::sessions::Sessions>()
@@ -715,25 +744,29 @@ async fn cert_check(app: &AppHandle, id: u32, p: &ConnParams) -> Result<Option<S
         // сертификат при первом входе (tofu)
         let (h, port) = split_host_port(addr, 443);
         let host_id = if h.contains(':') { format!("[{}]:{}", h, port) } else { format!("{}:{}", h, port) };
-        match crate::rdpcert::fetch(&h, port, false).await {
-            Ok(fp) => confirm("RD-шлюза".into(), host_id, fp).await?,
+        let legacy = match crate::rdpcert::fetch(&h, port, false).await {
+            Ok(fp) => {
+                confirm("RD-шлюза".into(), host_id, fp).await?;
+                None
+            }
             Err(e) if e.starts_with(crate::rdpcert::TLS_UNSUPPORTED) => {
-                unchecked(app, id, &path, "RD-шлюза", &host_id).await?
+                unchecked(app, id, &path, "RD-шлюза", &host_id).await?;
+                Some(crate::net::old_tls_version(&h, port, false).await)
             }
             Err(e) => return Err(e),
-        }
-        return Ok(None);
+        };
+        return Ok((None, legacy));
     }
     let port = p.port.unwrap_or(3389);
     let host_id = if p.host.contains(':') { format!("[{}]:{}", p.host, port) } else { format!("{}:{}", p.host, port) };
     match crate::rdpcert::fetch(&p.host, port, true).await {
         Ok(fp) => {
             confirm("RDP-сервера".into(), host_id, fp.clone()).await?;
-            Ok(Some(crate::rdpcert::freerdp_pin(&[&fp])))
+            Ok((Some(crate::rdpcert::freerdp_pin(&[&fp])), None))
         }
         Err(e) if e.starts_with(crate::rdpcert::TLS_UNSUPPORTED) => {
             unchecked(app, id, &path, "RDP-сервера", &host_id).await?;
-            Ok(None)
+            Ok((None, Some(crate::net::old_tls_version(&p.host, port, true).await)))
         }
         Err(e) => Err(e),
     }
@@ -764,7 +797,7 @@ async fn unchecked(app: &AppHandle, id: u32, path: &std::path::Path, what: &str,
         return Ok(());
     }
     let msg = format!(
-        "Не удалось заранее проверить сертификат {} {}: сервер использует устаревшие параметры TLS.\n\nFreeRDP доверит сертификату сервера при первом входе автоматически (режим «доверие при первом подключении», без проверки центра сертификации). Перехват в момент первого подключения остался бы незамеченным.\n\nПодключиться? Вопрос больше не появится для этого адреса.",
+        "Не удалось заранее проверить сертификат {} {}: сервер использует устаревшие параметры TLS.\n\nFreeRDP доверит сертификату сервера при первом входе автоматически (режим «доверие при первом подключении», без проверки центра сертификации) и примет устаревшие протокол/шифры сервера — уровень безопасности TLS будет понижен. Перехват в момент первого подключения остался бы незамеченным.\n\nПодключиться? Вопрос больше не появится для этого адреса.",
         what, host_id
     );
     if crate::sessions::ask(app, id, "confirm", "Сертификат не проверен заранее", &msg, false).await.is_none() {
@@ -776,7 +809,7 @@ async fn unchecked(app: &AppHandle, id: u32, path: &std::path::Path, what: &str,
 
 #[allow(clippy::too_many_arguments)]
 pub async fn open(app: &AppHandle, id: u32, p: ConnParams, x: i32, y: i32, w: i32, h: i32, log_enabled: bool) -> Result<(), String> {
-    let pin = cert_check(app, id, &p).await?;
+    let (pin, legacy) = cert_check(app, id, &p).await?;
     let parent = main_hwnd(app)?;
     let _ = APP.set(app.clone());
     #[cfg(not(windows))]
@@ -795,7 +828,7 @@ pub async fn open(app: &AppHandle, id: u32, p: ConnParams, x: i32, y: i32, w: i3
                 win::focus(hwnd);
             })
             .await?;
-            let args = build_args(&p, hwnd, w, h, pin.as_deref())?;
+            let args = build_args(&p, hwnd, w, h, pin.as_deref(), legacy)?;
 
             // Журнал на диск — только если включён в настройках (там адреса и логины).
             // Без журнала вывод FreeRDP (только ошибки) держим в памяти — для сообщения об ошибке.
@@ -1142,7 +1175,7 @@ mod tests {
     fn injection_and_unsafe_extras_rejected() {
         let base = ConnParams { name: "a\nb".into(), protocol: "rdp".into(), host: "h".into(), ..Default::default() };
         // имя с переводом строки — просто заголовок окна, без новой строки
-        let a = build_args(&base, 1, 800, 600, None).unwrap();
+        let a = build_args(&base, 1, 800, 600, None, None).unwrap();
         assert!(a.iter().all(|x| !x.contains('\n')));
         for (field, val) in [("password", "x\n/drives"), ("username", "u\r\n/cert:ignore"), ("host", "h\n/proxy:http://evil")] {
             let mut p = base.clone();
@@ -1151,18 +1184,32 @@ mod tests {
                 "username" => p.username = val.into(),
                 _ => p.host = val.into(),
             }
-            assert!(build_args(&p, 1, 800, 600, None).is_err(), "{} не отклонён", field);
+            assert!(build_args(&p, 1, 800, 600, None, None).is_err(), "{} не отклонён", field);
         }
         for bad in ["/cert:ignore", "+drives", "/drive:c,C:\\", "/sec:rdp", "-sec-nla", "/log-level:TRACE", "/proxy:http://x", "/tls:seclevel:0", "/p:x"] {
             let mut p = base.clone();
             p.opts.insert("freerdp".into(), bad.into());
-            assert!(build_args(&p, 1, 800, 600, None).is_err(), "{} пропущен", bad);
+            assert!(build_args(&p, 1, 800, 600, None, None).is_err(), "{} пропущен", bad);
         }
         let mut p = base.clone();
         p.opts.insert("freerdp".into(), "/network:lan +fonts /bpp:32".into());
-        assert!(build_args(&p, 1, 800, 600, None).is_ok());
-        let a = build_args(&base, 1, 800, 600, Some("deny,fingerprint:sha256:AB")).unwrap();
+        assert!(build_args(&p, 1, 800, 600, None, None).is_ok());
+        let a = build_args(&base, 1, 800, 600, Some("deny,fingerprint:sha256:AB"), None).unwrap();
         assert!(a.contains(&"/cert:deny,fingerprint:sha256:AB".to_string()));
+    }
+
+    /// Старый TLS: seclevel понижаем всегда, enforce — только если пробник увидел старую версию
+    #[test]
+    fn legacy_tls_seclevel_and_enforce() {
+        let base = ConnParams { name: "a".into(), protocol: "rdp".into(), host: "h".into(), ..Default::default() };
+        let a = build_args(&base, 1, 800, 600, None, None).unwrap();
+        assert!(!a.iter().any(|x| x.starts_with("/tls:")));
+        let a = build_args(&base, 1, 800, 600, None, Some("auto")).unwrap();
+        assert!(a.contains(&"/tls:seclevel:0".to_string()));
+        for (v, arg) in [("1.0", "/tls:seclevel:0,enforce:1.0"), ("1.1", "/tls:seclevel:0,enforce:1.1")] {
+            let a = build_args(&base, 1, 800, 600, None, Some(v)).unwrap();
+            assert!(a.contains(&arg.to_string()), "{}", v);
+        }
     }
 
     #[test]
@@ -1170,13 +1217,13 @@ mod tests {
         let base = ConnParams { name: "a".into(), protocol: "rdp".into(), host: "h".into(), ..Default::default() };
         let mut p = base.clone();
         p.opts.insert("resolution".into(), "800x600\n/cert:ignore".into());
-        assert!(build_args(&p, 1, 800, 600, None).is_err(), "resolution с инъекцией пропущен");
+        assert!(build_args(&p, 1, 800, 600, None, None).is_err(), "resolution с инъекцией пропущен");
         let mut p = base.clone();
         p.opts.insert("drives".into(), "C:\\share\n/cert:ignore\n/drives".into());
-        assert!(build_args(&p, 1, 800, 600, None).is_err(), "drives с инъекцией пропущен");
+        assert!(build_args(&p, 1, 800, 600, None, None).is_err(), "drives с инъекцией пропущен");
         let mut p = base.clone();
         p.opts.insert("resolution".into(), "1280x720".into());
-        assert!(build_args(&p, 1, 800, 600, None).is_ok(), "обычное разрешение отклонено");
+        assert!(build_args(&p, 1, 800, 600, None, None).is_ok(), "обычное разрешение отклонено");
     }
 
     #[test]
@@ -1194,12 +1241,12 @@ mod tests {
         ] {
             let mut p = base.clone();
             p.opts.insert("freerdp".into(), bad.into());
-            assert!(build_args(&p, 1, 800, 600, None).is_err(), "{} пропущен", bad);
+            assert!(build_args(&p, 1, 800, 600, None, None).is_err(), "{} пропущен", bad);
         }
         for good in ["/network:lan", "+fonts", "-fonts", "/bpp:32", "/gfx:RFX", "/compression", "-glyph-cache", "/jpeg-quality:80"] {
             let mut p = base.clone();
             p.opts.insert("freerdp".into(), good.into());
-            assert!(build_args(&p, 1, 800, 600, None).is_ok(), "{} отклонён", good);
+            assert!(build_args(&p, 1, 800, 600, None, None).is_ok(), "{} отклонён", good);
         }
     }
 
@@ -1230,7 +1277,7 @@ mod tests {
         };
         p.opts.insert("admin".into(), "1".into());
         p.gateway = Some(("gw.corp:443".into(), "g".into(), "".into(), "gp".into()));
-        let a = build_args(&p, 1234, 1000, 700, None).unwrap();
+        let a = build_args(&p, 1234, 1000, 700, None, None).unwrap();
         assert!(a.contains(&"/v:10.0.0.5:3390".to_string()));
         assert!(a.contains(&"/parent-window:1234".to_string()));
         assert!(a.contains(&"/admin".to_string()));
@@ -1250,36 +1297,36 @@ mod tests {
         let base = ConnParams { name: "a".into(), protocol: "rdp".into(), host: "h".into(), ..Default::default() };
         let mut p = base.clone();
         p.opts.insert("clipboard".into(), "off".into());
-        let a = build_args(&p, 1, 800, 600, None).unwrap();
+        let a = build_args(&p, 1, 800, 600, None, None).unwrap();
         assert!(a.contains(&"-clipboard".to_string()));
         assert!(!a.iter().any(|x| x.starts_with("/clipboard:")));
 
         let mut p = base.clone();
         p.opts.insert("resolution".into(), "1280x720".into());
-        let a = build_args(&p, 1, 800, 600, None).unwrap();
+        let a = build_args(&p, 1, 800, 600, None, None).unwrap();
         assert!(a.contains(&"/size:1280x720".to_string()));
         assert!(a.contains(&"/smart-sizing".to_string()));
         assert!(!a.contains(&"/dynamic-resolution".to_string()));
 
         let mut p = base.clone();
         p.opts.insert("drives".into(), "C:\\share".into());
-        let a = build_args(&p, 1, 800, 600, None).unwrap();
+        let a = build_args(&p, 1, 800, 600, None, None).unwrap();
         assert!(a.contains(&"/drive:share,C:\\share".to_string()));
         for v in ["1", "true", "yes", "all", "да", "on", "TRUE"] {
             let mut p = base.clone();
             p.opts.insert("drives".into(), v.into());
-            assert!(build_args(&p, 1, 800, 600, None).unwrap().contains(&"/drives".to_string()), "drives={}", v);
+            assert!(build_args(&p, 1, 800, 600, None, None).unwrap().contains(&"/drives".to_string()), "drives={}", v);
         }
 
         // cert=ignore сравнивается без учёта регистра — как в cert_check
         for v in ["ignore", "Ignore", "IGNORE"] {
             let mut p = base.clone();
             p.opts.insert("cert".into(), v.into());
-            let a = build_args(&p, 1, 800, 600, None).unwrap();
+            let a = build_args(&p, 1, 800, 600, None, None).unwrap();
             assert!(a.contains(&"/cert:ignore".to_string()), "cert={}", v);
         }
         // Подтверждённый отпечаток важнее tofu
-        let a = build_args(&base, 1, 800, 600, Some("deny,fingerprint:sha256:AB")).unwrap();
+        let a = build_args(&base, 1, 800, 600, Some("deny,fingerprint:sha256:AB"), None).unwrap();
         assert!(a.contains(&"/cert:deny,fingerprint:sha256:AB".to_string()));
     }
 
@@ -1287,10 +1334,10 @@ mod tests {
     #[test]
     fn ipv6_host_bracketed() {
         let mut p = ConnParams { name: "a".into(), protocol: "rdp".into(), host: "fe80::1".into(), ..Default::default() };
-        let a = build_args(&p, 1, 800, 600, None).unwrap();
+        let a = build_args(&p, 1, 800, 600, None, None).unwrap();
         assert!(a.contains(&"/v:[fe80::1]:3389".to_string()));
         p.port = Some(3390);
-        let a = build_args(&p, 1, 800, 600, None).unwrap();
+        let a = build_args(&p, 1, 800, 600, None, None).unwrap();
         assert!(a.contains(&"/v:[fe80::1]:3390".to_string()));
         assert_eq!(split_host_port("[fe80::1]:444", 443), ("fe80::1".to_string(), 444));
         assert_eq!(split_host_port("[fe80::1]", 443), ("fe80::1".to_string(), 443));
@@ -1306,19 +1353,19 @@ mod tests {
         let base = ConnParams { name: "a".into(), protocol: "rdp".into(), host: "h".into(), ..Default::default() };
         let mut p = base.clone();
         p.gateway = Some(("gw:443,evil".into(), "u".into(), "".into(), "".into()));
-        assert!(build_args(&p, 1, 800, 600, None).is_err());
+        assert!(build_args(&p, 1, 800, 600, None, None).is_err());
         let mut p = base.clone();
         p.domain = "CORP\n/cert:ignore".into();
-        assert!(build_args(&p, 1, 800, 600, None).is_err());
+        assert!(build_args(&p, 1, 800, 600, None, None).is_err());
         let mut p = base.clone();
         p.gateway = Some(("gw:443".into(), "u\n/x".into(), "".into(), "".into()));
-        assert!(build_args(&p, 1, 800, 600, None).is_err());
+        assert!(build_args(&p, 1, 800, 600, None, None).is_err());
         let mut p = base.clone();
         p.gateway = Some(("gw:443".into(), "u".into(), "".into(), "".into()));
         p.opts.insert("gwtransport".into(), "rpc\n/cert:ignore".into());
         // gwtransport сопоставляется, а не подставляется как есть: перевод строки
         // не попадает в аргументы, значение уходит в безопасную ветку по умолчанию
-        let a = build_args(&p, 1, 800, 600, None).unwrap();
+        let a = build_args(&p, 1, 800, 600, None, None).unwrap();
         assert!(a.iter().all(|x| !x.contains('\n')));
         assert!(a.iter().any(|x| x.contains("type:http,no-websockets")));
     }
@@ -1330,7 +1377,7 @@ mod tests {
         for k in ALLOW_EXTRA {
             let mut p = base.clone();
             p.opts.insert("freerdp".into(), format!("/{}:x", k));
-            assert!(build_args(&p, 1, 800, 600, None).is_ok(), "/{}:x отклонён", k);
+            assert!(build_args(&p, 1, 800, 600, None, None).is_ok(), "/{}:x отклонён", k);
         }
     }
 }

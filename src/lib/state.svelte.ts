@@ -1,6 +1,6 @@
 import { untrack } from "svelte";
 import { PRESETS, THEME_VARS, themeVars, type CustomTheme } from "./themes";
-import { api, errText, listen, parseConn, fieldValue, DEFAULT_PORTS, type Item, type Protocol, type Status, type VaultView } from "./api";
+import { api, errText, listen, parseConn, fieldValue, DEFAULT_PORTS, PROTOCOLS, type Item, type Protocol, type Status, type VaultView } from "./api";
 
 export type TabState = "connecting" | "connected" | "closed" | "error";
 export type Tab = {
@@ -215,6 +215,8 @@ class AppState {
   winboxUpdate = $state<{ installed: string; latest: string } | null>(null);
   /** Вышла новая версия FreeRDP (обновления закрывают уязвимости RDP-клиента) */
   freerdpUpdate = $state<{ installed: string; latest: string; url: string } | null>(null);
+  /** Идёт обновление FreeRDP: этап и процент загрузки */
+  freerdpUpdating = $state<{ phase: string; percent: number } | null>(null);
 
   settings = $state<Settings>(migrateSettings(loadJson("settings", DEFAULT_SETTINGS)));
   recent = $state<string[]>(loadArr("recent"));
@@ -264,15 +266,18 @@ class AppState {
   /** Шлюзы: адрес rdgw:// или запись, на которую ссылается поле gateway какого-либо подключения */
   gatewayIds = $derived.by(() => {
     const ids = new Set<string>();
+    const byId = new Set(this.view.items.map((i) => i.id));
     const byName = new Map<string, string[]>();
     for (const i of this.view.items) {
       if (i.uris.some((u) => /^rdgw:\/\//i.test(u.trim()))) ids.add(i.id);
-      byName.set(i.name, [...(byName.get(i.name) ?? []), i.id]);
+      const arr = byName.get(i.name);
+      if (arr) arr.push(i.id);
+      else byName.set(i.name, [i.id]);
     }
     for (const c of this.view.items) {
       const g = fieldValue(c, "gateway");
       if (!g) continue;
-      if (this.view.items.some((i) => i.id === g)) ids.add(g);
+      if (byId.has(g)) ids.add(g);
       else for (const id of byName.get(g) ?? []) ids.add(id);
     }
     return ids;
@@ -292,8 +297,20 @@ class AppState {
     return n === undefined ? "" : this.relName(n);
   }
 
+  /** Индексы для поиска за раз (loginOf/probeTarget/item зовутся на каждую строку дерева) */
+  itemById = $derived(new Map(this.view.items.map((i) => [i.id, i] as [string, Item])));
+  itemsByName = $derived.by(() => {
+    const m = new Map<string, Item[]>();
+    for (const i of this.view.items) {
+      const arr = m.get(i.name);
+      if (arr) arr.push(i);
+      else m.set(i.name, [i]);
+    }
+    return m;
+  });
+
   item(id: string | null | undefined): Item | undefined {
-    return id ? this.view.items.find((i) => i.id === id) : undefined;
+    return id ? this.itemById.get(id) : undefined;
   }
 
   saveSettings() {
@@ -313,7 +330,7 @@ class AppState {
   loginOf(it: Item): string {
     const ref = fieldValue(it, "credential");
     if (ref) {
-      const c = this.item(ref) ?? this.view.items.find((i) => i.name === ref);
+      const c = this.itemById.get(ref) ?? this.itemsByName.get(ref)?.[0];
       if (c?.username) return c.username;
     }
     if (it.username) return it.username;
@@ -328,7 +345,7 @@ class AppState {
     const gw = fieldValue(it, "gateway");
     if (gw && c.protocol === "rdp") {
       if (!this.settings.probeViaGateway) return null;
-      const g = this.item(gw) ?? this.view.items.find((i) => i.name === gw);
+      const g = this.itemById.get(gw) ?? this.itemsByName.get(gw)?.[0];
       const m = /^(?:[a-z]+:\/\/)?(\[[^\]]+\]|[^:/?#]+)(?::(\d+))?/i.exec((g?.uris[0] ?? "").trim());
       return m ? { host: m[1], port: Number(m[2] ?? 443), kind: "tls" } : null;
     }
@@ -432,7 +449,13 @@ class AppState {
   }
 
   async lock() {
-    await api.lock();
+    try {
+      await api.lock();
+    } catch (e) {
+      // Не менять phase при отказе: интерфейс остался бы разблокированным без блокировки
+      this.toast(errText(e), true);
+      return;
+    }
     this.view = { folders: [], collections: [], orgs: [], items: [] };
     this.editing = null;
     this.selected = null;
@@ -474,9 +497,26 @@ class AppState {
   }
 
   quickConnect(address: string, protocol: string, username?: string, password?: string) {
-    const m = /^([a-z]+):\/\//i.exec(address);
-    const proto = (m ? m[1].toLowerCase() : protocol) as Protocol;
-    this.addTab({ protocol: proto, title: address, quick: { address, protocol, username, password } });
+    const addr = address.trim();
+    const m = /^([a-z]+):\/\//i.exec(addr);
+    let proto = m ? m[1].toLowerCase() : protocol;
+    let finalAddr = addr;
+    if (proto === "http" || proto === "https") {
+      proto = "web";
+    } else if (proto === "web") {
+      // web:// WebView не понимает — превращаем в https
+      finalAddr = addr.replace(/^web:\/\//i, "https://");
+    } else if (proto === "winbox") {
+      // WinBox — отдельная программа, ей нужна запись хранилища (как в connect)
+      this.toast("WinBox запускается из записи подключения — быстрое подключение недоступно", true);
+      return;
+    }
+    if (proto === "web" && !/^[a-z]+:\/\//i.test(finalAddr)) finalAddr = "https://" + finalAddr;
+    if (!(PROTOCOLS as readonly string[]).includes(proto)) {
+      this.toast(`Протокол ${proto} не поддерживается`, true);
+      return;
+    }
+    this.addTab({ protocol: proto as Protocol, title: addr, quick: { address: finalAddr, protocol: proto, username, password } });
   }
 
   private addTab(t: Pick<Tab, "protocol" | "title" | "itemId" | "quick">) {
@@ -508,7 +548,11 @@ class AppState {
     const i = this.tabs.findIndex((t) => t.key === key);
     if (i < 0) return;
     const t = this.tabs[i];
-    if (t.sessionId !== null) api.close(t.sessionId).catch(() => {});
+    if (t.sessionId !== null) {
+      api.close(t.sessionId).catch(() => {});
+      // Диалоги закрытого сеанса больше не нужны
+      this.prompts = this.prompts.filter((p) => p.session !== t.sessionId);
+    }
     this.tabs.splice(i, 1);
     if (this.activeTab === key) {
       this.activeTab = this.tabs[Math.min(i, this.tabs.length - 1)]?.key ?? null;
@@ -518,7 +562,9 @@ class AppState {
   reconnect(key: string) {
     const t = this.tab(key);
     if (!t) return;
-    if (t.sessionId !== null && t.state === "connected") api.close(t.sessionId).catch(() => {});
+    // Закрываем сеанс в любом состоянии, не только «connected»: во время «Подключение…»
+    // нативный сеанс уже может аутентифицироваться — без закрытия он осиротеет
+    if (t.sessionId !== null) api.close(t.sessionId).catch(() => {});
     t.sessionId = null;
     t.state = "connecting";
     t.message = "";
@@ -528,7 +574,9 @@ class AppState {
   cycleTab(dir: 1 | -1) {
     if (!this.tabs.length) return;
     const i = this.tabs.findIndex((t) => t.key === this.activeTab);
-    this.activeTab = this.tabs[(i + dir + this.tabs.length) % this.tabs.length].key;
+    // С «Главной» (i=-1): вперёд — первая вкладка, назад — последняя (не предпоследняя)
+    const cur = i < 0 ? (dir === 1 ? -1 : 0) : i;
+    this.activeTab = this.tabs[(cur + dir + this.tabs.length) % this.tabs.length].key;
   }
 
   // ---------- Оверлеи (скрывают окна RDP, которые иначе перекрыли бы диалог) ----------
@@ -566,8 +614,14 @@ export function applyTheme(theme: string, preview?: CustomTheme) {
   root.dataset.themeRev = String(Number(root.dataset.themeRev ?? 0) + 1);
 }
 
-export async function setupEvents() {
-  await listen<{ id: number; state: TabState; message: string }>("session-status", (e) => {
+/** Автоблокировка: бездействие во всей системе превысило лимит (0 — выключено). Вынесено для тестов. */
+export function shouldLock(idleMs: number, minutes: number): boolean {
+  return minutes > 0 && idleMs > minutes * 60_000;
+}
+
+/** Подписки на события backend; возвращает снятие подписок (cleanup при HMR/размонтировании). */
+export async function setupEvents(): Promise<() => void> {
+  const un1 = await listen<{ id: number; state: TabState; message: string }>("session-status", (e) => {
     const t = app.tabs.find((t) => t.sessionId === e.payload.id);
     if (!t) {
       earlyStatus.set(e.payload.id, { state: e.payload.state, message: e.payload.message });
@@ -575,15 +629,24 @@ export async function setupEvents() {
     }
     t.state = e.payload.state;
     t.message = e.payload.message;
+    // Диалоги завершённого сеанса больше не нужны (backend их тоже отменяет)
+    if (e.payload.state === "closed" || e.payload.state === "error") {
+      app.prompts = app.prompts.filter((p) => p.session !== e.payload.id);
+    }
   });
-  await listen<number>("rdp-docked", (e) => {
+  const un2 = await listen<number>("rdp-docked", (e) => {
     const t = app.tabs.find((t) => t.sessionId === e.payload);
     if (t) {
       t.detached = false;
       app.activeTab = t.key;
     }
   });
-  await listen<PromptReq>("prompt", (e) => {
+  const un3 = await listen<PromptReq>("prompt", (e) => {
     app.prompts.push(e.payload);
   });
+  return () => {
+    un1();
+    un2();
+    un3();
+  };
 }

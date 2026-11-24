@@ -4,7 +4,7 @@
 // Не попадает: логин, пароль, TOTP, ссылки на учётные записи и SSH-ключи, скрытые поля,
 // заметки (в них часто хранят пароли), промежуточный SSH-хост (ссылка на другую запись).
 // Формат совместим с импортом (ImportDialog): те же поля, что у импорта из mRemoteNG.
-import { api, errText, fieldValue, parseConn, inTauri, KNOWN_FIELDS, type Item } from "./api";
+import { api, errText, fieldValue, flagValue, parseConn, inTauri, KNOWN_FIELDS, type Item } from "./api";
 import { app } from "./state.svelte";
 
 export const EXPORT_FORMAT = "rdpmgrcoffee-connections";
@@ -27,6 +27,8 @@ export type ExportedConn = {
   notes: string;
   opts: Record<string, string>;
   gateway: ExportedGw | null;
+  /** Полный адрес веб-подключения (с путём страницы): host/port путь теряют */
+  uri: string;
 };
 export type ExportFile = {
   format: typeof EXPORT_FORMAT;
@@ -42,7 +44,7 @@ function gatewayOf(it: Item): ExportedGw | null {
   const g = app.item(ref) ?? app.view.items.find((i) => i.name === ref);
   const host = (g?.uris[0] ?? "").trim().replace(/^[a-z]+:\/\//i, "").replace(/^[^@/]*@/, "").replace(/\/.*$/, "");
   if (!host) return null;
-  const same = !!g && fieldValue(g, "samecreds") === "true";
+  const same = !!g && flagValue(g, "samecreds");
   return { host, username: "", password: "", domain: g && !same ? fieldValue(g, "domain") : "", same };
 }
 
@@ -96,6 +98,7 @@ export function buildExport(items: Item[], base = "", full = false): ExportFile 
       notes: full ? it.notes : "",
       opts,
       gateway: c.protocol === "rdp" ? gatewayOf(it) : null,
+      uri: c.protocol === "web" ? c.uri : "",
     });
     ids.push(it.id);
   }
@@ -178,7 +181,7 @@ export function parseExport(text: string, secrets = false): { conns: ExportedCon
   for (const c of d.conns) {
     const host = str(c?.host).trim();
     const protocol = str(c?.protocol).toLowerCase();
-    if (!host || !["rdp", "ssh", "telnet", "serial", "winbox"].includes(protocol)) {
+    if (!host || !["rdp", "ssh", "telnet", "serial", "winbox", "vnc", "web"].includes(protocol)) {
       skipped.push(str(c?.name) || "(без имени)");
       continue;
     }
@@ -209,6 +212,8 @@ export function parseExport(text: string, secrets = false): { conns: ExportedCon
               same: !!g.same,
             }
           : null,
+      // Веб-адрес — целиком, с путём; чужие схемы не принимаем (backend пускает только http/https)
+      uri: protocol === "web" && /^https?:\/\//i.test(str(c.uri)) ? str(c.uri) : "",
     });
   }
   const folders = Array.isArray(d.folders) ? d.folders.filter(Array.isArray).map((p) => p.map(str).filter(Boolean)) : [];

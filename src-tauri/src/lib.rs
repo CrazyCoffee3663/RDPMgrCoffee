@@ -97,15 +97,54 @@ async fn vault_unlock(app: AppHandle, vault: State<'_, Vault>, password: String)
 #[tauri::command]
 async fn vault_lock(app: AppHandle, vault: State<'_, Vault>) -> CmdResult<()> {
     vault.lock().await;
+    // Пароль не должен оставаться в буфере до истечения TTL после блокировки
+    clip::clear_if_secret();
     // Сеансы продолжают работать, но скрыты за экраном блокировки и без доступа к буферу обмена
     rdp::set_locked(&app, true);
     Ok(())
 }
 
 #[tauri::command]
-async fn vault_logout(vault: State<'_, Vault>) -> CmdResult<()> {
+async fn vault_logout(app: AppHandle, vault: State<'_, Vault>) -> CmdResult<()> {
     vault.logout().await;
+    // Блокируем независимо от фронтенда: порядок invoke(vault_lock) после logout не гарантирован
+    clip::clear_if_secret();
+    rdp::set_locked(&app, true);
     Ok(())
+}
+
+/// Подсказка из прежней версии программы (com.user.connmgr, данные bw CLI):
+/// сервер и почта для формы входа. Пароль не трогаем, старый каталог не удаляем.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LegacyHint {
+    server: String,
+    email: String,
+}
+
+#[tauri::command]
+fn legacy_hint(app: AppHandle) -> Option<LegacyHint> {
+    let old = app
+        .path()
+        .app_data_dir()
+        .ok()?
+        .parent()?
+        .join("com.user.connmgr")
+        .join("bw-data")
+        .join("data.json");
+    let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(old).ok()?).ok()?;
+    let server = v["serverUrl"]
+        .as_str()
+        .or_else(|| v["environmentUrls"]["base"].as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let email = v["userEmail"].as_str().unwrap_or("").trim().to_string();
+    if server.is_empty() && email.is_empty() {
+        None
+    } else {
+        Some(LegacyHint { server, email })
+    }
 }
 
 #[tauri::command]
@@ -326,10 +365,19 @@ fn locate(app: &AppHandle, rel: &str) -> PathBuf {
     }
     #[cfg(not(debug_assertions))]
     {
-        app.path()
+        // Запасной путь — папка программы, но не текущий каталог: относительный путь
+        // разрешился бы от CWD, куда можно подложить свой wfreerdp.exe
+        let base = app
+            .path()
             .resource_dir()
-            .map(|d| clean(d.join("resources").join(rel)))
-            .unwrap_or_else(|_| PathBuf::from(rel))
+            .ok()
+            .or_else(|| std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf())));
+        match base {
+            Some(d) => clean(d.join("resources").join(rel)),
+            // Папку программы определить не удалось — несуществующий путь: запуск
+            // упадёт с понятной ошибкой, а не найдёт чужой файл в CWD
+            None => PathBuf::new(),
+        }
     }
 }
 
@@ -438,9 +486,10 @@ async fn sftp_download(app: AppHandle, sessions: State<'_, Sessions>, id: u32, p
     Ok(p.display().to_string())
 }
 
-/// Загрузка файла: тело запроса — содержимое, заголовки x-sid и x-path (urlencoded).
+/// Загрузка файла кусками: тело запроса — содержимое среза, заголовки x-sid, x-path
+/// (urlencoded) и x-offset. Интерфейс шлёт файл по частям, а не целиком в памяти webview.
 #[tauri::command]
-async fn sftp_upload(sessions: State<'_, Sessions>, request: tauri::ipc::Request<'_>) -> Result<(), String> {
+async fn sftp_upload_chunk(sessions: State<'_, Sessions>, request: tauri::ipc::Request<'_>) -> Result<(), String> {
     let tauri::ipc::InvokeBody::Raw(data) = request.body() else {
         return Err("Ожидалось содержимое файла".into());
     };
@@ -450,7 +499,8 @@ async fn sftp_upload(sessions: State<'_, Sessions>, request: tauri::ipc::Request
     if path.is_empty() {
         return Err("Не указан путь".into());
     }
-    sessions::sftp_upload(&sessions, id, &path, data).await
+    let offset: u64 = h("x-offset").parse().map_err(|_| "Нет смещения куска")?;
+    sessions::sftp_upload_chunk(&sessions, id, &path, offset, data).await
 }
 
 fn urlencoding_decode(s: &str) -> String {
@@ -561,6 +611,17 @@ async fn freerdp_status(tools: State<'_, Tools>) -> Result<tools::FreerdpStatus,
     Ok(tools::freerdp_status(&tools.http, dir.as_deref()).await)
 }
 
+/// Обновление FreeRDP одной кнопкой: архив с GitHub-релиза, SHA-256, проверка запуском, замена.
+#[tauri::command]
+async fn freerdp_update(app: AppHandle, tools: State<'_, Tools>) -> Result<tools::FreerdpUpdateResult, String> {
+    let dir = rdp::FREERDP_EXE.get().and_then(|e| e.parent().map(|p| p.to_path_buf())).ok_or("FreeRDP не найден")?;
+    let report = move |phase: &str, percent: u8| {
+        use tauri::Emitter;
+        let _ = app.emit("freerdp-update-progress", serde_json::json!({ "phase": phase, "percent": percent }));
+    };
+    tools::freerdp_update(&report, &tools.http, &dir).await
+}
+
 /// Проверка доступности хостов (индикатор в дереве).
 #[tauri::command]
 async fn probe_hosts(targets: Vec<net::Target>, timeout_ms: u64, parallel: usize) -> Vec<net::Reach> {
@@ -576,20 +637,27 @@ fn mremoteng_default_file() -> Option<String> {
 
 /// Прочитать и разобрать файл mRemoteNG по пути.
 #[tauri::command]
-fn import_mremoteng_file(path: String, password: Option<String>) -> Result<mremoteng::Import, String> {
-    let xml = std::fs::read_to_string(&path).map_err(|e| format!("Не удалось прочитать {}: {}", path, e))?;
-    mremoteng::parse(&xml, password.as_deref())
+async fn import_mremoteng_file(path: String, password: Option<String>) -> Result<mremoteng::Import, String> {
+    // Разбор гоняет KDF по файлу — синхронная команда выполнялась бы на главном потоке
+    tauri::async_runtime::spawn_blocking(move || {
+        let xml = std::fs::read_to_string(&path).map_err(|e| format!("Не удалось прочитать {}: {}", path, e))?;
+        mremoteng::parse(&xml, password.as_deref())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Разобрать файлы Terminals (тексты Terminals.config, Favorites.xml, Credentials.xml; любой может быть пустым).
 #[tauri::command]
-fn import_terminals(
+async fn import_terminals(
     config: String,
     favorites: String,
     credentials: String,
     password: Option<String>,
 ) -> Result<mremoteng::Import, String> {
-    terminals::parse(&config, &favorites, &credentials, password.as_deref())
+    tauri::async_runtime::spawn_blocking(move || terminals::parse(&config, &favorites, &credentials, password.as_deref()))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 /// Папка данных Terminals по умолчанию (если найдена)
@@ -600,22 +668,36 @@ fn terminals_default_dir() -> Option<String> {
 
 /// Разобрать файлы Terminals из папки
 #[tauri::command]
-fn import_terminals_dir(dir: String, password: Option<String>) -> Result<mremoteng::Import, String> {
-    let d = std::path::Path::new(&dir);
-    let read = |f: &str| std::fs::read_to_string(d.join(f)).unwrap_or_default();
-    terminals::parse(&read("Terminals.config"), &read("Favorites.xml"), &read("Credentials.xml"), password.as_deref())
+async fn import_terminals_dir(dir: String, password: Option<String>) -> Result<mremoteng::Import, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let d = std::path::Path::new(&dir);
+        let read = |f: &str| std::fs::read_to_string(d.join(f)).unwrap_or_default();
+        terminals::parse(&read("Terminals.config"), &read("Favorites.xml"), &read("Credentials.xml"), password.as_deref())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Разобрать confCons.xml mRemoteNG (записи создаёт интерфейс).
 #[tauri::command]
-fn import_mremoteng(xml: String, password: Option<String>) -> Result<mremoteng::Import, String> {
-    mremoteng::parse(&xml, password.as_deref())
+async fn import_mremoteng(xml: String, password: Option<String>) -> Result<mremoteng::Import, String> {
+    tauri::async_runtime::spawn_blocking(move || mremoteng::parse(&xml, password.as_deref()))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        // Второй экземпляр не запускается (конкурентная перезапись local vault) — показываем открытое окно
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            if let Some(w) = app.get_webview_window("main") {
+                let _ = w.show();
+                let _ = w.unminimize();
+                let _ = w.set_focus();
+            }
+        }))
         .manage(Sessions::default())
         .manage(rdp::Rdp::default())
         .setup(|app| {
@@ -628,6 +710,9 @@ pub fn run() {
                     .unwrap_or_else(|_| std::env::temp_dir().join("connmgr")),
             );
             let _ = std::fs::create_dir_all(&dir);
+            // Маркер «в буфере наш секрет» + очистка после падения/выхода прошлого процесса
+            clip::init(&dir);
+            clip::startup_cleanup();
             *app.state::<Sessions>().known_hosts.lock().unwrap() = dir.join("known_hosts");
             app.manage(Vault::new(dir.join("vault")));
             app.manage(Tools {
@@ -649,6 +734,8 @@ pub fn run() {
             }
             tauri::WindowEvent::Destroyed => {
                 let app = w.app_handle();
+                // Выход программы не должен оставлять пароль в буфере до истечения TTL
+                clip::clear_if_secret();
                 app.state::<Sessions>().close_all();
                 rdp::close_all(app);
                 for (label, win) in app.webview_windows() {
@@ -716,12 +803,14 @@ pub fn run() {
             tool_stop,
             sftp_list,
             sftp_download,
-            sftp_upload,
+            sftp_upload_chunk,
             sftp_op,
             winbox_status,
             freerdp_status,
+            freerdp_update,
             winbox_install,
-            import_mremoteng_file
+            import_mremoteng_file,
+            legacy_hint
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

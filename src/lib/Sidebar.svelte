@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { parseConn, fieldValue, PROTOCOL_LABEL, type Item, type Folder } from "./api";
+  import { parseConn, fieldValue, flagValue, PROTOCOL_LABEL, type Item, type Folder } from "./api";
   import { app } from "./state.svelte";
   import { menu } from "./dialogs.svelte";
   import * as act from "./actions";
@@ -91,14 +91,17 @@
       }
     }
     const ord = app.settings.order ?? {};
-    const rank = (list: string[] | undefined, k: string) => {
-      const i = list ? list.indexOf(k) : -1;
-      return i < 0 ? Infinity : i;
-    };
     const sortNode = (n: Node): number => {
+      // Карта рангов строится один раз на узел: indexOf в компараторе давал
+      // O(n²log n) на каждое нажатие клавиши в режиме ручного порядка
       const o = ord[n.key];
-      n.children.sort((a, b) => rank(o, a.key) - rank(o, b.key) || a.name.localeCompare(b.name, "ru"));
-      n.items.sort((a, b) => rank(o, a.id) - rank(o, b.id) || a.name.localeCompare(b.name, "ru"));
+      const idx = new Map<string, number>();
+      o?.forEach((k, i) => {
+        if (!idx.has(k)) idx.set(k, i);
+      });
+      const rank = (k: string) => idx.get(k) ?? Infinity;
+      n.children.sort((a, b) => rank(a.key) - rank(b.key) || a.name.localeCompare(b.name, "ru"));
+      n.items.sort((a, b) => rank(a.id) - rank(b.id) || a.name.localeCompare(b.name, "ru"));
       n.count = n.items.length + n.children.reduce((s, c) => s + sortNode(c), 0);
       return n.count;
     };
@@ -186,28 +189,42 @@
   const selectedItems = () => app.selection.map((id) => app.item(id)).filter((x): x is Item => !!x);
 
   function onItemKey(e: KeyboardEvent) {
-    const idx = rows.findIndex((r) => r.kind === "item" && r.item.id === app.selected);
+    // Навигация по всем строкам, включая папки: раньше они пропускались и были
+    // недоступны с клавиатуры (раскрыть/свернуть — Enter/стрелки)
+    const rowKey = (r: Row) => (r.kind === "item" ? r.item.id : r.node.key);
+    const idx = rows.findIndex((r) => rowKey(r) === app.selected);
+    const cur = idx >= 0 ? rows[idx] : undefined;
     const sel = app.item(app.selected);
     if (e.key === "ArrowDown" || e.key === "ArrowUp") {
       e.preventDefault();
       const dir = e.key === "ArrowDown" ? 1 : -1;
-      for (let i = idx + dir; i >= 0 && i < rows.length; i += dir) {
-        const r = rows[i];
-        if (r.kind === "item") {
-          app.selected = r.item.id;
-          if (e.shiftKey && anchor) {
-            const list = itemsInRows();
-            const a = list.findIndex((x) => x.id === anchor);
-            const b = list.findIndex((x) => x.id === r.item.id);
-            app.selection = list.slice(Math.min(a, b), Math.max(a, b) + 1).map((x) => x.id);
-          } else {
-            app.selection = [r.item.id];
-            anchor = r.item.id;
-          }
-          document.getElementById("row-" + r.item.id)?.scrollIntoView({ block: "nearest" });
-          break;
+      const next = rows[idx + dir];
+      if (!next) return;
+      app.selected = rowKey(next);
+      if (next.kind === "item") {
+        if (e.shiftKey && anchor) {
+          const list = itemsInRows();
+          const a = list.findIndex((x) => x.id === anchor);
+          const b = list.findIndex((x) => x.id === next.item.id);
+          if (a >= 0 && b >= 0) app.selection = list.slice(Math.min(a, b), Math.max(a, b) + 1).map((x) => x.id);
+        } else {
+          app.selection = [next.item.id];
+          anchor = next.item.id;
         }
+      } else {
+        // Папки в множественное выделение не входят
+        app.selection = [];
       }
+      document.getElementById("row-" + rowKey(next))?.scrollIntoView({ block: "nearest" });
+    } else if (e.key === "Enter" && cur?.kind === "node") {
+      e.preventDefault();
+      app.toggleExpanded(cur.node.key);
+    } else if (e.key === "ArrowRight" && cur?.kind === "node") {
+      e.preventDefault();
+      if (!app.expanded.includes(cur.node.key)) app.toggleExpanded(cur.node.key);
+    } else if (e.key === "ArrowLeft" && cur?.kind === "node") {
+      e.preventDefault();
+      if (app.expanded.includes(cur.node.key)) app.toggleExpanded(cur.node.key);
     } else if (e.key === "Enter" && sel) {
       e.preventDefault();
       if (parseConn(sel)) app.connect(sel);
@@ -419,13 +436,21 @@
           if (e.key === "ArrowDown") {
             e.preventDefault();
             const first = rows.find((r) => r.kind === "item");
-            if (first && first.kind === "item") app.selected = first.item.id;
+            if (first && first.kind === "item") {
+              app.selected = first.item.id;
+              // Зеркалим clickItem: иначе оставалось выделение до поиска и Delete
+              // удалял невидимые записи
+              app.selection = [first.item.id];
+              anchor = first.item.id;
+            }
             treeEl?.focus();
           }
           if (e.key === "Enter") {
             const first = rows.find((r) => r.kind === "item");
             if (first && first.kind === "item") {
               app.selected = first.item.id;
+              app.selection = [first.item.id];
+              anchor = first.item.id;
               if (parseConn(first.item)) app.connect(first.item);
               else app.editing = first.item.id;
             }
@@ -468,7 +493,9 @@
         {@const n = r.node}
         {@const open = !!query.trim() || app.expanded.includes(n.key)}
         <div
+          id="row-{n.key}"
           class="row folder"
+          class:cur={app.selected === n.key}
           class:drop={dragOver === n.key && dropPos === "into"}
           class:drop-before={dragOver === n.key && dropPos === "before"}
           class:drop-after={dragOver === n.key && dropPos === "after"}
@@ -478,7 +505,7 @@
           ondragstart={(e) => onFolderDragStart(e, n)}
           ondragend={onDragEnd}
           role="treeitem"
-          aria-selected="false"
+          aria-selected={app.selected === n.key}
           aria-expanded={open}
           tabindex="-1"
           onclick={() => app.toggleExpanded(n.key)}
@@ -538,7 +565,7 @@
             <span class="ficon"><Icon name={it.kind === 5 ? "key" : "user"} size={14} /></span>
           {/if}
           <span class="name">{it.name}</span>
-          {#if c && c.protocol !== "winbox" && ["1", "true", "yes", "да", "on"].includes(fieldValue(it, "mikrotik").toLowerCase())}
+          {#if c && c.protocol !== "winbox" && flagValue(it, "mikrotik")}
             <span class="mt" title="MikroTik — в меню есть WinBox">MikroTik</span>
           {/if}
           {#if it.favorite}<span class="fav"><Icon name="star" size={11} /></span>{/if}

@@ -70,13 +70,27 @@ async fn check(addr: String, kind: &str, timeout: Duration) -> bool {
         }
     }
     let mut buf = [0u8; 64];
-    match tokio::time::timeout(left, s.read(&mut buf)).await {
+    // Баннер SSH/VNC может прийти по частям: одиночный read вернёт «SS» — и хост
+    // ложно считался бы недоступным. Копим минимум 4 байта в пределах оставшегося времени.
+    let need = if matches!(kind, "ssh" | "vnc") { 4 } else { 1 };
+    let mut acc: Vec<u8> = Vec::new();
+    let read = async {
+        while acc.len() < need {
+            let n = s.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            acc.extend_from_slice(&buf[..n]);
+        }
+        Ok::<(), std::io::Error>(())
+    };
+    match tokio::time::timeout(left, read).await {
         // Пришли данные: у RDP ответ начинается с TPKT 0x03, у SSH — с «SSH-», у TLS — 0x15/0x16
-        Ok(Ok(n)) if n > 0 => match kind {
-            "rdp" => buf[0] == 0x03,
-            "ssh" => buf[..n].starts_with(b"SSH-"),
-            "vnc" => buf[..n].starts_with(b"RFB "),
-            "tls" => buf[0] == 0x15 || buf[0] == 0x16,
+        Ok(Ok(())) if !acc.is_empty() => match kind {
+            "rdp" => acc[0] == 0x03,
+            "ssh" => acc.starts_with(b"SSH-"),
+            "vnc" => acc.starts_with(b"RFB "),
+            "tls" => acc[0] == 0x15 || acc[0] == 0x16,
             _ => true,
         },
         // Соединение закрыли — за адресом никого нет (так отвечает прокси)
@@ -96,7 +110,9 @@ pub async fn probe(targets: Vec<Target>, timeout_ms: u64, parallel: usize) -> Ve
         let sem = sem.clone();
         tasks.push(tokio::spawn(async move {
             let _permit = sem.acquire_owned().await;
-            let addr = format!("{}:{}", t.host.trim_start_matches('[').trim_end_matches(']'), t.port);
+            let h = t.host.trim_matches(['[', ']']);
+            // IPv6-адрес для connect обязан быть в скобках, иначе порт неотличим от адреса
+            let addr = if h.contains(':') { format!("[{}]:{}", h, t.port) } else { format!("{}:{}", h, t.port) };
             let up = check(addr, &t.kind, timeout).await;
             Reach { id: t.id, up }
         }));
@@ -165,6 +181,39 @@ mod tests {
         assert!(up("tcp-silent"));
         assert!(!up("refused"));
         assert_eq!(tls_hello().len(), 5 + 4 + 2 + 32 + 1 + 2 + 12 + 2);
+    }
+
+    /// v72: баннер, пришедший по одному байту, не должен давать «недоступен»
+    #[tokio::test]
+    async fn ssh_banner_split_across_reads() {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut c, _)) = l.accept().await {
+                for b in b"SSH-2.0-split\r\n" {
+                    let _ = c.write_all(&[*b]).await;
+                    tokio::time::sleep(Duration::from_millis(30)).await;
+                }
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        });
+        let r = probe(vec![tgt("split", port, "ssh")], 1500, 4).await;
+        assert!(r[0].up, "частичный баннер не должен давать «недоступен»");
+    }
+
+    /// v33: пробник ходит на IPv6-адрес в скобках
+    #[tokio::test]
+    async fn ipv6_loopback_probe() {
+        let l = TcpListener::bind("[::1]:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut c, _)) = l.accept().await {
+                let _ = c.write_all(b"SSH-2.0-v6\r\n").await;
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        });
+        let r = probe(vec![Target { id: "v6".into(), host: "::1".into(), port, kind: "ssh".into() }], 800, 4).await;
+        assert!(r[0].up, "IPv6 loopback должен проверяться");
     }
 
     /// Ручная проверка через сеть этого ПК: cargo test probe_live -- --ignored --nocapture

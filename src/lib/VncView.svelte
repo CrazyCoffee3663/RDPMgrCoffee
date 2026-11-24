@@ -63,7 +63,8 @@
   let vncError = $state("");
 
   async function start() {
-    startedGen = tab.gen;
+    const gen = tab.gen;
+    startedGen = gen;
     stop();
     vncError = "";
     chan = new IpcChannel();
@@ -86,9 +87,15 @@
         { itemId: tab.itemId, quick: tab.quick?.address, quickProtocol: "vnc", quickUsername: tab.quick?.username, quickPassword: tab.quick?.password, cols: 0, rows: 0 },
         ch,
       );
+      // Переподключение/закрытие вкладки, пока open был в пути: поздний сеанс закрываем
+      if (tab.gen !== gen || !app.tab(tab.key)) {
+        api.close(r.id).catch(() => {});
+        return;
+      }
       c.sid = r.id;
       app.bindSession(tab.key, r.id);
     } catch (e) {
+      if (tab.gen !== gen) return;
       tab.state = "error";
       tab.message = errText(e);
     }

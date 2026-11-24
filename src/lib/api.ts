@@ -85,6 +85,8 @@ export type OpenArgs = {
 
 export const api = {
   status: () => invoke<Status>("vault_status"),
+  /** Подсказка из прежней версии (com.user.connmgr): сервер/почта для формы входа */
+  legacyHint: () => invoke<{ server: string; email: string } | null>("legacy_hint"),
   login: (server: string, email: string, password: string) =>
     invoke<LoginResult>("vault_login", { server, email, password }),
   login2fa: (provider: number, code: string) => invoke<LoginResult>("vault_login_2fa", { provider, code }),
@@ -131,11 +133,11 @@ export const api = {
   sftpList: (id: number, path: string) =>
     invoke<{ path: string; entries: { name: string; dir: boolean; link: boolean; size: number; mtime: number }[] }>("sftp_list", { id, path }),
   sftpDownload: (id: number, path: string) => invoke<string>("sftp_download", { id, path }),
-  /** Содержимое уходит сырым телом запроса, без JSON */
-  sftpUpload: (id: number, path: string, data: Uint8Array) =>
+  /** Кусок файла: сырое тело + заголовки x-sid/x-path/x-offset (файл не целиком в памяти webview) */
+  sftpUploadChunk: (id: number, path: string, offset: number, data: Uint8Array) =>
     inTauri
-      ? tauriInvoke<void>("sftp_upload", data, { headers: { "x-sid": String(id), "x-path": encodeURIComponent(path) } })
-      : invoke<void>("sftp_upload", { id, path }),
+      ? tauriInvoke<void>("sftp_upload_chunk", data, { headers: { "x-sid": String(id), "x-path": encodeURIComponent(path), "x-offset": String(offset) } })
+      : invoke<void>("sftp_upload_chunk", { id, path, offset, data: Array.from(data) }),
   sftpOp: (id: number, op: "mkdir" | "rmdir" | "rm" | "rename", path: string, to?: string) =>
     invoke<void>("sftp_op", { id, op, path, to }),
   /** Сохранить текстовый файл в «Загрузки» (без перезаписи), вернуть путь */
@@ -167,6 +169,7 @@ export const api = {
   winboxStatus: () => invoke<{ installed: string | null; latest: string | null; path: string }>("winbox_status"),
   winboxInstall: (version: string) => invoke<void>("winbox_install", { version }),
   freerdpStatus: () => invoke<{ installed: string | null; latest: string | null; url: string }>("freerdp_status"),
+  freerdpUpdate: () => invoke<{ version: string; already: boolean }>("freerdp_update"),
   rdpDetach: (id: number, title: string) => invoke<void>("rdp_detach", { id, title }),
   rdpAttach: (id: number) => invoke<void>("rdp_attach", { id }),
   probeHosts: (targets: { id: string; host: string; port: number; kind: string }[], timeoutMs: number, parallel: number) =>
@@ -205,24 +208,72 @@ export const KNOWN_FIELDS = [
 
 export type ConnInfo = { protocol: Protocol; host: string; port: number | null; uri: string };
 
+/** Хост для URI: IPv6 в скобках (зеркало backend parse_uri/build_args) */
+export function bracketHost(host: string): string {
+  return host.includes(":") ? `[${host}]` : host;
+}
+
+/** Порт в диапазоне u16, иначе null (зеркало backend parse::<u16>) */
+function parsePort(p: string): number | null {
+  if (!/^\d+$/.test(p)) return null;
+  const n = Number(p);
+  return n <= 65535 ? n : null;
+}
+
+/** Единый список «истинных» значений флажков (зеркало backend conn::is_truthy) */
+export function flagValue(item: Item, name: string): boolean {
+  return ["1", "true", "yes", "да", "on"].includes(fieldValue(item, name).trim().toLowerCase());
+}
+
+// Разбор адреса зеркалит backend conn::parse_uri (общие тест-векторы в probes):
+// userinfo по последнему @, голый IPv6 не режется, порт вне u16 — отказ, uri trimmed.
 export function parseConn(item: Item): ConnInfo | null {
   if (item.kind !== 1) return null;
   // Веб-подключение: обычная ссылка http(s) с полем protocol=web (запись остаётся понятной Bitwarden)
   const isWeb = fieldValue(item, "protocol").toLowerCase() === "web";
-  for (const uri of item.uris) {
-    const m = /^([a-z]+):\/\/(?:[^@/]*@)?(\[[^\]]+\]|[^:/?#]+)(?::(\d+))?/i.exec(uri.trim());
-    if (!m) continue;
-    const proto = m[1].toLowerCase();
-    if (isWeb && (proto === "http" || proto === "https")) {
-      return { protocol: "web", host: m[2].replace(/^\[|\]$/g, ""), port: m[3] ? Number(m[3]) : null, uri: uri.trim() };
+  for (const raw of item.uris) {
+    const uri = raw.trim();
+    const sep = uri.indexOf("://");
+    if (sep < 1) continue;
+    const scheme = uri.slice(0, sep).toLowerCase();
+    const rest = uri.slice(sep + 3);
+    const auth = rest.split(/[/?#]/)[0] ?? "";
+    const at = auth.lastIndexOf("@");
+    const hp = at >= 0 ? auth.slice(at + 1) : auth;
+    let host: string;
+    let port: number | null = null;
+    if (hp.startsWith("[")) {
+      const close = hp.indexOf("]");
+      if (close < 0) continue;
+      host = hp.slice(1, close);
+      const after = hp.slice(close + 1);
+      if (after.startsWith(":")) {
+        const p = after.slice(1);
+        port = parsePort(p);
+        if (/^\d+$/.test(p) && port === null) continue;
+      }
+    } else if (scheme === "serial") {
+      host = hp;
+    } else if ((hp.match(/:/g) ?? []).length >= 2) {
+      // Голый IPv6: порт возможен только в скобках
+      host = hp;
+    } else {
+      const colon = hp.lastIndexOf(":");
+      const p = colon > 0 ? hp.slice(colon + 1) : "";
+      if (colon > 0 && /^\d+$/.test(p)) {
+        port = parsePort(p);
+        if (port === null) continue;
+        host = hp.slice(0, colon);
+      } else {
+        host = hp;
+      }
     }
-    if ((PROTOCOLS as readonly string[]).includes(proto)) {
-      return {
-        protocol: proto as Protocol,
-        host: m[2].replace(/^\[|\]$/g, ""),
-        port: m[3] ? Number(m[3]) : null,
-        uri,
-      };
+    if (!host) continue;
+    if (isWeb && (scheme === "http" || scheme === "https")) {
+      return { protocol: "web", host, port, uri };
+    }
+    if ((PROTOCOLS as readonly string[]).includes(scheme)) {
+      return { protocol: scheme as Protocol, host, port, uri };
     }
   }
   return null;
@@ -233,9 +284,9 @@ export function buildUri(protocol: Protocol, host: string, port: number | null):
     const h = host.trim();
     return /^https?:\/\//i.test(h) ? h : `https://${h}${port ? ":" + port : ""}`;
   }
-  const h = host.includes(":") && protocol !== "serial" ? `[${host}]` : host;
+  const h = protocol !== "serial" ? bracketHost(host.trim()) : host.trim();
   const p = port && port !== DEFAULT_PORTS[protocol] ? `:${port}` : "";
-  return `${protocol}://${h.trim()}${p}`;
+  return `${protocol}://${h}${p}`;
 }
 
 export function fieldValue(item: Item, name: string): string {

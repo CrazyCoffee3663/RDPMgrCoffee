@@ -26,17 +26,25 @@
   }
 
   async function start() {
-    startedGen = tab.gen;
+    const gen = tab.gen;
+    startedGen = gen;
     if (label) api.webClose(label).catch(() => {});
-    label = `web-${tab.key}-${tab.gen}`;
+    const myLabel = `web-${tab.key}-${gen}`;
+    label = myLabel;
     url = home;
     tab.state = "connecting";
     try {
       const [x, y, w, h] = rect();
-      await api.webOpen(label, home, x, y, w, h);
+      await api.webOpen(myLabel, home, x, y, w, h);
+      // Переподключение/закрытие вкладки, пока webOpen был в пути: поздний webview закрываем
+      if (tab.gen !== gen || !app.tab(tab.key)) {
+        api.webClose(myLabel).catch(() => {});
+        return;
+      }
       tab.state = "connected";
       place();
     } catch (e) {
+      if (tab.gen !== gen) return;
       tab.state = "error";
       tab.message = errText(e);
     }

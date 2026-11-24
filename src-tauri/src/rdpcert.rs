@@ -124,15 +124,22 @@ pub fn pretty(fp: &str) -> String {
     fp.as_bytes().chunks(2).map(|c| String::from_utf8_lossy(c).into_owned()).collect::<Vec<_>>().join(":")
 }
 
+/// Чтение-изменение-запись файла отпечатков — под общим локом: два параллельных
+/// подключения не должны потерять записи друг друга. Лок НЕ держится через диалог
+/// подтверждения (ask ждёт пользователя до 600 с) — только вокруг файловых операций.
+static STORE_LOCK: Mutex<()> = Mutex::new(());
+
 /// Запомненный отпечаток для «хост:порт»
 pub fn known(path: &Path, id: &str) -> Option<String> {
+    let _g = STORE_LOCK.lock().unwrap();
     std::fs::read_to_string(path)
         .ok()?
         .lines()
         .find_map(|l| l.split_once(' ').filter(|(h, _)| *h == id).map(|(_, f)| f.trim().to_string()))
 }
 
-pub fn remember(path: &Path, id: &str, fp: &str) {
+pub fn remember(path: &Path, id: &str, fp: &str) -> Result<(), String> {
+    let _g = STORE_LOCK.lock().unwrap();
     let text = std::fs::read_to_string(path).unwrap_or_default();
     let mut lines: Vec<String> = text
         .lines()
@@ -140,7 +147,9 @@ pub fn remember(path: &Path, id: &str, fp: &str) {
         .map(String::from)
         .collect();
     lines.push(format!("{} {}", id, fp));
-    let _ = std::fs::write(path, lines.join("\n") + "\n");
+    // Отказ записи — ошибка операции: «запомнили» без файла значило бы повторный вопрос
+    // при каждом подключении и молчаливое расхождение с тем, что видел пользователь
+    std::fs::write(path, lines.join("\n") + "\n").map_err(|e| format!("Не удалось запомнить сертификат {}: {}", id, e))
 }
 
 /// Значение для /cert: принимать только эти отпечатки, остальные — отклонять без вопросов.
@@ -163,14 +172,23 @@ mod tests {
         let p = std::env::temp_dir().join(format!("rdpcert-{}", std::process::id()));
         let _ = std::fs::remove_file(&p);
         assert_eq!(known(&p, "h:3389"), None);
-        remember(&p, "h:3389", "AABB");
-        remember(&p, "g:443", "CCDD");
-        remember(&p, "h:3389", "EEFF");
+        remember(&p, "h:3389", "AABB").unwrap();
+        remember(&p, "g:443", "CCDD").unwrap();
+        remember(&p, "h:3389", "EEFF").unwrap();
         assert_eq!(known(&p, "h:3389").as_deref(), Some("EEFF"));
         assert_eq!(known(&p, "g:443").as_deref(), Some("CCDD"));
         assert_eq!(pretty("AABBCC"), "AA:BB:CC");
         assert_eq!(freerdp_pin(&["AABB"]), "deny,fingerprint:sha256:AABB,fingerprint:sha256:AA:BB");
         let _ = std::fs::remove_file(&p);
+    }
+
+    /// Отказ записи отпечатка — ошибка, а не молчаливый «запомнили»
+    #[test]
+    fn remember_write_failure_is_error() {
+        let p = std::env::temp_dir().join(format!("rdpcert-dir-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&p);
+        assert!(remember(&p, "h:3389", "AABB").is_err());
+        let _ = std::fs::remove_dir_all(&p);
     }
 
     /// Проверка на RDP этого компьютера: cargo test rdp_localhost -- --ignored --nocapture

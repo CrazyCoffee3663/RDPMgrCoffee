@@ -28,12 +28,14 @@ pub struct Sessions {
     next_id: AtomicU32,
     next_prompt: AtomicU64,
     terms: Mutex<HashMap<u32, mpsc::UnboundedSender<TermCmd>>>,
-    prompts: Mutex<HashMap<u64, oneshot::Sender<Option<String>>>>,
+    /// id диалога → (сеанс, канал ответа): сеанс нужен для отмены диалогов при закрытии вкладки
+    prompts: Mutex<HashMap<u64, (u32, oneshot::Sender<Option<String>>)>>,
     pub known_hosts: Mutex<PathBuf>,
     /// Открытые SSH-соединения (для SFTP)
     ssh: Mutex<HashMap<u32, Arc<SshHandle>>>,
-    /// SFTP-сессии поверх них (создаются при первом обращении)
-    sftp: tokio::sync::Mutex<HashMap<u32, Arc<russh_sftp::client::SftpSession>>>,
+    /// SFTP-сессии поверх них (создаются при первом обращении). Замок на каждый сеанс:
+    /// глобальный сериализовал 15-секундное открытие одной вкладки со всеми остальными
+    sftp: Mutex<HashMap<u32, Arc<tokio::sync::Mutex<Option<Arc<russh_sftp::client::SftpSession>>>>>>,
 }
 
 type SshHandle = client::Handle<SshHandler>;
@@ -83,8 +85,20 @@ impl Sessions {
     }
 
     pub fn answer(&self, prompt: u64, value: Option<String>) {
-        if let Some(tx) = self.prompts.lock().unwrap().remove(&prompt) {
+        if let Some((_, tx)) = self.prompts.lock().unwrap().remove(&prompt) {
             let _ = tx.send(value);
+        }
+    }
+
+    /// Отменить все диалоги сеанса (вкладка закрыта во время входа): иначе диалог
+    /// висел бы до 600 секунд, а задача входа осталась сиротой
+    pub fn cancel_prompts(&self, session: u32) {
+        let mut g = self.prompts.lock().unwrap();
+        let ids: Vec<u64> = g.iter().filter(|(_, (s, _))| *s == session).map(|(id, _)| *id).collect();
+        for id in ids {
+            if let Some((_, tx)) = g.remove(&id) {
+                let _ = tx.send(None);
+            }
         }
     }
 
@@ -107,7 +121,7 @@ pub(crate) async fn ask(
     let st = app.state::<Sessions>();
     let id = st.next_prompt.fetch_add(1, Ordering::Relaxed) + 1;
     let (tx, rx) = oneshot::channel();
-    st.prompts.lock().unwrap().insert(id, tx);
+    st.prompts.lock().unwrap().insert(id, (session, tx));
     let _ = app.emit(
         "prompt",
         PromptEvent {
@@ -182,6 +196,8 @@ struct SshHandler {
     app: AppHandle,
     sid: u32,
     host_id: String,
+    /// Канал вывода сеанса — для предупреждений (например, ключ не сохранён на диск)
+    out: Channel<InvokeResponseBody>,
 }
 
 fn known_hosts_check(path: &PathBuf, host_id: &str, key_line: &str) -> (bool, bool) {
@@ -201,7 +217,7 @@ fn known_hosts_check(path: &PathBuf, host_id: &str, key_line: &str) -> (bool, bo
     (false, other)
 }
 
-fn known_hosts_store(path: &PathBuf, host_id: &str, key_line: &str) {
+fn known_hosts_store(path: &PathBuf, host_id: &str, key_line: &str) -> Result<(), String> {
     let text = std::fs::read_to_string(path).unwrap_or_default();
     let mut lines: Vec<String> = text
         .lines()
@@ -209,7 +225,7 @@ fn known_hosts_store(path: &PathBuf, host_id: &str, key_line: &str) {
         .map(String::from)
         .collect();
     lines.push(format!("{} {}", host_id, key_line));
-    let _ = std::fs::write(path, lines.join("\n") + "\n");
+    std::fs::write(path, lines.join("\n") + "\n").map_err(|e| format!("{}: {}", path.display(), e))
 }
 
 impl client::Handler for SshHandler {
@@ -251,7 +267,11 @@ impl client::Handler for SshHandler {
         };
         let ok = ask(&self.app, self.sid, "confirm", title, &msg, danger).await.is_some();
         if ok {
-            known_hosts_store(&path, &self.host_id, &line);
+            // Отказ записи не отменяет доверие (пользователь уже подтвердил ключ), но и не
+            // молчит: при следующем подключении вопрос повторится
+            if let Err(e) = known_hosts_store(&path, &self.host_id, &line) {
+                send_text(&self.out, &format!("\x1b[33mНе удалось сохранить ключ сервера ({}) — при следующем подключении вопрос повторится\x1b[0m\n", e));
+            }
         }
         Ok(ok)
     }
@@ -276,7 +296,7 @@ async fn ssh_login(
         ..Default::default()
     });
     let host_id = if port == 22 { p.host.clone() } else { format!("[{}]:{}", p.host, port) };
-    let handler = SshHandler { app: app.clone(), sid: id, host_id };
+    let handler = SshHandler { app: app.clone(), sid: id, host_id, out: out.clone() };
     let connect_err = |e: russh::Error| match e {
         russh::Error::UnknownKey => "Ключ сервера не принят".to_string(),
         e => format!("Не удалось подключиться к {}: {}", p.host, e),
@@ -285,21 +305,22 @@ async fn ssh_login(
         send_text(out, &format!("\x1b[90mПромежуточный хост {}…\x1b[0m\n", j.host));
         let jh = Box::pin(ssh_login(app, id, j, out, keep)).await?;
         send_text(out, &format!("\x1b[90mПодключение к {}:{} через {}…\x1b[0m\n", p.host, port, j.host));
-        let ch = jh
-            .channel_open_direct_tcpip(p.host.clone(), port as u32, "127.0.0.1", 0)
+        // Таймаут — только на сетевую операцию: диалог доверия ключу внутри connect_stream
+        // ждёт пользователя до 600 с и не должен убиваться 20-секундным таймаутом
+        let ch = tokio::time::timeout(Duration::from_secs(20), jh.channel_open_direct_tcpip(p.host.clone(), port as u32, "127.0.0.1", 0))
             .await
+            .map_err(|_| "Превышено время ожидания подключения".to_string())?
             .map_err(|e| format!("Промежуточный хост не смог подключиться к {}:{}: {}", p.host, port, e))?;
         keep.push(jh);
-        tokio::time::timeout(Duration::from_secs(20), client::connect_stream(config, ch.into_stream(), handler))
-            .await
-            .map_err(|_| "Превышено время ожидания подключения".to_string())?
-            .map_err(connect_err)?
+        client::connect_stream(config, ch.into_stream(), handler).await.map_err(connect_err)?
     } else {
         send_text(out, &format!("\x1b[90mПодключение к {}:{}…\x1b[0m\n", p.host, port));
-        tokio::time::timeout(Duration::from_secs(20), client::connect(config, (p.host.as_str(), port), handler))
+        let tcp = tokio::time::timeout(Duration::from_secs(20), tokio::net::TcpStream::connect((p.host.as_str(), port)))
             .await
             .map_err(|_| "Превышено время ожидания подключения".to_string())?
-            .map_err(connect_err)?
+            .map_err(|e| format!("Не удалось подключиться к {}: {}", p.host, e))?;
+        let _ = tcp.set_nodelay(true);
+        client::connect_stream(config, tcp, handler).await.map_err(connect_err)?
     };
     ssh_auth(app, id, p, &mut h).await?;
     Ok(h)
@@ -406,10 +427,50 @@ async fn run_ssh(
     mut rx: mpsc::UnboundedReceiver<TermCmd>,
 ) -> Result<(), String> {
     let mut keep = Vec::new();
-    let h = Arc::new(ssh_login(app, id, p, out, &mut keep).await?);
     let st = app.state::<Sessions>();
-    st.ssh.lock().unwrap().insert(id, h.clone());
-    let tunnels = start_tunnels(app, id, h.clone(), p.opt("tunnels"), out).await;
+    let mut tunnels: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    // Вход и туннели — под отменой по Close: закрытая вкладка во время входа иначе
+    // оставляла сироту с диалогом до 600 секунд. Данные до подключения отправлять некуда.
+    let mut setup = Box::pin(async {
+        let h = Arc::new(ssh_login(app, id, p, out, &mut keep).await?);
+        st.ssh.lock().unwrap().insert(id, h.clone());
+        start_tunnels(app, id, h.clone(), p.opt("tunnels"), out, &mut tunnels).await;
+        Ok::<Arc<SshHandle>, String>(h)
+    });
+    let h = loop {
+        tokio::select! {
+            r = &mut setup => match r {
+                Ok(h) => break h,
+                Err(e) => {
+                    drop(setup);
+                    st.cancel_prompts(id);
+                    for t in &tunnels { t.abort(); }
+                    st.ssh.lock().unwrap().remove(&id);
+                    st.sftp.lock().unwrap().remove(&id);
+                    for j in keep.into_iter().rev() {
+                        let _ = j.disconnect(russh::Disconnect::ByApplication, "", "en").await;
+                    }
+                    return Err(e);
+                }
+            },
+            cmd = rx.recv() => match cmd {
+                Some(TermCmd::Close) | None => {
+                    drop(setup);
+                    st.cancel_prompts(id);
+                    for t in &tunnels { t.abort(); }
+                    st.ssh.lock().unwrap().remove(&id);
+                    st.sftp.lock().unwrap().remove(&id);
+                    for j in keep.into_iter().rev() {
+                        let _ = j.disconnect(russh::Disconnect::ByApplication, "", "en").await;
+                    }
+                    return Err("Отменено".into());
+                }
+                _ => {}
+            }
+        }
+    };
+    // setup завершён — освобождаем заимствования keep/tunnels до основного цикла
+    drop(setup);
 
     let res = async {
         let mut ch = h.channel_open_session().await.map_err(|e| e.to_string())?;
@@ -445,7 +506,7 @@ async fn run_ssh(
         t.abort();
     }
     st.ssh.lock().unwrap().remove(&id);
-    st.sftp.lock().await.remove(&id);
+    st.sftp.lock().unwrap().remove(&id);
     let _ = h.disconnect(russh::Disconnect::ByApplication, "", "en").await;
     for j in keep.into_iter().rev() {
         let _ = j.disconnect(russh::Disconnect::ByApplication, "", "en").await;
@@ -509,15 +570,15 @@ async fn start_tunnels(
     h: Arc<SshHandle>,
     spec: &str,
     out: &Channel<InvokeResponseBody>,
-) -> Vec<tokio::task::JoinHandle<()>> {
+    tasks: &mut Vec<tokio::task::JoinHandle<()>>,
+) {
     let rules = match parse_tunnels(spec) {
         Ok(r) => r,
         Err(e) => {
             send_text(out, &format!("\x1b[33m{}\x1b[0m\n", e));
-            return vec![];
+            return;
         }
     };
-    let mut tasks = vec![];
     for t in rules {
         let (bind, lport, desc) = match &t {
             Tunnel::Local { bind, lport, host, port } => (bind.clone(), *lport, format!("{}:{} → {}:{}", bind, lport, host, port)),
@@ -576,7 +637,6 @@ async fn start_tunnels(
             }
         }));
     }
-    tasks
 }
 
 /// Минимальный SOCKS5 (без авторизации, только CONNECT). Возвращает куда подключаться.
@@ -642,9 +702,12 @@ pub struct SftpListing {
 
 impl Sessions {
     /// SFTP-сессия для SSH-вкладки (открывается при первом обращении).
+    /// Замок карты — только на чтение/вставку; 15-секундное открытие сериализуется
+    /// на каждый сеанс отдельно, а не между всеми вкладками.
     pub async fn sftp(&self, id: u32) -> Result<Arc<russh_sftp::client::SftpSession>, String> {
-        let mut g = self.sftp.lock().await;
-        if let Some(s) = g.get(&id) {
+        let slot = self.sftp.lock().unwrap().entry(id).or_default().clone();
+        let mut g = slot.lock().await;
+        if let Some(s) = g.as_ref() {
             return Ok(s.clone());
         }
         let h = self.ssh.lock().unwrap().get(&id).cloned().ok_or("SSH-сеанс не найден или ещё не подключён")?;
@@ -659,7 +722,7 @@ impl Sessions {
             .await
             .map_err(|_| "Сервер не ответил по SFTP за 15 секунд".to_string())??;
         let sftp = Arc::new(sftp);
-        g.insert(id, sftp.clone());
+        *g = Some(sftp.clone());
         Ok(sftp)
     }
 }
@@ -687,18 +750,22 @@ pub async fn sftp_list(st: &Sessions, id: u32, path: &str) -> Result<SftpListing
     Ok(SftpListing { path, entries })
 }
 
-/// Скачать файл в папку dir (не перезаписывая существующие). Возвращает путь.
-pub async fn sftp_download(st: &Sessions, id: u32, remote: &str, dir: &std::path::Path) -> Result<PathBuf, String> {
-    let sftp = st.sftp(id).await?;
+/// Имя файла с сервера для сохранения в Windows: недопустимые символы, зарезервированные
+/// имена (CON, NUL, COM1…), точки/пробелы в конце. Вынесено из sftp_download для тестов.
+pub fn sanitize_download_name(remote: &str) -> String {
     let name = remote.rsplit('/').next().filter(|n| !n.is_empty()).unwrap_or("file");
     let name: String = name.chars().map(|c| if r#"<>:"/\|?*"#.contains(c) || c.is_control() { '_' } else { c }).collect();
-    // Имя приходит с сервера: «.», «..», зарезервированные имена Windows (CON, NUL, COM1…)
-    // и точки/пробелы в конце недопустимы
     let name = name.trim_end_matches(['.', ' ']).to_string();
     let stem_up = name.split('.').next().unwrap_or("").to_ascii_uppercase();
     let reserved = ["CON", "PRN", "AUX", "NUL"].contains(&stem_up.as_str())
         || ((stem_up.starts_with("COM") || stem_up.starts_with("LPT")) && stem_up.len() == 4 && stem_up.as_bytes()[3].is_ascii_digit());
-    let name = if name.is_empty() { "file".to_string() } else if reserved { format!("_{}", name) } else { name };
+    if name.is_empty() { "file".to_string() } else if reserved { format!("_{}", name) } else { name }
+}
+
+/// Скачать файл в папку dir (не перезаписывая существующие). Возвращает путь.
+pub async fn sftp_download(st: &Sessions, id: u32, remote: &str, dir: &std::path::Path) -> Result<PathBuf, String> {
+    let sftp = st.sftp(id).await?;
+    let name = sanitize_download_name(remote);
     let mut local = dir.join(&name);
     let (stem, ext) = match name.rsplit_once('.') {
         Some((s, e)) if !s.is_empty() => (s.to_string(), format!(".{}", e)),
@@ -716,9 +783,20 @@ pub async fn sftp_download(st: &Sessions, id: u32, remote: &str, dir: &std::path
     Ok(local)
 }
 
-pub async fn sftp_upload(st: &Sessions, id: u32, remote: &str, data: &[u8]) -> Result<(), String> {
+/// Загрузка файла кусками: интерфейс шлёт срезы по несколько МиБ, а не весь файл
+/// в памяти webview. offset 0 — создать/обрезать, иначе — запись с нужной позиции.
+pub async fn sftp_upload_chunk(st: &Sessions, id: u32, remote: &str, offset: u64, data: &[u8]) -> Result<(), String> {
+    use russh_sftp::protocol::OpenFlags;
+    use tokio::io::AsyncSeekExt;
     let sftp = st.sftp(id).await?;
-    let mut f = sftp.create(remote).await.map_err(|e| e.to_string())?;
+    let mut flags = OpenFlags::WRITE | OpenFlags::CREATE;
+    if offset == 0 {
+        flags |= OpenFlags::TRUNCATE;
+    }
+    let mut f = sftp.open_with_flags(remote, flags).await.map_err(|e| e.to_string())?;
+    if offset > 0 {
+        f.seek(std::io::SeekFrom::Start(offset)).await.map_err(|e| e.to_string())?;
+    }
     f.write_all(data).await.map_err(|e| e.to_string())?;
     f.shutdown().await.map_err(|e| e.to_string())?;
     Ok(())
@@ -827,6 +905,11 @@ impl TelnetParser {
                 3 => {
                     if b == IAC {
                         self.state = 4
+                    } else if self.sb.len() >= 65536 {
+                        // Буфер подпереговоров не ограничен: враждебный сервер исчерпал бы
+                        // память. При переполнении сбрасываем SB и возвращаемся к данным
+                        self.sb.clear();
+                        self.state = 0;
                     } else {
                         self.sb.push(b)
                     }
@@ -861,6 +944,13 @@ async fn run_telnet(
     out: &Channel<InvokeResponseBody>,
     mut rx: mpsc::UnboundedReceiver<TermCmd>,
 ) -> Result<(), String> {
+    // Автологин отправляет логин и пароль одной строкой: \r\n внутри значения выполнил бы
+    // чужую команду на сервере сразу после приглашения (запись может прийти из общей коллекции)
+    for (label, v) in [("Логин", &p.username), ("Пароль", &p.password)] {
+        if v.contains(['\r', '\n', '\0']) {
+            return Err(format!("{} содержит перевод строки — такое подключение не запускается", label));
+        }
+    }
     let port = p.port.unwrap_or(23);
     send_text(out, &format!("\x1b[90mПодключение к {}:{}…\x1b[0m\n", p.host, port));
     let stream = tokio::time::timeout(
@@ -895,7 +985,15 @@ async fn run_telnet(
                     send_out(out, &data);
                     if !(sent_user && sent_pw) {
                         tail.push_str(&String::from_utf8_lossy(&data).to_lowercase());
-                        if tail.len() > 200 { tail = tail[tail.len() - 100..].to_string(); }
+                        if tail.len() > 200 {
+                            // Срез только по границам символов: len-100 мог попасть в середину
+                            // многобайтового символа — паника (в release — abort процесса)
+                            let mut start = tail.len() - 100;
+                            while !tail.is_char_boundary(start) {
+                                start -= 1;
+                            }
+                            tail = tail[start..].to_string();
+                        }
                         let t = tail.trim_end();
                         if !sent_user && (t.ends_with("login:") || t.ends_with("username:")) {
                             wr.write_all(format!("{}\r\n", p.username).as_bytes()).await.map_err(|e| e.to_string())?;

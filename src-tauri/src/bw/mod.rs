@@ -8,7 +8,7 @@ use crypto::{Kdf, SymKey};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 use zeroize::Zeroize;
@@ -49,6 +49,8 @@ struct Unlocked {
     refresh_token: Option<String>,
     master_hash: String,
     sync: Value,
+    /// Индекс имя→id для resolve_ref; None — устарел, строится заново при первом поиске
+    names: Option<HashMap<String, Vec<String>>>,
 }
 
 impl Drop for Unlocked {
@@ -82,6 +84,8 @@ impl Drop for Pending {
 #[derive(Default)]
 struct Inner {
     account: Option<Account>,
+    /// account.json существует, но не парсится: это повреждение, а не «новое хранилище»
+    account_broken: bool,
     unlocked: Option<Unlocked>,
     pending: Option<Pending>,
 }
@@ -90,6 +94,9 @@ pub struct Vault {
     dir: PathBuf,
     http: reqwest::Client,
     inner: Mutex<Inner>,
+    /// Сериализует запись кеша: снимок берётся под inner, дисковый ввод-вывод — вне его,
+    /// но порядок операций сохраняется (поздний снимок не записывается раньше раннего)
+    save_guard: Mutex<()>,
 }
 
 // ---------- Данные для интерфейса ----------
@@ -275,6 +282,34 @@ fn s(v: &Value) -> Option<&str> {
     v.as_str().filter(|x| !x.is_empty())
 }
 
+fn write_file_at(dir: &Path, name: &str, data: &[u8]) -> VResult<()> {
+    let tmp = dir.join(format!("{}.tmp", name));
+    std::fs::write(&tmp, data).map_err(|e| format!("Запись {}: {}", name, e))?;
+    std::fs::rename(&tmp, dir.join(name)).map_err(|e| format!("Запись {}: {}", name, e))
+}
+
+/// Сохранить кеш/хранилище и его контрольную сумму (HMAC ключом пользователя):
+/// зашифрованные поля можно переставить между записями (адрес одной — пароль другой),
+/// контрольная сумма всего файла не даёт сделать это незаметно.
+/// Ошибка записи — ошибка операции: у локального хранилища этот файл единственная копия,
+/// молча проглотить отказ значит показать «сохранено» и потерять данные при блокировке.
+fn save_cache_at(dir: &Path, sync: &Value, key: &SymKey) -> VResult<()> {
+    let t = serde_json::to_vec(sync).map_err(|e| format!("Не удалось сериализовать хранилище: {}", e))?;
+    // У локального хранилища этот файл — единственная копия: держим предыдущую версию
+    if dir.join("local.flag").exists() {
+        for (src, dst) in [("cache.json", "cache.json.bak"), ("cache.mac", "cache.mac.bak")] {
+            let p = dir.join(src);
+            if p.exists() {
+                std::fs::copy(&p, dir.join(dst)).map_err(|e| format!("Резервная копия {}: {}", src, e))?;
+            }
+        }
+    }
+    // Сначала данные, потом сумма: при сбое между записями load_cache возьмёт цельную
+    // предыдущую пару из .bak, а не новый MAC со старыми данными
+    write_file_at(dir, "cache.json", &t)?;
+    write_file_at(dir, "cache.mac", crypto::file_mac(key, &t).as_bytes())
+}
+
 struct Endpoints {
     api: String,
     identity: String,
@@ -282,14 +317,20 @@ struct Endpoints {
 
 fn endpoints(server: &str) -> Endpoints {
     let lower = server.to_lowercase();
-    let host = lower
+    let hostport = lower
         .split_once("://")
         .map(|(_, r)| r)
         .unwrap_or(&lower)
         .split('/')
         .next()
-        .unwrap_or("")
-        .to_string();
+        .unwrap_or("");
+    // Порт не часть имени: vault.bitwarden.com:443 — тот же официальный сервер,
+    // иначе self-hosted-ветка строит несуществующий путь /api на официальном домене
+    let host = match hostport.strip_prefix('[') {
+        Some(rest) => rest.split(']').next().unwrap_or(rest),
+        None => hostport.rsplit_once(':').map(|(h, _)| h).unwrap_or(hostport),
+    }
+    .trim_end_matches('.');
     if host == "vault.bitwarden.com" || host == "bitwarden.com" {
         return Endpoints {
             api: "https://api.bitwarden.com".into(),
@@ -359,43 +400,48 @@ impl Vault {
             .timeout(Duration::from_secs(60))
             .build()
             .expect("http client");
-        let account = std::fs::read_to_string(dir.join("account.json"))
-            .ok()
-            .and_then(|t| serde_json::from_str::<Account>(&t).ok())
-            .filter(|a| !a.protected_key.is_empty());
+        // «Нет файла» и «файл повреждён» — разные случаи: битый account.json при целом
+        // cache.json не должен молча превращаться в экран настройки поверх живых данных
+        let (account, account_broken) = match std::fs::read_to_string(dir.join("account.json")) {
+            Ok(t) => match serde_json::from_str::<Account>(&t) {
+                Ok(a) if !a.protected_key.is_empty() => (Some(a), false),
+                Ok(_) => (None, false),
+                Err(_) => (None, true),
+            },
+            Err(_) => (None, false),
+        };
         Self {
             dir,
             http,
             inner: Mutex::new(Inner {
                 account,
+                account_broken,
                 ..Default::default()
             }),
+            save_guard: Mutex::new(()),
         }
     }
 
     fn write_file(&self, name: &str, data: &[u8]) -> VResult<()> {
-        let tmp = self.dir.join(format!("{}.tmp", name));
-        std::fs::write(&tmp, data).map_err(|e| format!("Запись {}: {}", name, e))?;
-        std::fs::rename(&tmp, self.dir.join(name)).map_err(|e| format!("Запись {}: {}", name, e))
+        write_file_at(&self.dir, name, data)
     }
 
     fn save_account(&self, a: &Account) -> VResult<()> {
         self.write_file("account.json", serde_json::to_string_pretty(a).unwrap().as_bytes())
     }
 
-    /// Сохранить кеш/хранилище и его контрольную сумму (HMAC ключом пользователя):
-    /// зашифрованные поля можно переставить между записями (адрес одной — пароль другой),
-    /// контрольная сумма всего файла не даёт сделать это незаметно.
-    fn save_cache(&self, sync: &Value, key: &SymKey) {
-        if let Ok(t) = serde_json::to_vec(sync) {
-            // У локального хранилища этот файл — единственная копия: держим предыдущую версию
-            if self.dir.join("local.flag").exists() {
-                let _ = std::fs::copy(self.dir.join("cache.json"), self.dir.join("cache.json.bak"));
-                let _ = std::fs::copy(self.dir.join("cache.mac"), self.dir.join("cache.mac.bak"));
-            }
-            let _ = self.write_file("cache.mac", crypto::file_mac(key, &t).as_bytes());
-            let _ = self.write_file("cache.json", &t);
-        }
+    fn save_cache(&self, sync: &Value, key: &SymKey) -> VResult<()> {
+        save_cache_at(&self.dir, sync, key)
+    }
+
+    /// Записать кеш вне лока inner: сериализация, HMAC, копии и запись — в spawn_blocking,
+    /// чтобы дисковый ввод-вывод не блокировал ни асинхронный поток, ни читателей хранилища.
+    /// Вызывать под save_guard со снимком, снятым под inner.
+    async fn persist(&self, sync: Value, key: SymKey) -> VResult<()> {
+        let dir = self.dir.clone();
+        tokio::task::spawn_blocking(move || save_cache_at(&dir, &sync, &key))
+            .await
+            .map_err(|e| e.to_string())?
     }
 
     async fn is_local(&self) -> bool {
@@ -422,14 +468,6 @@ impl Vault {
         if password.chars().count() < 12 {
             return Err("Мастер-пароль должен быть не короче 12 символов".into());
         }
-        let device_id = {
-            let g = self.inner.lock().await;
-            if g.account.as_ref().is_some_and(|a| !a.protected_key.is_empty()) {
-                return Err("Хранилище уже настроено".into());
-            }
-            g.account.as_ref().map(|a| a.device_id.clone()).filter(|d| !d.is_empty())
-        }
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         // Argon2id с параметрами Bitwarden по умолчанию; соль случайная
         let kdf = Kdf { kind: 1, iterations: 3, memory: Some(64), parallelism: Some(4) };
         let salt = uuid::Uuid::new_v4().to_string();
@@ -443,6 +481,19 @@ impl Vault {
         })
         .await
         .map_err(|e| e.to_string())??;
+        // Проверка «ещё не настроено» и запись результата — под одним локом: иначе два
+        // параллельных create_local оба прошли бы проверку и второй затёр бы данные первого
+        let mut g = self.inner.lock().await;
+        if g.account.as_ref().is_some_and(|a| !a.protected_key.is_empty()) {
+            return Err("Хранилище уже настроено".into());
+        }
+        let device_id = g
+            .account
+            .as_ref()
+            .map(|a| a.device_id.clone())
+            .filter(|d| !d.is_empty())
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let broken = g.account_broken;
         let account = Account {
             server: String::new(),
             email: salt,
@@ -461,11 +512,14 @@ impl Vault {
             "collections": [],
             "ciphers": [],
         });
-        let _ = std::fs::remove_file(self.dir.join("cache.json"));
+        // Остатки прошлого хранилища (в т.ч. при битом account.json) не удаляем — всё уходит
+        // в папку резервной копии, иначе «новое» хранилище стёрло бы живые данные
+        if broken || ["cache.json", "cache.json.bak", "local.flag"].iter().any(|f| self.dir.join(f).exists()) {
+            self.stash_local()?;
+        }
         self.write_file("local.flag", b"1")?;
         self.save_account(&account)?;
-        self.save_cache(&sync, &user_key);
-        let mut g = self.inner.lock().await;
+        self.save_cache(&sync, &user_key)?;
         g.account = Some(account);
         g.unlocked = Some(Unlocked {
             user_key,
@@ -475,6 +529,7 @@ impl Vault {
             refresh_token: None,
             master_hash: String::new(),
             sync,
+            names: None,
         });
         Ok(())
     }
@@ -507,11 +562,22 @@ impl Vault {
         .await
         .map_err(|e| e.to_string())??;
         let mut g = self.inner.lock().await;
+        let unlocked = g.unlocked.is_some();
         let a = g.account.as_mut().ok_or("Учётная запись не настроена")?;
-        a.email = new_salt;
-        a.protected_key = new_protected;
-        let acc = a.clone();
-        self.save_account(&acc)
+        // Идентичность под финальным локом: параллельная смена пароля/выход не должны
+        // применить устаревший ключ к уже другой учётной записи
+        if !a.local || !unlocked || a.email != account.email || a.protected_key != account.protected_key {
+            return Err("Хранилище изменилось — повторите смену пароля".into());
+        }
+        let mut acc = a.clone();
+        acc.email = new_salt;
+        acc.protected_key = new_protected;
+        // Сначала диск, потом память: при отказе записи в памяти не должно остаться
+        // пароля, которого нет в файле (после перезапуска он бы не подошёл)
+        self.save_account(&acc)?;
+        a.email = acc.email;
+        a.protected_key = acc.protected_key;
+        Ok(())
     }
 
     /// Резервная копия локального хранилища: те же зашифрованные данные одним файлом.
@@ -542,22 +608,25 @@ impl Vault {
         if !account.local || account.protected_key.is_empty() || account.kdf.is_none() || !v["data"]["ciphers"].is_array() {
             return Err("В копии нет данных хранилища".into());
         }
-        {
-            let g = self.inner.lock().await;
-            if g.account.as_ref().is_some_and(|a| !a.protected_key.is_empty()) {
-                return Err("Хранилище уже настроено".into());
-            }
-            if let Some(d) = g.account.as_ref().map(|a| a.device_id.clone()).filter(|d| !d.is_empty()) {
-                account.device_id = d;
-            }
-        }
-        let _ = std::fs::remove_file(self.dir.join("cache.json"));
-        self.write_file("local.flag", b"1")?;
         let mac = v["mac"].as_str().ok_or("В резервной копии нет контрольной суммы — она создана старой версией программы")?;
-        self.write_file("cache.mac", mac.as_bytes())?;
-        self.write_file("cache.json", &serde_json::to_vec(&v["data"]).unwrap())?;
-        self.save_account(&account)?;
+        let data = serde_json::to_vec(&v["data"]).unwrap();
+        // Проверка «ещё не настроено» и запись — под одним локом, как в create_local
         let mut g = self.inner.lock().await;
+        if g.account.as_ref().is_some_and(|a| !a.protected_key.is_empty()) {
+            return Err("Хранилище уже настроено".into());
+        }
+        if let Some(d) = g.account.as_ref().map(|a| a.device_id.clone()).filter(|d| !d.is_empty()) {
+            account.device_id = d;
+        }
+        let broken = g.account_broken;
+        // Как и в create_local: старые файлы не удаляем, а убираем в копию
+        if broken || ["cache.json", "cache.json.bak", "local.flag"].iter().any(|f| self.dir.join(f).exists()) {
+            self.stash_local()?;
+        }
+        self.write_file("local.flag", b"1")?;
+        self.write_file("cache.mac", mac.as_bytes())?;
+        self.write_file("cache.json", &data)?;
+        self.save_account(&account)?;
         g.account = Some(account);
         g.unlocked = None;
         Ok(())
@@ -609,18 +678,35 @@ impl Vault {
     /// Загрузить кеш с проверкой контрольной суммы. Кеш Bitwarden без суммы или с неверной
     /// суммой отбрасывается (данные заново придут с сервера); локальное хранилище — ошибка.
     fn load_cache(&self, key: &SymKey, local: bool) -> VResult<Option<Value>> {
-        let Ok(t) = std::fs::read(self.dir.join("cache.json")) else { return Ok(None) };
-        let mac = std::fs::read_to_string(self.dir.join("cache.mac")).unwrap_or_default();
-        if !crypto::file_mac_ok(key, &t, &mac) {
-            if local {
+        let pair = |json: &str, mac: &str| -> Option<(Vec<u8>, Value)> {
+            let t = std::fs::read(self.dir.join(json)).ok()?;
+            let m = std::fs::read_to_string(self.dir.join(mac)).unwrap_or_default();
+            if !crypto::file_mac_ok(key, &t, &m) {
+                return None;
+            }
+            let v = serde_json::from_slice(&t).ok()?;
+            Some((t, v))
+        };
+        if let Some((_, v)) = pair("cache.json", "cache.mac") {
+            return Ok(Some(v));
+        }
+        if local {
+            // Сбой между записью cache.json и cache.mac (или порча основного файла):
+            // цельная предыдущая пара лежит в .bak — берём её и возвращаем на место,
+            // чтобы следующая запись не затёрла резерв повреждённым файлом
+            if let Some((t, v)) = pair("cache.json.bak", "cache.mac.bak") {
+                self.write_file("cache.json", &t)?;
+                self.write_file("cache.mac", crypto::file_mac(key, &t).as_bytes())?;
+                return Ok(Some(v));
+            }
+            if self.dir.join("cache.json").exists() || self.dir.join("cache.json.bak").exists() {
                 return Err(format!(
                     "Файл хранилища изменён вне программы или повреждён ({}) — данные не загружены. Восстановите хранилище из резервной копии.",
                     self.dir.join("cache.json").display()
                 ));
             }
-            return Ok(None);
         }
-        Ok(serde_json::from_slice(&t).ok())
+        Ok(None)
     }
 
     pub async fn status(&self) -> Status {
@@ -654,11 +740,30 @@ impl Vault {
             let r = self.http.post(&url).json(&body).send().await.map_err(net_err)?;
             if r.status().is_success() {
                 let v = camelize(r.json::<Value>().await.map_err(net_err)?);
+                // Параметры пришли с сервера: без проверки u64→u32/u8 обрезали бы их
+                // (iterations 2^32+5 → 5, kind 256 → 0), а ноль итераций дал бы нулевой ключ
+                let kind = v["kdf"].as_u64().unwrap_or(0);
+                let iterations = v["kdfIterations"].as_u64().unwrap_or(600000);
+                let memory = v["kdfMemory"].as_u64();
+                let parallelism = v["kdfParallelism"].as_u64();
+                if kind > 1 {
+                    return Err(format!("Неизвестный тип KDF: {}", kind));
+                }
+                if iterations == 0 || iterations > 10_000_000 {
+                    return Err(format!("Недопустимое число итераций KDF: {}", iterations));
+                }
+                if kind == 1 {
+                    let m = memory.unwrap_or(64);
+                    let p = parallelism.unwrap_or(4);
+                    if !(8..=1024).contains(&m) || !(1..=16).contains(&p) {
+                        return Err(format!("Недопустимые параметры Argon2: память {} МиБ, параллелизм {}", m, p));
+                    }
+                }
                 return Ok(Kdf {
-                    kind: v["kdf"].as_u64().unwrap_or(0) as u8,
-                    iterations: v["kdfIterations"].as_u64().unwrap_or(600000) as u32,
-                    memory: v["kdfMemory"].as_u64().map(|x| x as u32),
-                    parallelism: v["kdfParallelism"].as_u64().map(|x| x as u32),
+                    kind: kind as u8,
+                    iterations: u32::try_from(iterations).map_err(|_| "Недопустимое число итераций KDF")?,
+                    memory: memory.map(u32::try_from).transpose().map_err(|_| "Недопустимая память KDF")?,
+                    parallelism: parallelism.map(u32::try_from).transpose().map_err(|_| "Недопустимый параллелизм KDF")?,
                 });
             }
             if r.status().as_u16() != 404 {
@@ -855,6 +960,12 @@ impl Vault {
             last_sync: 0,
             local: false,
         };
+        // Старый кеш принадлежит другой учётной записи. Локальное хранилище не стираем никогда:
+        // сначала копия, и только потом серверный account.json — иначе отказ stash оставил бы
+        // на диске серверный account без ключа локальных данных
+        if self.dir.join("local.flag").exists() {
+            self.stash_local()?;
+        }
         self.save_account(&account)?;
         let expires = tok["expires_in"].as_u64().unwrap_or(3600);
         let unlocked = Unlocked {
@@ -865,11 +976,8 @@ impl Vault {
             refresh_token: refresh,
             master_hash: pending.hash.clone(),
             sync: json!({}),
+            names: None,
         };
-        // Старый кеш принадлежит другой учётной записи. Локальное хранилище не стираем никогда.
-        if self.dir.join("local.flag").exists() {
-            self.stash_local()?;
-        }
         let _ = std::fs::remove_file(self.dir.join("cache.json"));
         let mut g = self.inner.lock().await;
         g.account = Some(account);
@@ -946,11 +1054,21 @@ impl Vault {
             refresh_token: refresh,
             master_hash: hash,
             sync: cache.unwrap_or_else(|| json!({})),
+            names: None,
         };
         if has_cache {
             compute_org_keys(&mut u);
         }
         let mut g = self.inner.lock().await;
+        // Идентичность под финальным локом: параллельный выход или смена пароля не должны
+        // оставить разблокированным хранилище с устаревшим ключом
+        match &g.account {
+            Some(a)
+                if a.device_id == account.device_id
+                    && a.email == account.email
+                    && a.protected_key == account.protected_key => {}
+            _ => return Err("Учётная запись изменилась — повторите вход".into()),
+        }
         g.unlocked = Some(u);
         Ok(has_cache)
     }
@@ -1111,11 +1229,20 @@ impl Vault {
         if !data["ciphers"].is_array() {
             return Err("Сервер вернул неожиданный ответ на синхронизацию".into());
         }
+        // Запись — вне лока inner (сериализация/HMAC/диск в spawn_blocking), порядок — save_guard
+        let _sg = self.save_guard.lock().await;
+        let key = {
+            let g = self.inner.lock().await;
+            g.unlocked.as_ref().map(|u| u.user_key.clone())
+        };
+        if let Some(key) = key {
+            self.persist(data.clone(), key).await?;
+        }
         let mut g = self.inner.lock().await;
         let g = &mut *g;
         if let Some(u) = g.unlocked.as_mut() {
-            self.save_cache(&data, &u.user_key);
             u.sync = data;
+            u.names = None;
             compute_org_keys(u);
         }
         if let Some(a) = g.account.as_mut() {
@@ -1164,24 +1291,31 @@ impl Vault {
     }
 
     /// Найти запись по id или точному имени (для ссылок вида gateway=Имя).
+    /// Индекс имя→id строится один раз и переиспользуется: подключение зовёт resolve_ref
+    /// до четырёх раз (credential/sshkey/gateway/jump), расшифровывать все имена каждый раз дорого.
     pub async fn resolve_ref(&self, r: &str) -> VResult<String> {
-        let g = self.inner.lock().await;
-        let u = g.unlocked.as_ref().ok_or("Хранилище заблокировано")?;
-        let ciphers = u.sync["ciphers"].as_array().cloned().unwrap_or_default();
-        if ciphers.iter().any(|c| c["id"].as_str() == Some(r)) {
+        let mut g = self.inner.lock().await;
+        let u = g.unlocked.as_mut().ok_or("Хранилище заблокировано")?;
+        if u.sync["ciphers"].as_array().is_some_and(|a| a.iter().any(|c| c["id"].as_str() == Some(r))) {
             return Ok(r.to_string());
         }
-        let found: Vec<String> = ciphers
-            .iter()
-            .filter(|c| c["deletedDate"].is_null())
-            .filter_map(|c| {
-                let k = cipher_key(u, c).ok()?;
-                (dec(&k, &c["name"]) == r).then(|| c["id"].as_str().unwrap_or("").to_string())
-            })
-            .collect();
-        match found.len() {
-            0 => Err(format!("Запись «{}» не найдена в хранилище", r)),
-            1 => Ok(found[0].clone()),
+        if u.names.is_none() {
+            let mut idx: HashMap<String, Vec<String>> = HashMap::new();
+            if let Some(arr) = u.sync["ciphers"].as_array() {
+                for c in arr {
+                    if !c["deletedDate"].is_null() {
+                        continue;
+                    }
+                    let Ok(k) = cipher_key(u, c) else { continue };
+                    idx.entry(dec(&k, &c["name"])).or_default().push(c["id"].as_str().unwrap_or("").to_string());
+                }
+            }
+            u.names = Some(idx);
+        }
+        let ids = u.names.as_ref().unwrap().get(r).map(Vec::as_slice).unwrap_or(&[]);
+        match ids {
+            [] => Err(format!("Запись «{}» не найдена в хранилище", r)),
+            [one] => Ok(one.clone()),
             _ => Err(format!("Несколько записей называются «{}», оставьте одну", r)),
         }
     }
@@ -1248,6 +1382,9 @@ impl Vault {
             let g = self.inner.lock().await;
             let u = g.unlocked.as_ref().ok_or("Хранилище заблокировано")?;
             let c = find_cipher(&u.sync, id)?;
+            if c["edit"] == json!(false) {
+                return Err("Нет прав на изменение этой записи".into());
+            }
             (
                 c["folderId"].as_str().map(String::from),
                 c["favorite"].as_bool().unwrap_or(false),
@@ -1281,34 +1418,56 @@ impl Vault {
 
     /// Удалить в корзину.
     pub async fn delete_item(&self, id: &str) -> VResult<()> {
+        {
+            let g = self.inner.lock().await;
+            let u = g.unlocked.as_ref().ok_or("Хранилище заблокировано")?;
+            let c = find_cipher(&u.sync, id)?;
+            // Та же проверка прав, что в save_item: сервер её тоже делает, но клиент
+            // должен давать понятную ошибку до запроса, а не после
+            if c["edit"] == json!(false) {
+                return Err("Нет прав на удаление этой записи".into());
+            }
+        }
         if !self.is_local().await {
             self.api(reqwest::Method::PUT, &format!("/ciphers/{}/delete", id), None)
                 .await?;
         }
-        let mut g = self.inner.lock().await;
-        if let Some(u) = g.unlocked.as_mut() {
-            if let Some(arr) = u.sync["ciphers"].as_array_mut() {
-                arr.retain(|c| c["id"].as_str() != Some(id));
-            }
-            self.save_cache(&u.sync, &u.user_key);
+        let _sg = self.save_guard.lock().await;
+        let snap = {
+            let mut g = self.inner.lock().await;
+            g.unlocked.as_mut().map(|u| {
+                if let Some(arr) = u.sync["ciphers"].as_array_mut() {
+                    arr.retain(|c| c["id"].as_str() != Some(id));
+                }
+                u.names = None;
+                (u.sync.clone(), u.user_key.clone())
+            })
+        };
+        if let Some((sync, key)) = snap {
+            self.persist(sync, key).await?;
         }
         Ok(())
     }
 
     async fn store_cipher(&self, resp: Value) -> VResult<ItemV> {
         let id = s(&resp["id"]).ok_or("Сервер не вернул запись")?.to_string();
-        let mut g = self.inner.lock().await;
-        let u = g.unlocked.as_mut().ok_or("Хранилище заблокировано")?;
-        if !u.sync["ciphers"].is_array() {
-            u.sync["ciphers"] = json!([]);
-        }
-        let arr = u.sync["ciphers"].as_array_mut().unwrap();
-        match arr.iter_mut().find(|c| c["id"].as_str() == Some(&id)) {
-            Some(c) => *c = resp.clone(),
-            None => arr.push(resp.clone()),
-        }
-        self.save_cache(&u.sync, &u.user_key);
-        decrypt_item(u, &resp).ok_or_else(|| "Не удалось расшифровать сохранённую запись".into())
+        let _sg = self.save_guard.lock().await;
+        let (sync, key, out) = {
+            let mut g = self.inner.lock().await;
+            let u = g.unlocked.as_mut().ok_or("Хранилище заблокировано")?;
+            if !u.sync["ciphers"].is_array() {
+                u.sync["ciphers"] = json!([]);
+            }
+            let arr = u.sync["ciphers"].as_array_mut().unwrap();
+            match arr.iter_mut().find(|c| c["id"].as_str() == Some(&id)) {
+                Some(c) => *c = resp.clone(),
+                None => arr.push(resp.clone()),
+            }
+            u.names = None;
+            (u.sync.clone(), u.user_key.clone(), decrypt_item(u, &resp))
+        };
+        self.persist(sync, key).await?;
+        out.ok_or_else(|| "Не удалось расшифровать сохранённую запись".into())
     }
 
     pub async fn save_folder(&self, id: Option<String>, name: &str) -> VResult<FolderV> {
@@ -1338,17 +1497,21 @@ impl Vault {
             }
         };
         let fid = s(&resp["id"]).ok_or("Сервер не вернул папку")?.to_string();
-        let mut g = self.inner.lock().await;
-        let u = g.unlocked.as_mut().ok_or("Хранилище заблокировано")?;
-        if !u.sync["folders"].is_array() {
-            u.sync["folders"] = json!([]);
-        }
-        let arr = u.sync["folders"].as_array_mut().unwrap();
-        match arr.iter_mut().find(|f| f["id"].as_str() == Some(&fid)) {
-            Some(f) => *f = resp,
-            None => arr.push(resp),
-        }
-        self.save_cache(&u.sync, &u.user_key);
+        let _sg = self.save_guard.lock().await;
+        let (sync, key) = {
+            let mut g = self.inner.lock().await;
+            let u = g.unlocked.as_mut().ok_or("Хранилище заблокировано")?;
+            if !u.sync["folders"].is_array() {
+                u.sync["folders"] = json!([]);
+            }
+            let arr = u.sync["folders"].as_array_mut().unwrap();
+            match arr.iter_mut().find(|f| f["id"].as_str() == Some(&fid)) {
+                Some(f) => *f = resp,
+                None => arr.push(resp),
+            }
+            (u.sync.clone(), u.user_key.clone())
+        };
+        self.persist(sync, key).await?;
         Ok(FolderV { id: fid, name: name.to_string() })
     }
 
@@ -1357,20 +1520,26 @@ impl Vault {
             self.api(reqwest::Method::DELETE, &format!("/folders/{}", id), None)
                 .await?;
         }
-        let mut g = self.inner.lock().await;
-        if let Some(u) = g.unlocked.as_mut() {
-            if let Some(arr) = u.sync["folders"].as_array_mut() {
-                arr.retain(|f| f["id"].as_str() != Some(id));
-            }
-            // Записи из удалённой папки сервер переносит в корень
-            if let Some(arr) = u.sync["ciphers"].as_array_mut() {
-                for c in arr.iter_mut() {
-                    if c["folderId"].as_str() == Some(id) {
-                        c["folderId"] = Value::Null;
+        let _sg = self.save_guard.lock().await;
+        let snap = {
+            let mut g = self.inner.lock().await;
+            g.unlocked.as_mut().map(|u| {
+                if let Some(arr) = u.sync["folders"].as_array_mut() {
+                    arr.retain(|f| f["id"].as_str() != Some(id));
+                }
+                // Записи из удалённой папки сервер переносит в корень
+                if let Some(arr) = u.sync["ciphers"].as_array_mut() {
+                    for c in arr.iter_mut() {
+                        if c["folderId"].as_str() == Some(id) {
+                            c["folderId"] = Value::Null;
+                        }
                     }
                 }
-            }
-            self.save_cache(&u.sync, &u.user_key);
+                (u.sync.clone(), u.user_key.clone())
+            })
+        };
+        if let Some((sync, key)) = snap {
+            self.persist(sync, key).await?;
         }
         Ok(())
     }
@@ -1385,8 +1554,11 @@ fn compute_org_keys(u: &mut Unlocked) {
     if let Some(orgs) = u.sync["profile"]["organizations"].as_array() {
         for o in orgs {
             if let (Some(id), Some(k)) = (s(&o["id"]), s(&o["key"])) {
-                if let Ok(bytes) = crypto::rsa_decrypt(&rsa, k) {
-                    if let Ok(key) = SymKey::from_bytes(&bytes) {
+                if let Ok(mut bytes) = crypto::rsa_decrypt(&rsa, k) {
+                    let key = SymKey::from_bytes(&bytes);
+                    // Открытый ключ организации — секретный материал, стираем после копирования
+                    bytes.zeroize();
+                    if let Ok(key) = key {
                         u.org_keys.insert(id.to_string(), key);
                     }
                 }
@@ -1412,7 +1584,12 @@ fn cipher_key(u: &Unlocked, raw: &Value) -> VResult<SymKey> {
         None => &u.user_key,
     };
     match s(&raw["key"]) {
-        Some(k) => SymKey::from_bytes(&base.decrypt(k)?),
+        Some(k) => {
+            let mut b = base.decrypt(k)?;
+            let out = SymKey::from_bytes(&b);
+            b.zeroize();
+            out
+        }
         None => Ok(base.clone()),
     }
 }
@@ -1666,6 +1843,7 @@ mod tests {
             refresh_token: None,
             master_hash: String::new(),
             sync,
+            names: None,
         }
     }
 
@@ -1749,6 +1927,74 @@ mod tests {
             "new"
         );
     }
+
+    /// v32: порт и регистр не мешают узнать официальный сервер; self-hosted порт сохраняется
+    #[test]
+    fn endpoints_strip_port_and_normalize() {
+        assert_eq!(endpoints("https://vault.bitwarden.com").api, "https://api.bitwarden.com");
+        assert_eq!(endpoints("https://vault.bitwarden.com:443").api, "https://api.bitwarden.com");
+        assert_eq!(endpoints("https://vault.bitwarden.com:443").identity, "https://identity.bitwarden.com");
+        assert_eq!(endpoints("https://bitwarden.eu:443/").identity, "https://identity.bitwarden.eu");
+        assert_eq!(endpoints("https://Vault.Bitwarden.com.").api, "https://api.bitwarden.com");
+        assert_eq!(endpoints("https://bw.example.com:8443").api, "https://bw.example.com:8443/api");
+        assert_eq!(endpoints("https://bw.example.com:8443").identity, "https://bw.example.com:8443/identity");
+        assert_eq!(endpoints("https://[::1]:8443").api, "https://[::1]:8443/api");
+    }
+
+    fn ro_input(name: &str) -> ItemInput {
+        ItemInput {
+            id: None,
+            kind: Some(1),
+            org_id: None,
+            collection_ids: vec![],
+            folder_id: None,
+            name: name.into(),
+            notes: String::new(),
+            username: String::new(),
+            password: None,
+            uris: vec![],
+            fields: vec![],
+            favorite: false,
+        }
+    }
+
+    /// v76: move_item/delete_item проверяют edit так же, как save_item (до запроса к серверу)
+    #[tokio::test]
+    async fn move_and_delete_respect_edit_flag() {
+        let dir = std::env::temp_dir().join(format!("rdpmgr-edit-{}", uuid::Uuid::new_v4()));
+        let v = Vault::new(dir.clone());
+        let mut u = unlocked_with(json!({}));
+        let mut body = build_cipher(&u.user_key, None, &ro_input("чужая"));
+        body["id"] = json!("ro1");
+        body["edit"] = json!(false);
+        u.sync = json!({ "ciphers": [body] });
+        v.inner.lock().await.unlocked = Some(u);
+        assert!(v.move_item("ro1", None, Some(true)).await.err().unwrap().contains("Нет прав"));
+        assert!(v.delete_item("ro1").await.err().unwrap().contains("Нет прав"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// v62: индекс имя→id, неоднозначность и поиск по id
+    #[tokio::test]
+    async fn resolve_ref_index_and_ambiguity() {
+        let dir = std::env::temp_dir().join(format!("rdpmgr-resolve-{}", uuid::Uuid::new_v4()));
+        let v = Vault::new(dir.clone());
+        let mut u = unlocked_with(json!({}));
+        let mut a = build_cipher(&u.user_key, None, &ro_input("Шлюз"));
+        a["id"] = json!("a");
+        let mut b = build_cipher(&u.user_key, None, &ro_input("Шлюз"));
+        b["id"] = json!("b");
+        let mut c = build_cipher(&u.user_key, None, &ro_input("Уникальный"));
+        c["id"] = json!("c");
+        u.sync = json!({ "ciphers": [a, b, c] });
+        v.inner.lock().await.unlocked = Some(u);
+        assert_eq!(v.resolve_ref("Уникальный").await.unwrap(), "c");
+        assert_eq!(v.resolve_ref("a").await.unwrap(), "a");
+        assert!(v.resolve_ref("Шлюз").await.unwrap_err().contains("Несколько"));
+        assert!(v.resolve_ref("Нет такого").await.is_err());
+        assert_eq!(v.resolve_ref("Уникальный").await.unwrap(), "c");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 #[cfg(test)]
@@ -1821,13 +2067,109 @@ mod local_tests {
         v.delete_folder(&f.id).await.unwrap();
         assert!(v.view().await.unwrap().items.is_empty());
 
-        // Подмена файла хранилища вне программы обнаруживается
+        // Подмена файла хранилища вне программы: цельная пара .bak спасает, подмена обеих — ошибка
         v.save_folder(None, "ещё").await.unwrap();
         v.lock().await;
+        let tamper = |name: &str| {
+            let mut t = std::fs::read_to_string(dir.join(name)).unwrap();
+            t = t.replacen("\"folders\"", "\"folders\" ", 1);
+            std::fs::write(dir.join(name), t).unwrap();
+        };
+        tamper("cache.json");
+        // Повреждён только основной файл — разблокировка берёт цельную пару из .bak
+        assert!(v.unlock("new strong password").await.unwrap());
+        v.lock().await;
+        tamper("cache.json");
+        tamper("cache.json.bak");
+        assert!(v.unlock("new strong password").await.unwrap_err().contains("изменён"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Отказ записи единственной копии local-хранилища — ошибка операции, а не «сохранено».
+    #[tokio::test]
+    async fn save_failure_is_not_swallowed() {
+        let dir = std::env::temp_dir().join(format!("rdpmgr-savefail-{}", uuid::Uuid::new_v4()));
+        let v = Vault::new(dir.clone());
+        v.create_local("correct horse battery").await.unwrap();
+        // cache.json занят (каталог вместо файла) — запись не проходит
+        std::fs::remove_file(dir.join("cache.json")).unwrap();
+        std::fs::create_dir(dir.join("cache.json")).unwrap();
+        assert!(v.save_item(input("Сервер", "P@ss-Секрет-42", None)).await.is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Сбой между записью cache.json и cache.mac: разблокировка восстанавливает пару из .bak.
+    #[tokio::test]
+    async fn broken_pair_restored_from_bak() {
+        let dir = std::env::temp_dir().join(format!("rdpmgr-bak-{}", uuid::Uuid::new_v4()));
+        let v = Vault::new(dir.clone());
+        v.create_local("correct horse battery").await.unwrap();
+        v.save_folder(None, "Первая").await.unwrap();
+        v.save_folder(None, "Вторая").await.unwrap();
+        v.lock().await;
+        // Новый cache.json со старой суммой (или порча файла) — основная пара невалидна
         let mut t = std::fs::read_to_string(dir.join("cache.json")).unwrap();
         t = t.replacen("\"folders\"", "\"folders\" ", 1);
         std::fs::write(dir.join("cache.json"), t).unwrap();
-        assert!(v.unlock("new strong password").await.unwrap_err().contains("изменён"));
+        assert!(v.unlock("correct horse battery").await.unwrap());
+        let names: Vec<String> = v.view().await.unwrap().folders.iter().map(|f| f.name.clone()).collect();
+        assert_eq!(names, vec!["Первая"], "данные должны восстановиться из .bak");
+        // Основная пара снова цельная — повторная разблокировка проходит и без .bak
+        v.lock().await;
+        std::fs::remove_file(dir.join("cache.json.bak")).unwrap();
+        std::fs::remove_file(dir.join("cache.mac.bak")).unwrap();
+        assert!(v.unlock("correct horse battery").await.unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Битый account.json при целом cache.json: «новое» хранилище не удаляет старые данные.
+    #[tokio::test]
+    async fn create_local_stashes_broken_account() {
+        let dir = std::env::temp_dir().join(format!("rdpmgr-stash-{}", uuid::Uuid::new_v4()));
+        let v = Vault::new(dir.clone());
+        v.create_local("correct horse battery").await.unwrap();
+        v.save_item(input("Сервер-тайный", "P@ss-Секрет-42", None)).await.unwrap();
+        v.lock().await;
+        std::fs::write(dir.join("account.json"), "{повреждён").unwrap();
+        let v2 = Vault::new(dir.clone());
+        assert_eq!(v2.status().await.state, "setup");
+        v2.create_local("another strong password").await.unwrap();
+        let stash = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| p.file_name().unwrap().to_string_lossy().starts_with("local-backup-"))
+            .expect("старые данные должны уйти в папку копии");
+        assert!(stash.join("cache.json").exists(), "cache.json удалён вместо копии");
+        assert!(stash.join("account.json").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// v23: отказ записи account.json не меняет пароль в памяти — старый продолжает работать
+    #[tokio::test]
+    async fn password_change_failure_keeps_old_password() {
+        let dir = std::env::temp_dir().join(format!("rdpmgr-pwfail-{}", uuid::Uuid::new_v4()));
+        let v = Vault::new(dir.clone());
+        v.create_local("correct horse battery").await.unwrap();
+        // account.json занят каталогом — запись нового пароля не пройдёт
+        std::fs::remove_file(dir.join("account.json")).unwrap();
+        std::fs::create_dir(dir.join("account.json")).unwrap();
+        assert!(v.change_local_password("correct horse battery", "new strong password").await.is_err());
+        v.lock().await;
+        assert!(v.unlock("correct horse battery").await.unwrap(), "в памяти должен остаться прежний пароль");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// v62: индекс resolve_ref сбрасывается после изменения записей
+    #[tokio::test]
+    async fn resolve_ref_index_invalidated_on_change() {
+        let dir = std::env::temp_dir().join(format!("rdpmgr-idx-{}", uuid::Uuid::new_v4()));
+        let v = Vault::new(dir.clone());
+        v.create_local("correct horse battery").await.unwrap();
+        let a = v.save_item(input("Дубль", "p1", None)).await.unwrap();
+        let b = v.save_item(input("Дубль", "p2", None)).await.unwrap();
+        assert!(v.resolve_ref("Дубль").await.unwrap_err().contains("Несколько"));
+        v.delete_item(&a.id).await.unwrap();
+        assert_eq!(v.resolve_ref("Дубль").await.unwrap(), b.id);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

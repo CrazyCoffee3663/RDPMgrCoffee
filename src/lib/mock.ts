@@ -65,8 +65,10 @@ const H: Record<string, Handler> = {
     local
       ? { state, server: "", email: "", local: true }
       : { state, server: "https://vault.example.com", email: "admin@example.com", local: false },
+  legacy_hint: () => null,
   terminals_default_dir: () => null,
-  freerdp_status: () => ({ installed: "3.32.0", latest: "3.33.0", url: "https://github.com/FreeRDP/FreeRDP/releases" }),
+  freerdp_status: () => ({ installed: "3.33.1", latest: "3.33.1", url: "https://github.com/FreeRDP/FreeRDP/releases" }),
+  freerdp_update: () => ({ version: "3.33.1", already: true }),
   web_open: () => {},
   web_place: () => {},
   web_close: () => {},
@@ -105,10 +107,15 @@ const H: Record<string, Handler> = {
   vault_view: () => ({ folders, collections: [], orgs: [], items }),
   item_secret: () => ({ password: "S3cr3t-P@ss", totp: "", fields: [], sshPrivateKey: "" }),
   item_save: ({ item }) => {
+    const prev = items.find((x) => x.id === item.id);
     const saved = {
       ...item, id: item.id ?? uid(), kind: item.kind ?? 1, collectionIds: item.collectionIds ?? [],
-      orgId: item.orgId ?? null, hasPassword: !!item.password, hasTotp: false, edit: true, revision: "",
+      orgId: item.orgId ?? null,
+      // null — пароль не менялся: флаг остаётся прежним; сам пароль в интерфейс не возвращаем
+      hasPassword: item.password != null ? !!item.password : (prev?.hasPassword ?? false),
+      hasTotp: false, edit: true, revision: "",
     };
+    delete (saved as { password?: string }).password;
     const i = items.findIndex((x) => x.id === saved.id);
     if (i >= 0) items[i] = saved;
     else items.push(saved);
@@ -166,7 +173,7 @@ const H: Record<string, Handler> = {
     ],
   }),
   sftp_download: ({ path }) => "C:\Users\demo\Downloads\\" + String(path).split("/").pop(),
-  sftp_upload: () => {},
+  sftp_upload_chunk: () => {},
   sftp_op: () => {},
   winbox_status: () => ({ installed: "4.4", latest: "4.5", path: "C:\tools\winbox" }),
   winbox_install: () => {},

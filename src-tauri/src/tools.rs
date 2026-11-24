@@ -293,6 +293,54 @@ fn decode_oem(b: &[u8]) -> String {
     String::from_utf8_lossy(b).into_owned()
 }
 
+/// Job Object: закрытие дескриптора завершает все процессы задания (всё дерево).
+/// kill_on_drop/kill убивает только прямого потомка — cmd /k ping -t оставлял ping сиротой.
+#[cfg(windows)]
+struct Job(windows::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+impl Job {
+    fn assign(child: &tokio::process::Child) -> Result<Job, String> {
+        use windows::Win32::Foundation::{CloseHandle, HANDLE};
+        use windows::Win32::System::JobObjects::*;
+        unsafe {
+            let h = CreateJobObjectW(None, None).map_err(|e| e.to_string())?;
+            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            let r = SetInformationJobObject(
+                h,
+                JobObjectExtendedLimitInformation,
+                &info as *const _ as *const _,
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            );
+            if let Err(e) = r {
+                let _ = CloseHandle(h);
+                return Err(e.to_string());
+            }
+            let proc = child.raw_handle().ok_or("Нет дескриптора процесса")?;
+            if let Err(e) = AssignProcessToJobObject(h, HANDLE(proc)) {
+                let _ = CloseHandle(h);
+                return Err(e.to_string());
+            }
+            Ok(Job(h))
+        }
+    }
+}
+
+// Дескриптор задания — общепроцессный; CloseHandle потокобезопасен, задание живёт
+// в одном экземпляре exec и закрывается при его завершении на любом потоке
+#[cfg(windows)]
+unsafe impl Send for Job {}
+
+#[cfg(windows)]
+impl Drop for Job {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = windows::Win32::Foundation::CloseHandle(self.0);
+        }
+    }
+}
+
 /// Выполнить программу без окна консоли, отдавая вывод в `out`. Остановка — через `stop`
 /// (сигнал или закрытие отправителя). Возвращает код выхода (None — остановлено).
 pub async fn exec<F: Fn(String)>(
@@ -308,6 +356,15 @@ pub async fn exec<F: Fn(String)>(
     #[cfg(windows)]
     cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
     let mut child = cmd.spawn().map_err(|e| format!("Не удалось запустить {}: {}", exe.display(), e))?;
+    // Отказ изоляции — отказ запуска: иначе «Стоп» оставлял бы дочерние процессы
+    #[cfg(windows)]
+    let _job = match Job::assign(&child) {
+        Ok(j) => j,
+        Err(e) => {
+            let _ = child.kill().await;
+            return Err(format!("Не удалось изолировать процесс инструмента: {}", e));
+        }
+    };
     let mut so = child.stdout.take().ok_or("нет stdout")?;
     let mut se = child.stderr.take().ok_or("нет stderr")?;
     let (mut d1, mut d2) = (OemDecoder::default(), OemDecoder::default());
@@ -430,28 +487,225 @@ pub struct FreerdpStatus {
     pub url: String,
 }
 
+/// Репозиторий с готовыми сборками FreeRDP: кнопка обновления качает его релизы.
+/// Всё через github.com: api.github.com блокируют hosts-файлы некоторых антивирусов.
+const FREERDP_REPO: &str = "CrazyCoffee3663/RDPMgrCoffee";
+
+/// Тег последнего релиза: github.com/releases/latest перенаправляет на /releases/tag/<tag>.
+pub fn tag_from_release_url(url: &str) -> Option<String> {
+    let path = url.split('?').next()?;
+    let tag = path.rsplit("/tag/").next()?.trim_end_matches('/');
+    if tag.is_empty() || tag.contains('/') || tag.len() > 32 {
+        return None;
+    }
+    Some(tag.to_string())
+}
+
+pub async fn latest_release(http: &reqwest::Client, repo: &str) -> Option<(String, String)> {
+    let r = http.get(format!("https://github.com/{repo}/releases/latest")).send().await.ok()?;
+    if !r.status().is_success() {
+        return None;
+    }
+    let tag = tag_from_release_url(r.url().as_str())?;
+    Some((tag.clone(), format!("https://github.com/{repo}/releases/tag/{tag}")))
+}
+
+/// Ссылки на файлы релиза со страницы expanded_assets — без GitHub API.
+pub fn parse_asset_urls(html: &str, repo: &str, tag: &str) -> Vec<String> {
+    let needle = format!("/{repo}/releases/download/{tag}/");
+    let mut out: Vec<String> = Vec::new();
+    let mut rest = html;
+    while let Some(i) = rest.find(&needle) {
+        rest = &rest[i + needle.len()..];
+        let end = rest.find('"').unwrap_or(rest.len());
+        let name = &rest[..end];
+        if name.is_empty() || name.contains('/') || name.contains("..") {
+            continue;
+        }
+        let url = format!("https://github.com/{repo}/releases/download/{tag}/{name}");
+        if !out.contains(&url) {
+            out.push(url);
+        }
+    }
+    out
+}
+
 pub async fn freerdp_status(http: &reqwest::Client, freerdp_dir: Option<&Path>) -> FreerdpStatus {
     let installed = freerdp_dir
         .and_then(|d| std::fs::read_to_string(d.join("version.txt")).ok())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
     let mut url = "https://github.com/FreeRDP/FreeRDP/releases".to_string();
-    let latest = match http
-        .get("https://api.github.com/repos/FreeRDP/FreeRDP/releases/latest")
-        .header("Accept", "application/vnd.github+json")
-        .send()
-        .await
-    {
-        Ok(r) if r.status().is_success() => r.json::<serde_json::Value>().await.ok().and_then(|v| {
-            if let Some(u) = v["html_url"].as_str().filter(|u| u.starts_with("https://github.com/FreeRDP/FreeRDP/")) {
-                url = u.to_string();
-            }
-            v["tag_name"].as_str().map(|t| t.trim_start_matches('v').to_string())
-        }),
-        _ => None,
+    let latest = match latest_release(http, "FreeRDP/FreeRDP").await {
+        Some((tag, u)) => {
+            url = u;
+            Some(tag)
+        }
+        None => None,
     }
     .filter(|s| !s.is_empty() && s.len() < 16 && s.chars().all(|c| c.is_ascii_digit() || c == '.'));
     FreerdpStatus { installed, latest, url }
+}
+
+#[derive(Serialize)]
+pub struct FreerdpUpdateResult {
+    pub version: String,
+    pub already: bool,
+}
+
+static UPDATING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Заменить каталог подготовленным .new, прежний сохранить в .old; при сбое — откат.
+pub fn swap_dirs(dir: &Path) -> Result<(), String> {
+    let new = dir.with_file_name("freerdp.new");
+    let old = dir.with_file_name("freerdp.old");
+    if !new.is_dir() {
+        return Err("Нет подготовленного каталога обновления".into());
+    }
+    let _ = std::fs::remove_dir_all(&old);
+    std::fs::rename(dir, &old).map_err(|e| format!("Не удалось сдвинуть текущий FreeRDP (открыты вкладки RDP?): {}", e))?;
+    if let Err(e) = std::fs::rename(&new, dir) {
+        let _ = std::fs::rename(&old, dir);
+        return Err(format!("Не удалось установить обновление: {}", e));
+    }
+    Ok(())
+}
+
+/// Новая сборка обязана запускаться: набор с недостающей DLL не должен попасть к пользователю.
+pub async fn verify_freerdp_exe(exe: &Path) -> Result<(), String> {
+    let mut cmd = tokio::process::Command::new(exe);
+    cmd.arg("/version").creation_flags(0x08000000).kill_on_drop(true);
+    let out = tokio::time::timeout(std::time::Duration::from_secs(20), cmd.output())
+        .await
+        .map_err(|_| "Новый FreeRDP не ответил за 20 секунд".to_string())?
+        .map_err(|e| format!("Не удалось запустить новый FreeRDP: {}", e))?;
+    let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    if !out.status.success() || !text.contains("This is FreeRDP version") {
+        return Err(format!("Новый FreeRDP не запускается (не хватает DLL?): {}", text.lines().last().unwrap_or("")));
+    }
+    Ok(())
+}
+
+/// Обновление FreeRDP одной кнопкой: релиз со сборкой из FREERDP_REPO, SHA-256,
+/// проверка запуском и замена каталога с откатом. report — этап и процент для интерфейса.
+pub async fn freerdp_update(
+    report: &(dyn Fn(&str, u8) + Sync),
+    http: &reqwest::Client,
+    dir: &Path,
+) -> Result<FreerdpUpdateResult, String> {
+    use std::sync::atomic::Ordering;
+    if UPDATING.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+        return Err("Обновление уже выполняется".into());
+    }
+    let res = freerdp_update_inner(report, http, dir).await;
+    UPDATING.store(false, Ordering::SeqCst);
+    res
+}
+
+async fn freerdp_update_inner(
+    report: &(dyn Fn(&str, u8) + Sync),
+    http: &reqwest::Client,
+    dir: &Path,
+) -> Result<FreerdpUpdateResult, String> {
+    use sha2::Digest;
+    let (tag, _url) = latest_release(http, FREERDP_REPO).await.ok_or("Не удалось получить последний релиз с GitHub")?;
+    let version = tag.strip_prefix("freerdp-").unwrap_or(&tag).to_string();
+    if version.is_empty() || version.len() > 16 || !version.chars().all(|c| c.is_ascii_digit() || c == '.') {
+        return Err(format!("Неожиданный тег релиза: {}", tag));
+    }
+    let installed = std::fs::read_to_string(dir.join("version.txt")).ok().map(|s| s.trim().to_string());
+    if installed.as_deref() == Some(version.as_str()) {
+        return Ok(FreerdpUpdateResult { version, already: true });
+    }
+    report("list", 0);
+    let html = http
+        .get(format!("https://github.com/{FREERDP_REPO}/releases/expanded_assets/{tag}"))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .text()
+        .await
+        .map_err(|e| e.to_string())?;
+    let urls = parse_asset_urls(&html, FREERDP_REPO, &tag);
+    let zip_url = urls.iter().find(|u| u.ends_with("-win-x64.zip")).ok_or("В релизе нет архива freerdp-…-win-x64.zip")?;
+    let sha_url = urls.iter().find(|u| u.ends_with(".sha256")).cloned().unwrap_or_else(|| format!("{zip_url}.sha256"));
+    let expected = http
+        .get(&sha_url)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .text()
+        .await
+        .map_err(|e| e.to_string())?
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if expected.len() != 64 || !expected.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err("В релизе нет корректной SHA-256 архива".into());
+    }
+    report("download", 0);
+    let mut resp = http.get(zip_url).send().await.map_err(|e| format!("Не удалось скачать архив: {}", e))?;
+    if !resp.status().is_success() {
+        return Err(format!("GitHub вернул {}", resp.status()));
+    }
+    let total = resp.content_length().unwrap_or(0);
+    let zip_path = std::env::temp_dir().join("connmgr-freerdp-update.zip");
+    let mut file = std::fs::File::create(&zip_path).map_err(|e| e.to_string())?;
+    let mut done: u64 = 0;
+    let mut hasher = sha2::Sha256::new();
+    while let Some(chunk) = resp.chunk().await.map_err(|e| e.to_string())? {
+        hasher.update(&chunk);
+        std::io::Write::write_all(&mut file, &chunk).map_err(|e| e.to_string())?;
+        done += chunk.len() as u64;
+        if total > 0 {
+            report("download", (done * 100 / total).min(100) as u8);
+        }
+    }
+    drop(file);
+    if format!("{:x}", hasher.finalize()) != expected {
+        let _ = std::fs::remove_file(&zip_path);
+        return Err("SHA-256 архива не совпала с релизом — обновление отменено".into());
+    }
+    report("install", 100);
+    let new = dir.with_file_name("freerdp.new");
+    let _ = std::fs::remove_dir_all(&new);
+    std::fs::create_dir_all(&new).map_err(|e| e.to_string())?;
+    {
+        let mut zip = zip::ZipArchive::new(std::fs::File::open(&zip_path).map_err(|e| e.to_string())?)
+            .map_err(|e| format!("Архив повреждён: {}", e))?;
+        for i in 0..zip.len() {
+            let mut f = zip.by_index(i).map_err(|e| e.to_string())?;
+            // enclosed_name защищает от путей вида ../../
+            let Some(rel) = f.enclosed_name() else { continue };
+            let out = new.join(rel);
+            if f.is_dir() {
+                std::fs::create_dir_all(&out).map_err(|e| e.to_string())?;
+                continue;
+            }
+            if let Some(p) = out.parent() {
+                std::fs::create_dir_all(p).map_err(|e| e.to_string())?;
+            }
+            let mut w = std::fs::File::create(&out).map_err(|e| e.to_string())?;
+            std::io::copy(&mut f, &mut w).map_err(|e| e.to_string())?;
+        }
+    }
+    let _ = std::fs::remove_file(&zip_path);
+    let exe = new.join("wfreerdp.exe");
+    if !exe.is_file() {
+        let _ = std::fs::remove_dir_all(&new);
+        return Err("В архиве нет wfreerdp.exe".into());
+    }
+    if !new.join("version.txt").is_file() {
+        std::fs::write(new.join("version.txt"), &version).map_err(|e| e.to_string())?;
+    }
+    if let Err(e) = verify_freerdp_exe(&exe).await {
+        let _ = std::fs::remove_dir_all(&new);
+        return Err(e);
+    }
+    swap_dirs(dir)?;
+    report("done", 100);
+    Ok(FreerdpUpdateResult { version, already: false })
 }
 
 #[derive(Serialize)]
@@ -562,13 +816,68 @@ mod tests {
             r#""cmd" /k ping "a b" "x\"y" "c:\d e\\""#
         );
     }
+
+    #[test]
+    fn release_tag_from_redirect_url() {
+        assert_eq!(
+            tag_from_release_url("https://github.com/o/r/releases/tag/freerdp-3.33.1"),
+            Some("freerdp-3.33.1".into())
+        );
+        assert_eq!(tag_from_release_url("https://github.com/o/r/releases/tag/3.33.1/"), Some("3.33.1".into()));
+        assert_eq!(tag_from_release_url("https://github.com/o/r/releases"), None);
+        assert_eq!(tag_from_release_url("https://github.com/o/r/releases/tag/"), None);
+        assert_eq!(tag_from_release_url("https://github.com/o/r/releases/tag/a/b"), None);
+    }
+
+    #[test]
+    fn asset_urls_from_expanded_assets_html() {
+        let html = r#"<a href="/o/r/releases/download/freerdp-3.33.1/freerdp-3.33.1-win-x64.zip">zip</a>
+            <a href="/o/r/releases/download/freerdp-3.33.1/freerdp-3.33.1-win-x64.zip.sha256">sha</a>
+            <a href="/o/r/releases/download/freerdp-3.33.1/freerdp-3.33.1-win-x64.zip">dup</a>
+            <a href="/o/r/releases/download/freerdp-3.33.1/../../evil">bad</a>
+            <a href="/other/r/releases/download/freerdp-3.33.1/x.zip">other</a>"#;
+        let urls = parse_asset_urls(html, "o/r", "freerdp-3.33.1");
+        assert_eq!(
+            urls,
+            vec![
+                "https://github.com/o/r/releases/download/freerdp-3.33.1/freerdp-3.33.1-win-x64.zip".to_string(),
+                "https://github.com/o/r/releases/download/freerdp-3.33.1/freerdp-3.33.1-win-x64.zip.sha256".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn swap_dirs_roundtrip_and_rollback() {
+        let base = std::env::temp_dir().join(format!("connmgr-swap-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let dir = base.join("freerdp");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("version.txt"), "1").unwrap();
+        // без .new — отказ, текущий каталог не тронут
+        assert!(swap_dirs(&dir).is_err());
+        assert_eq!(std::fs::read_to_string(dir.join("version.txt")).unwrap(), "1");
+        let new = base.join("freerdp.new");
+        std::fs::create_dir_all(&new).unwrap();
+        std::fs::write(new.join("version.txt"), "2").unwrap();
+        swap_dirs(&dir).unwrap();
+        assert_eq!(std::fs::read_to_string(dir.join("version.txt")).unwrap(), "2");
+        assert_eq!(std::fs::read_to_string(base.join("freerdp.old").join("version.txt")).unwrap(), "1");
+        assert!(!new.exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }
+
+/// Оба ping-теста считают процессы ping.exe в системе — без сериализации чужой ping
+/// попадает в базовый счётчик и ломает сравнение
+#[cfg(all(test, windows))]
+static PING_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(all(test, windows))]
 mod exec_tests {
     use super::*;
     #[tokio::test]
     async fn ping_output_decoded() {
+        let _g = PING_LOCK.lock().unwrap();
         let buf = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
         let b = buf.clone();
         let (_tx, rx) = tokio::sync::oneshot::channel();
@@ -611,5 +920,74 @@ mod trust_tests {
         let s = authenticode_signer(&f).unwrap();
         eprintln!("signer: {}", s);
         verify_winbox(&f).unwrap();
+    }
+}
+
+/// v55/v79е: остановка инструмента убивает всё дерево процессов, а не только cmd
+#[cfg(all(test, windows))]
+mod exec_tree_tests {
+    use super::*;
+
+    fn ping_count() -> u32 {
+        use windows::Win32::System::Diagnostics::ToolHelp::*;
+        let mut n = 0;
+        unsafe {
+            let Ok(snap) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else { return 0 };
+            let mut e: PROCESSENTRY32W = std::mem::zeroed();
+            e.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+            if Process32FirstW(snap, &mut e).is_ok() {
+                loop {
+                    let name = String::from_utf16_lossy(&e.szExeFile);
+                    if name.trim_end_matches('\0').eq_ignore_ascii_case("ping.exe") {
+                        n += 1;
+                    }
+                    if Process32NextW(snap, &mut e).is_err() {
+                        break;
+                    }
+                }
+            }
+            let _ = windows::Win32::Foundation::CloseHandle(snap);
+        }
+        n
+    }
+
+    #[tokio::test]
+    async fn stop_kills_process_tree() {
+        let _g = super::PING_LOCK.lock().unwrap();
+        let before = ping_count();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let exe = find_exe("cmd").unwrap();
+        // Аргументы раздельно: cmd /k "ping -t …" в кавычках не запускает ping
+        let args = vec!["/k".to_string(), "ping".to_string(), "-t".to_string(), "127.0.0.1".to_string()];
+        let h = tokio::spawn(async move { exec(&exe, &args, |_| {}, rx).await });
+        let mut spawned = false;
+        for _ in 0..60 {
+            if h.is_finished() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            if ping_count() > before {
+                spawned = true;
+                break;
+            }
+        }
+        if !spawned {
+            // Не ждём вечно живой exec: останавливаем и показываем его результат
+            let _ = tx.send(());
+            let r = tokio::time::timeout(std::time::Duration::from_secs(5), h).await;
+            panic!("дочерний ping не появился (before={}): exec={:?}", before, r.map(|x| x.unwrap()));
+        }
+        let _ = tx.send(());
+        let stopped = tokio::time::timeout(std::time::Duration::from_secs(10), h).await.expect("exec не завершился после остановки").unwrap();
+        assert_eq!(stopped.unwrap(), None);
+        let mut gone = false;
+        for _ in 0..60 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            if ping_count() <= before {
+                gone = true;
+                break;
+            }
+        }
+        assert!(gone, "дочерний ping пережил остановку — дерево не убито");
     }
 }

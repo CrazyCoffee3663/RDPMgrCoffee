@@ -14,27 +14,72 @@
   const cmd = q.get("cmd") ?? "";
   const args = q.get("args") ?? "";
 
-  let out = $state("");
+  // Вывод — массив кусков: out += s перерисовывал весь текст на каждый чанк (O(length)).
+  // Куски добавляются в DOM по отдельности, склейка — батчами ~100 мс / 64 КБ.
+  let pieces = $state<string[]>([]);
+  let total = 0;
+  let pending: string[] = [];
+  let pendingLen = 0;
+  let flushTimer = 0;
   let running = $state(false);
   let status = $state("");
   let outEl = $state<HTMLPreElement>();
   let follow = true;
   const MAX = 400_000;
 
-  async function append(s: string) {
-    out += s.replace(/\r\n/g, "\n").replace(/\r/g, "");
-    if (out.length > MAX) out = out.slice(out.length - MAX * 0.8);
-    if (follow) {
-      await tick();
-      outEl?.scrollTo({ top: outEl.scrollHeight });
+  function flush() {
+    flushTimer = 0;
+    if (!pending.length) return;
+    const s = pending.join("").replace(/\r\n/g, "\n").replace(/\r/g, "");
+    pending = [];
+    pendingLen = 0;
+    if (!s) return;
+    pieces.push(s);
+    total += s.length;
+    if (total > MAX) {
+      let excess = total - Math.floor(MAX * 0.8);
+      while (excess > 0 && pieces.length) {
+        const p = pieces[0];
+        if (p.length <= excess) {
+          excess -= p.length;
+          pieces.shift();
+        } else {
+          pieces[0] = p.slice(excess);
+          excess = 0;
+        }
+      }
+      total = pieces.reduce((n, p) => n + p.length, 0);
     }
+    if (follow) {
+      void tick().then(() => outEl?.scrollTo({ top: outEl.scrollHeight }));
+    }
+  }
+
+  function append(s: string) {
+    pending.push(s);
+    pendingLen += s.length;
+    if (pendingLen >= 65536) {
+      clearTimeout(flushTimer);
+      flush();
+    } else if (!flushTimer) {
+      flushTimer = window.setTimeout(flush, 100);
+    }
+  }
+
+  function clearOut() {
+    clearTimeout(flushTimer);
+    flushTimer = 0;
+    pending = [];
+    pendingLen = 0;
+    pieces = [];
+    total = 0;
   }
 
   async function start() {
     if (running) return;
     running = true;
     status = "Выполняется…";
-    if (out) await append("\n──────── перезапуск ────────\n\n");
+    if (pieces.length || pending.length) append("\n──────── перезапуск ────────\n\n");
     const ch = makeChannel<string>();
     ch.onmessage = (s) => append(s);
     try {
@@ -43,10 +88,11 @@
     } catch (e) {
       const t = errText(e);
       status = "Ошибка";
-      await append(
+      append(
         `\n${t === "WINBOX_MISSING" ? "WinBox не установлен — установите его в «Настройки → Расширенные»." : t}\n`,
       );
     } finally {
+      flush();
       running = false;
     }
   }
@@ -56,8 +102,10 @@
   }
 
   async function copy() {
+    flush();
+    const text = pieces.join("");
     const sel = window.getSelection()?.toString();
-    await navigator.clipboard.writeText(sel || out).catch(() => api.clipboardSet(sel || out));
+    await navigator.clipboard.writeText(sel || text).catch(() => api.clipboardSet(sel || text));
     status = sel ? "Выделенное скопировано" : "Вывод скопирован";
   }
 
@@ -70,7 +118,8 @@
     if (e.ctrlKey && e.key.toLowerCase() === "c" && running && !window.getSelection()?.toString()) {
       e.preventDefault();
       stop();
-    } else if (e.key === "Enter" && !running) {
+    } else if (e.key === "Enter" && !running && (e.target as HTMLElement).tagName !== "BUTTON") {
+      // Enter на кнопке (копировать/очистить) не должен перезапускать инструмент — как в Tour
       start();
     } else if (e.key === "Escape" && inTauri) {
       import("@tauri-apps/api/window").then((m) => m.getCurrentWindow().close());
@@ -81,6 +130,7 @@
     applyTheme(app.settings.theme);
     document.title = `${name} — ${title}`;
     start();
+    return () => clearTimeout(flushTimer);
   });
 </script>
 
@@ -98,10 +148,10 @@
       <button class="btn sm" onclick={start} title="Запустить снова (Enter)"><Icon name="refresh" size={13} /> Ещё раз</button>
     {/if}
     <button class="icon-btn" onclick={copy} title="Копировать вывод или выделенное"><Icon name="copy" size={14} /></button>
-    <button class="icon-btn" onclick={() => (out = "")} title="Очистить"><Icon name="trash" size={14} /></button>
+    <button class="icon-btn" onclick={clearOut} title="Очистить"><Icon name="trash" size={14} /></button>
     <WindowControls />
   </div>
-  <pre class="out selectable" bind:this={outEl} onscroll={onScroll}>{out}</pre>
+  <pre class="out selectable" bind:this={outEl} onscroll={onScroll}>{#each pieces as p}{p}{/each}</pre>
   <div class="foot">
     <span class="st" class:run={running}></span>
     <span>{status}</span>

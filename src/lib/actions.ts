@@ -1,4 +1,4 @@
-import { api, errText, fieldValue, parseConn, inTauri, type Item, type Folder } from "./api";
+import { api, errText, fieldValue, flagValue, parseConn, inTauri, listen, type Item, type Folder } from "./api";
 import { app, GATEWAY_FOLDER, type Tool } from "./state.svelte";
 import { dialogs, type MenuItem } from "./dialogs.svelte";
 import { exportItems } from "./exporter";
@@ -137,19 +137,37 @@ export async function checkFreerdp(force = false) {
   }
 }
 
-/** Новая версия FreeRDP: объяснить и, с согласия, открыть страницу выпуска */
-export async function freerdpUpdateInfo() {
-  const u = app.freerdpUpdate;
-  if (!u) return;
+/** Обновление FreeRDP одной кнопкой: архив с GitHub-релиза, SHA-256, проверка запуском, замена */
+export async function updateFreerdp(version?: string): Promise<boolean> {
+  if (app.freerdpUpdating) return false;
+  const ver = version ?? app.freerdpUpdate?.latest;
   const ok = await dialogs.confirm(
-    `Вышел FreeRDP ${u.latest}`,
-    `Встроен FreeRDP ${u.installed}. Новые версии FreeRDP закрывают уязвимости RDP-клиента — для безопасности важно обновляться: ` +
-      `взломанный или подменённый сервер может атаковать компьютер через ошибки клиента.\n\n` +
-      `FreeRDP входит в состав RDPMgrCoffee и обновляется вместе с программой — установите её новую версию, когда она выйдет. ` +
-      `Открыть описание выпуска FreeRDP на GitHub?`,
-    "Открыть",
+    ver ? `Обновить FreeRDP до ${ver}?` : "Обновить FreeRDP?",
+    `Будет скачан архив (~8 МБ) с релиза GitHub, проверен по SHA-256 и опробован запуском; затем он заменит встроенный FreeRDP. ` +
+      `Новые версии FreeRDP закрывают уязвимости RDP-клиента — для безопасности важно обновляться.\n\n` +
+      `Открытые сеансы RDP продолжат работать на прежней версии до переподключения.`,
+    "Обновить",
   );
-  if (ok) api.openUrl(u.url).catch(() => {});
+  if (!ok) return false;
+  app.freerdpUpdating = { phase: "download", percent: 0 };
+  const un = await listen<{ phase: string; percent: number }>("freerdp-update-progress", (e) => {
+    app.freerdpUpdating = e.payload;
+  });
+  try {
+    const r = await api.freerdpUpdate();
+    if (r.already) app.toast(`FreeRDP ${r.version} уже установлен`);
+    else {
+      app.toast(`FreeRDP обновлён до ${r.version}`);
+      app.freerdpUpdate = null;
+    }
+    return true;
+  } catch (e) {
+    app.toast(errText(e), true);
+    return false;
+  } finally {
+    un();
+    app.freerdpUpdating = null;
+  }
 }
 
 export async function runTool(item: Item, tool: Tool) {
@@ -322,12 +340,30 @@ export async function renameFolder(folder: Folder) {
   const prefix = parts.length ? parts.join("/") + "/" : "";
   const oldFull = folder.name;
   const newFull = prefix + name.trim();
+  const affected = app.view.folders.filter((f) => f.name === oldFull || f.name.startsWith(oldFull + "/"));
+  const affectedIds = new Set(affected.map((f) => f.id));
+  // Коллизия — до цикла: иначе часть вложенных папок переименуется, а потом ошибка
+  if (app.view.folders.some((f) => !affectedIds.has(f.id) && (f.name === newFull || f.name.startsWith(newFull + "/")))) {
+    app.toast(`Папка «${name.trim()}» уже существует`, true);
+    return;
+  }
   try {
     // Вложенные папки в Bitwarden — это просто имена с «/», переименовываем и их
-    const affected = app.view.folders.filter((f) => f.name === oldFull || f.name.startsWith(oldFull + "/"));
     for (const f of affected) {
       const updated = await api.saveFolder(f.id, newFull + f.name.slice(oldFull.length));
       f.name = updated.name;
+    }
+    // Перенести состояние «раскрыта»/«скрыта»/порядок — как в moveFolder
+    // (ключи состояния относительны рабочей папки)
+    if (app.inScopeName(oldFull)) {
+      const path = app.relName(oldFull);
+      const target = app.relName(newFull);
+      const re = (p: string) => (p === path || p.startsWith(path + "/") ? target + p.slice(path.length) : p);
+      app.expanded = app.expanded.map((k) => (k.startsWith("f:") ? "f:" + re(k.slice(2)) : k));
+      app.settings.hiddenFolders = app.settings.hiddenFolders.map(re);
+      const rk = (k: string) => (k.startsWith("f:") ? "f:" + re(k.slice(2)) : k);
+      app.settings.order = Object.fromEntries(Object.entries(app.settings.order).map(([k, v]) => [rk(k), v.map(rk)]));
+      app.saveSettings();
     }
   } catch (e) {
     app.toast(errText(e), true);
@@ -403,7 +439,7 @@ export function gwKey(host: string, same: boolean, username = "", domain = "", p
 
 /** Ключ существующей записи шлюза (читает пароль из хранилища) */
 export async function itemGwKey(g: Item): Promise<string> {
-  const same = (fieldValue(g, "samecreds") ?? "").toLowerCase() === "true";
+  const same = flagValue(g, "samecreds");
   const pw = !same && g.hasPassword ? (await api.secret(g.id)).password : "";
   return gwKey(g.uris[0] ?? "", same, g.username, fieldValue(g, "domain") ?? "", pw);
 }
@@ -621,7 +657,7 @@ export function itemMenu(item: Item): MenuItem[] {
   m.push({ label: "Удалить", icon: "trash", danger: true, action: () => deleteItem(item), disabled: !item.edit, hint: "Del" });
   if (conn) {
     // SSH/Telnet-подключение с отметкой «Это MikroTik» получает инструменты MikroTik (WinBox)
-    const mt = ["1", "true", "yes", "да", "on"].includes(fieldValue(item, "mikrotik").toLowerCase());
+    const mt = flagValue(item, "mikrotik");
     const tools = app.settings.tools.filter(
       (t) => !t.protocols.length || t.protocols.includes(conn.protocol) || (mt && t.protocols.includes("winbox")),
     );

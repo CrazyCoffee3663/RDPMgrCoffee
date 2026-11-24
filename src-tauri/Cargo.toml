@@ -1,6 +1,6 @@
 [package]
 name = "connmgr"
-version = "1.0.0"
+version = "0.1.0"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
@@ -20,6 +20,8 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 tauri = { version = "2", features = ["unstable"] }
 tauri-plugin-opener = "2"
+# Единственный экземпляр: два процесса писали бы local vault из своих снимков и затирали правки друг друга
+tauri-plugin-single-instance = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "process"] }
@@ -28,8 +30,6 @@ uuid = { version = "1.29.2", features = ["v4"] }
 russh = "0.65.1"
 russh-sftp = "2"
 serialport = "4.10.1"
-thiserror = "2.0.21"
-anyhow = "1.0.104"
 windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_Graphics_Gdi", "Win32_System_LibraryLoader", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_DataExchange", "Win32_System_Memory", "Win32_System_Ole", "Win32_System_Threading", "Win32_Security", "Win32_Globalization", "Win32_Security_Cryptography", "Win32_Security_WinTrust", "Win32_Security_Cryptography_Catalog", "Win32_Security_Cryptography_Sip", "Win32_System_JobObjects", "Win32_System_SystemInformation"] }
 aes = "0.8"
 cbc = { version = "0.1", features = ["alloc"] }

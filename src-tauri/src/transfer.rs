@@ -19,7 +19,10 @@ const T: u32 = 3;
 const P: u32 = 4;
 
 fn derive(password: &str, salt: &[u8], m: u32, t: u32, p: u32) -> Result<SymKey, String> {
-    if !(8 * 1024..=1024 * 1024).contains(&m) || !(1..=20).contains(&t) || !(1..=16).contains(&p) {
+    // Границы — вокруг профиля экспорта (64 МиБ, t=3, p=4) с небольшим запасом:
+    // специально подготовленный файл с m=1 ГиБ, t=20, p=16 исчерпал бы память и CPU
+    // ещё до проверки пароля (DoS через импорт)
+    if !(8 * 1024..=256 * 1024).contains(&m) || !(1..=4).contains(&t) || !(1..=4).contains(&p) {
         return Err("Недопустимые параметры ключа в файле".into());
     }
     let params = argon2::Params::new(m, t, p, Some(64)).map_err(|e| e.to_string())?;
@@ -60,7 +63,8 @@ pub fn open(text: &str, password: &str) -> Result<String, String> {
         return Err("Неизвестный способ шифрования файла".into());
     }
     let salt = B64.decode(k["salt"].as_str().unwrap_or("")).map_err(|_| "Файл повреждён".to_string())?;
-    let n = |x: &Value| x.as_u64().unwrap_or(0) as u32;
+    // try_from, а не as: u64 за пределами u32 обрезался бы до безобидного значения
+    let n = |x: &Value| u32::try_from(x.as_u64().unwrap_or(0)).unwrap_or(0);
     let key = derive(password, &salt, n(&k["m"]), n(&k["t"]), n(&k["p"]))?;
     let data = key
         .decrypt(v["data"].as_str().unwrap_or(""))
@@ -113,5 +117,25 @@ mod tests {
         let mut v: Value = serde_json::from_str(&f).unwrap();
         v["kdf"]["m"] = json!(1);
         assert!(open(&v.to_string(), "export password 1").is_err());
+    }
+
+    /// v31: параметры импорта ограничены профилем экспорта; u64 не обрезается в u32
+    #[test]
+    fn import_kdf_params_capped() {
+        let f = seal(r#"{"a":1}"#, "export password 1").unwrap();
+        for (field, bad) in [
+            ("m", json!(256 * 1024 + 1)),
+            ("m", json!(1024 * 1024)),
+            ("t", json!(5)),
+            ("t", json!(20)),
+            ("p", json!(5)),
+            ("p", json!(16)),
+            ("m", json!(4294967296u64 + 65536)),
+            ("t", json!(0)),
+        ] {
+            let mut v: Value = serde_json::from_str(&f).unwrap();
+            v["kdf"][field] = bad.clone();
+            assert!(open(&v.to_string(), "export password 1").is_err(), "{}={} принят", field, bad);
+        }
     }
 }

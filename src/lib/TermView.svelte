@@ -134,7 +134,8 @@
   }
 
   async function start() {
-    startedGen = tab.gen;
+    const gen = tab.gen;
+    startedGen = gen;
     term.reset();
     doFit();
     const ch = makeChannel<ArrayBuffer>();
@@ -152,9 +153,16 @@
         },
         ch,
       );
+      // Переподключение/закрытие вкладки, пока open был в пути: поздний сеанс закрываем,
+      // иначе он останется аутентифицированным и осиротевшим
+      if (tab.gen !== gen || !app.tab(tab.key)) {
+        api.close(r.id).catch(() => {});
+        return;
+      }
       app.bindSession(tab.key, r.id);
       if (active) term.focus();
     } catch (e) {
+      if (tab.gen !== gen) return;
       tab.state = "error";
       tab.message = errText(e);
       term.write(`\r\n\x1b[31m${tab.message.replace(/\n/g, "\r\n")}\x1b[0m\r\n`);

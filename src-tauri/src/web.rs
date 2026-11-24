@@ -19,9 +19,18 @@ fn allowed(u: &Url) -> bool {
     if host == "tauri.localhost" || host == "ipc.localhost" || host.ends_with(".tauri.localhost") {
         return false;
     }
-    // Сервер разработки интерфейса
-    if cfg!(debug_assertions) && (host == "localhost" || host == "127.0.0.1") && u.port() == Some(1420) {
-        return false;
+    // Сервер разработки интерфейса: на dev-порту блокируется весь loopback-диапазон,
+    // а не два написания — [::1], localhost. и 127.0.0.2 раньше проходили фильтр
+    if cfg!(debug_assertions) && u.port() == Some(1420) {
+        let h = host.trim_end_matches('.');
+        let v6 = h.trim_matches(['[', ']']).parse::<std::net::Ipv6Addr>().ok();
+        let loopback = h == "localhost"
+            || h.ends_with(".localhost")
+            || h.parse::<std::net::Ipv4Addr>().map(|ip| ip.is_loopback() || ip.is_unspecified()).unwrap_or(false)
+            || v6.map(|ip| ip.is_loopback() || ip.is_unspecified() || ip.to_ipv4_mapped().map(|v4| v4.is_loopback()).unwrap_or(false)).unwrap_or(false);
+        if loopback {
+            return false;
+        }
     }
     true
 }
@@ -73,6 +82,13 @@ pub fn open(app: &AppHandle, label: String, url: String, x: f64, y: f64, w: f64,
         .disable_drag_drop_handler();
     win.add_child(builder, LogicalPosition::new(x, y), LogicalSize::new(w.max(1.0), h.max(1.0)))
         .map_err(|e| format!("Не удалось открыть страницу: {}", e))?;
+    // Хранилище могли заблокировать, пока страница открывалась (гонка с vault_lock):
+    // новый webview сразу прячем — place() покажет его после разблокировки
+    if *app.state::<crate::rdp::Rdp>().locked.lock().unwrap() {
+        if let Some(wv) = app.get_webview(&label) {
+            let _ = wv.hide();
+        }
+    }
     Ok(())
 }
 
@@ -133,5 +149,29 @@ mod tests {
         assert!(!ok("tauri://localhost"));
         assert!(check_label("web-abc-1").is_ok());
         assert!(check_label("main").is_err());
+    }
+
+    /// v61/v79д: dev-фильтр закрывает весь loopback на порту 1420, внешние адреса — нет
+    #[test]
+    fn dev_filter_covers_loopback_forms() {
+        let ok = |s: &str| allowed(&Url::parse(s).unwrap());
+        // В debug-сборке (cargo test) сервер разработки недоступен веб-вкладке
+        if cfg!(debug_assertions) {
+            assert!(!ok("http://localhost:1420/"));
+            assert!(!ok("http://127.0.0.1:1420/"));
+            assert!(!ok("http://[::1]:1420/"));
+            assert!(!ok("http://localhost.:1420/"));
+            assert!(!ok("http://127.0.0.2:1420/"));
+            assert!(!ok("http://127.1:1420/"));
+            assert!(!ok("http://2130706433:1420/"));
+            assert!(!ok("http://sub.localhost:1420/"));
+            assert!(!ok("http://0.0.0.0:1420/"));
+            assert!(!ok("http://[::]:1420/"));
+            assert!(!ok("http://[::ffff:127.0.0.1]:1420/"));
+            // Другой порт и внешние адреса не затрагиваются
+            assert!(ok("http://localhost:8080/"));
+            assert!(ok("http://192.168.1.1:1420/"));
+            assert!(ok("https://example.com:1420/"));
+        }
     }
 }

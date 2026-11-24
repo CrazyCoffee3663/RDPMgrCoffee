@@ -40,7 +40,8 @@
       "nsis": {
         "installMode": "currentUser",
         "languages": ["Russian"],
-        "displayLanguageSelector": false
+        "displayLanguageSelector": false,
+        "template": "nsis/installer.nsi"
       }
     },
     "icon": [

@@ -61,7 +61,7 @@ mod win {
                 let w = (lp.0 & 0xffff) as i32;
                 let h = ((lp.0 >> 16) & 0xffff) as i32;
                 if let Ok(child) = GetWindow(hwnd, GW_CHILD) {
-                    let _ = MoveWindow(child, 0, 0, w, h, true);
+                    move_async(child, w, h, false);
                 }
                 // Когда размер устоится — ещё раз сообщить FreeRDP, иначе он
                 // пропускает частые изменения и разрешение сервера не обновляется
@@ -84,7 +84,10 @@ mod win {
             if msg == WM_KILLFOCUS {
                 if let Ok(child) = GetWindow(hwnd, GW_CHILD) {
                     if HWND(wp.0 as _) == child {
-                        let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(Some(hwnd));
+                        // SetFocus шлёт WM_KILLFOCUS в поток сеанса синхронно — не блокируемся, если он завис
+                        if alive(child) {
+                            let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(Some(hwnd));
+                        }
                         let _ = PostMessageW(Some(child), WM_SETFOCUS, WPARAM(0), LPARAM(0));
                         FOCUS_NOTIFIED.lock().unwrap().insert(hwnd.0 as isize, child.0 as isize);
                     } else {
@@ -114,6 +117,29 @@ mod win {
 
     /// Какому окну сеанса хост уже сообщил о фокусе письмом (host hwnd -> child hwnd).
     static FOCUS_NOTIFIED: LazyLock<Mutex<HashMap<isize, isize>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    /// Окно принадлежит потоку FreeRDP: синхронные MoveWindow/SetParent/ShowWindow
+    /// блокируют наш UI-поток, пока тот поток качает сообщения. При обрыве VPN поток
+    /// FreeRDP может зависнуть — поэтому перестановки окна только асинхронные,
+    /// а перед синхронными операциями проверяем, жив ли поток.
+    fn alive(h: HWND) -> bool {
+        unsafe { SendMessageTimeoutW(h, WM_NULL, WPARAM(0), LPARAM(0), SMTO_ABORTIFHUNG | SMTO_NORMAL, 100, None).0 != 0 }
+    }
+
+    fn move_async(h: HWND, w: i32, hh: i32, show: bool) {
+        // SetParent связывает очереди ввода, а со связанными очередями даже
+        // SWP_ASYNCWINDOWPOS синхронен — зависший поток не трогаем вовсе
+        if !alive(h) {
+            return;
+        }
+        unsafe {
+            let mut flags = SWP_NOACTIVATE | SWP_NOZORDER | SWP_ASYNCWINDOWPOS;
+            if show {
+                flags |= SWP_SHOWWINDOW;
+            }
+            let _ = SetWindowPos(h, None, 0, 0, w, hh, flags);
+        }
+    }
 
     /// Повторно отправить окну FreeRDP WM_SIZE + WM_EXITSIZEMOVE —
     /// по ним он пересчитывает разрешение (/dynamic-resolution).
@@ -236,8 +262,7 @@ mod win {
                     notified.insert(hwnd, child.0 as isize);
                 }
                 if cw != rc.right || ch != rc.bottom || !IsWindowVisible(child).as_bool() {
-                    let _ = MoveWindow(child, 0, 0, rc.right, rc.bottom, true);
-                    let _ = ShowWindow(child, SW_SHOW);
+                    move_async(child, rc.right, rc.bottom, true);
                     SetTimer(Some(host), RESIZE_TIMER, 200, None);
                 }
             }
@@ -277,6 +302,10 @@ mod win {
                 if GetParent(h).ok() == Some(host) {
                     continue;
                 }
+                // Зависший поток FreeRDP (обрыв VPN) не должен вешать наш UI-поток
+                if !alive(h) {
+                    continue;
+                }
                 // Главное окно сеанса оказалось отдельным — встраиваем во вкладку
                 let style = GetWindowLongPtrW(h, GWL_STYLE) as u32;
                 let style = (style & !(WS_POPUP.0 | WS_CAPTION.0 | WS_THICKFRAME.0 | WS_SYSMENU.0)) | WS_CHILD.0;
@@ -284,11 +313,11 @@ mod win {
                 let _ = SetParent(h, Some(host));
                 let mut rc = Default::default();
                 let _ = GetClientRect(host, &mut rc);
-                let _ = MoveWindow(h, 0, 0, rc.right, rc.bottom, true);
+                move_async(h, rc.right, rc.bottom, false);
             } else {
                 let ex = GetWindowLongPtrW(h, GWL_EXSTYLE) as u32;
-                if ex & WS_EX_TOPMOST.0 == 0 {
-                    let _ = SetWindowPos(h, Some(HWND_TOPMOST), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+                if ex & WS_EX_TOPMOST.0 == 0 && alive(h) {
+                    let _ = SetWindowPos(h, Some(HWND_TOPMOST), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW | SWP_ASYNCWINDOWPOS);
                     let _ = SetForegroundWindow(h);
                 }
             }
@@ -339,6 +368,15 @@ mod win {
     pub fn focus(hwnd: isize) {
         unsafe {
             use windows::Win32::UI::Input::KeyboardAndMouse::{SetActiveWindow, SetFocus};
+            // SetFocus синхронно шлёт WM_KILLFOCUS потоку текущего фокуса —
+            // не вешаемся на чужом зависшем окне
+            let fg = GetForegroundWindow();
+            let tid = GetWindowThreadProcessId(fg, None);
+            let mut gti: GUITHREADINFO = std::mem::zeroed();
+            gti.cbSize = std::mem::size_of::<GUITHREADINFO>() as u32;
+            if GetGUIThreadInfo(tid, &mut gti).is_ok() && !gti.hwndFocus.0.is_null() && !alive(gti.hwndFocus) {
+                return;
+            }
             let h = HWND(hwnd as _);
             let _ = SetActiveWindow(h);
             let _ = SetFocus(Some(h));

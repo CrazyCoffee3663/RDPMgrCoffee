@@ -725,7 +725,10 @@ async fn app_update_inner(
     {
         use std::os::windows::process::CommandExt;
         // DETACHED_PROCESS: установщик переживает закрытие приложения
+        // /UPDATE: без него NSIS предлагает сначала удалить старую версию;
+        // с флагом файлы обновляются поверх, данные в AppData не трогаются
         std::process::Command::new(&exe_path)
+            .arg("/UPDATE")
             .creation_flags(0x00000008)
             .spawn()
             .map_err(|e| format!("Не удалось запустить установщик: {}", e))?;

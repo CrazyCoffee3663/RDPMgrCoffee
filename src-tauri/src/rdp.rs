@@ -46,6 +46,8 @@ pub struct Rdp {
 
 #[cfg(windows)]
 mod win {
+    use std::collections::HashMap;
+    use std::sync::{LazyLock, Mutex};
     use windows::core::w;
     use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
     use windows::Win32::Graphics::Gdi::{GetStockObject, BLACK_BRUSH, HBRUSH};
@@ -72,6 +74,7 @@ mod win {
             if msg == WM_SETFOCUS {
                 if let Ok(child) = GetWindow(hwnd, GW_CHILD) {
                     let _ = PostMessageW(Some(child), WM_SETFOCUS, WPARAM(0), LPARAM(0));
+                    FOCUS_NOTIFIED.lock().unwrap().insert(hwnd.0 as isize, child.0 as isize);
                 }
                 return LRESULT(0);
             }
@@ -83,6 +86,7 @@ mod win {
                     if HWND(wp.0 as _) == child {
                         let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(Some(hwnd));
                         let _ = PostMessageW(Some(child), WM_SETFOCUS, WPARAM(0), LPARAM(0));
+                        FOCUS_NOTIFIED.lock().unwrap().insert(hwnd.0 as isize, child.0 as isize);
                     } else {
                         let _ = PostMessageW(Some(child), WM_KILLFOCUS, WPARAM(0), LPARAM(0));
                     }
@@ -107,6 +111,9 @@ mod win {
     }
 
     const RESIZE_TIMER: usize = 1;
+
+    /// Какому окну сеанса хост уже сообщил о фокусе письмом (host hwnd -> child hwnd).
+    static FOCUS_NOTIFIED: LazyLock<Mutex<HashMap<isize, isize>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
     /// Повторно отправить окну FreeRDP WM_SIZE + WM_EXITSIZEMOVE —
     /// по ним он пересчитывает разрешение (/dynamic-resolution).
@@ -216,11 +223,17 @@ mod win {
                 let mut cr = Default::default();
                 let _ = GetWindowRect(child, &mut cr);
                 let (cw, ch) = (cr.right - cr.left, cr.bottom - cr.top);
-                // Окно FreeRDP появилось позже, а фокус на хосте — сообщить сеансу о фокусе
-                // письмом (системный фокус не отдаём: его ждёт LL-хук клавиатуры)
+                // О фокусе сообщаем письмом один раз на новое окно сеанса (системный фокус
+                // не отдаём: его ждёт LL-хук клавиатуры). Периодический WM_SETFOCUS слал бы
+                // серверу focus-in каждые 400 мс — сервер отпускает зажатые кнопки мыши,
+                // и выделение «отжималось» через секунду.
                 use windows::Win32::UI::Input::KeyboardAndMouse::GetFocus;
-                if GetFocus() == host {
-                    let _ = PostMessageW(Some(child), WM_SETFOCUS, WPARAM(0), LPARAM(0));
+                let mut notified = FOCUS_NOTIFIED.lock().unwrap();
+                if notified.get(&hwnd).copied() != Some(child.0 as isize) {
+                    if GetFocus() == host {
+                        let _ = PostMessageW(Some(child), WM_SETFOCUS, WPARAM(0), LPARAM(0));
+                    }
+                    notified.insert(hwnd, child.0 as isize);
                 }
                 if cw != rc.right || ch != rc.bottom || !IsWindowVisible(child).as_bool() {
                     let _ = MoveWindow(child, 0, 0, rc.right, rc.bottom, true);
@@ -259,6 +272,11 @@ mod win {
             let n = GetClassNameW(h, &mut buf) as usize;
             let class = String::from_utf16_lossy(&buf[..n]);
             if class == "FreeRDP" {
+                // Встроенное окно не переставляем каждые 2 с: SetParent/MoveWindow
+                // во время перетаскивания сбрасывали захват мыши
+                if GetParent(h).ok() == Some(host) {
+                    continue;
+                }
                 // Главное окно сеанса оказалось отдельным — встраиваем во вкладку
                 let style = GetWindowLongPtrW(h, GWL_STYLE) as u32;
                 let style = (style & !(WS_POPUP.0 | WS_CAPTION.0 | WS_THICKFRAME.0 | WS_SYSMENU.0)) | WS_CHILD.0;
@@ -409,6 +427,7 @@ mod win {
     }
 
     pub fn destroy(hwnd: isize) {
+        FOCUS_NOTIFIED.lock().unwrap().remove(&hwnd);
         unsafe {
             let _ = DestroyWindow(HWND(hwnd as _));
         }
@@ -555,7 +574,13 @@ fn build_args(p: &ConnParams, hwnd: isize, w: i32, h: i32, pin: Option<&str>, le
     match p.opt("resolution") {
         "" | "auto" => {
             a.push(format!("/size:{}x{}", w.max(640), h.max(480)));
-            a.push("/dynamic-resolution".into());
+            if legacy.is_some() {
+                // Старый сервер (устаревший TLS) — как правило RDP до 7.0: канала disp нет,
+                // /dynamic-resolution там молча не работает. Масштабируем картинку под окно.
+                a.push("/smart-sizing".into());
+            } else {
+                a.push("/dynamic-resolution".into());
+            }
         }
         r => {
             // Только ШИРИНАxВЫСОТА: свободная строка ушла бы в /size как есть и могла
@@ -1206,9 +1231,13 @@ mod tests {
         assert!(!a.iter().any(|x| x.starts_with("/tls:")));
         let a = build_args(&base, 1, 800, 600, None, Some("auto")).unwrap();
         assert!(a.contains(&"/tls:seclevel:0".to_string()));
+        // у старого сервера нет канала disp — масштабирование под окно вместо dynamic-resolution
+        assert!(a.contains(&"/smart-sizing".to_string()));
+        assert!(!a.contains(&"/dynamic-resolution".to_string()));
         for (v, arg) in [("1.0", "/tls:seclevel:0,enforce:1.0"), ("1.1", "/tls:seclevel:0,enforce:1.1")] {
             let a = build_args(&base, 1, 800, 600, None, Some(v)).unwrap();
             assert!(a.contains(&arg.to_string()), "{}", v);
+            assert!(a.contains(&"/smart-sizing".to_string()), "{}", v);
         }
     }
 

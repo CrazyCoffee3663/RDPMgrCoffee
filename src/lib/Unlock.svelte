@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { onMount } from "svelte";
   import { api, errText } from "./api";
   import { app } from "./state.svelte";
   import Icon from "./Icon.svelte";
@@ -25,6 +26,20 @@
   let busy = $state(false);
   let error = $state("");
   let info = $state("");
+  let legacyNote = $state("");
+
+  // Identifier сменился (com.user.connmgr → io.github.connmgr): подставляем сервер/почту
+  // из данных прежней версии (bw CLI). Пароль не трогаем, старый каталог не удаляем.
+  onMount(async () => {
+    if (app.phase === "setup" && !server && !email) {
+      const h = await api.legacyHint().catch(() => null);
+      if (h && (h.server || h.email)) {
+        server = h.server;
+        email = h.email;
+        legacyNote = "Адрес и почта подставлены из прежней версии программы. Мастер-пароль введите заново.";
+      }
+    }
+  });
 
   const supported = $derived(providers.filter((p) => p in PROVIDER_NAMES));
 
@@ -203,6 +218,7 @@
       </form>
     {:else if app.phase !== "locked" && step === "creds"}
       <form onsubmit={(e) => (e.preventDefault(), login())}>
+        {#if legacyNote}<p class="faint small">{legacyNote}</p>{/if}
         <label>
           <span>Сервер</span>
           <input placeholder="https://vault.bitwarden.com или адрес Vaultwarden" bind:value={server} disabled={busy} />

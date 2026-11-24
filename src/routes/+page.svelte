@@ -1,17 +1,15 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { app, applyTheme, setupEvents } from "$lib/state.svelte";
+  import { app, applyTheme, setupEvents, shouldLock } from "$lib/state.svelte";
   import { api, errText, PROTOCOL_LABEL, TAB_PROTOCOLS } from "$lib/api";
   import { getCurrentWindow } from "@tauri-apps/api/window";
 
   const inTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
-  import { newItem, checkWinbox, installWinbox, checkFreerdp, freerdpUpdateInfo } from "$lib/actions";
+  import { newItem, checkWinbox, installWinbox, checkFreerdp, updateFreerdp } from "$lib/actions";
   import { menu } from "$lib/dialogs.svelte";
   import Unlock from "$lib/Unlock.svelte";
   import Sidebar from "$lib/Sidebar.svelte";
   import Editor from "$lib/Editor.svelte";
-  import TermView from "$lib/TermView.svelte";
-  import RdpView from "$lib/RdpView.svelte";
   import Home from "$lib/Home.svelte";
   import Settings from "$lib/Settings.svelte";
   import WindowControls from "$lib/WindowControls.svelte";
@@ -20,9 +18,19 @@
   import Overlays from "$lib/Overlays.svelte";
   import ExportDialog from "$lib/ExportDialog.svelte";
   import Tour from "$lib/Tour.svelte";
-  import VncView from "$lib/VncView.svelte";
-  import WebTabView from "$lib/WebTabView.svelte";
   import Icon from "$lib/Icon.svelte";
+
+  // Вьюхи с тяжёлыми зависимостями (xterm, noVNC) грузятся при первой вкладке своего
+  // протокола: статические импорты тянули их в основной чанк (~858 кБ). Кеш промиса —
+  // чтобы {#await} не мигал загрузкой при каждом обновлении вкладки.
+  let termP: Promise<typeof import("$lib/TermView.svelte")> | null = null;
+  let rdpP: Promise<typeof import("$lib/RdpView.svelte")> | null = null;
+  let vncP: Promise<typeof import("$lib/VncView.svelte")> | null = null;
+  let webP: Promise<typeof import("$lib/WebTabView.svelte")> | null = null;
+  const termView = () => (termP ??= import("$lib/TermView.svelte"));
+  const rdpView = () => (rdpP ??= import("$lib/RdpView.svelte"));
+  const vncView = () => (vncP ??= import("$lib/VncView.svelte"));
+  const webView = () => (webP ??= import("$lib/WebTabView.svelte"));
 
   let sidebar = $state<ReturnType<typeof Sidebar>>();
   let showSidebar = $state(true);
@@ -36,7 +44,8 @@
     const mq = window.matchMedia("(prefers-color-scheme: dark)");
     const onScheme = () => applyTheme(app.settings.theme);
     mq.addEventListener("change", onScheme);
-    setupEvents();
+    let unEvents: (() => void) | undefined;
+    setupEvents().then((f) => (unEvents = f));
     app.init();
 
     const bump = () => (lastActivity = Date.now());
@@ -49,11 +58,11 @@
     const timer = setInterval(async () => {
       if (app.phase !== "unlocked") return;
       const lockMin = app.settings.autoLockMinutes;
-      if (lockMin > 0 && Date.now() - lastActivity > lockMin * 60_000) {
+      if (shouldLock(Date.now() - lastActivity, lockMin)) {
         // Бездействие — по всей системе: работа в RDP-окне или другой программе не видна странице.
         // Если системное время ввода недоступно — по событиям страницы.
         const idle = await api.idleMs().catch(() => Date.now() - lastActivity);
-        if (idle > lockMin * 60_000) {
+        if (shouldLock(idle, lockMin)) {
           app.lock();
           return;
         }
@@ -72,6 +81,10 @@
     return () => {
       clearInterval(timer);
       mq.removeEventListener("change", onScheme);
+      // Без снятия слушателей и подписок dev-HMR удваивал диалоги и таймеры
+      window.removeEventListener("mousemove", bump);
+      window.removeEventListener("keydown", bump);
+      unEvents?.();
     };
   });
 
@@ -291,13 +304,29 @@
         <div class="views">
           {#each app.tabs as t (t.key)}
             {#if t.protocol === "rdp"}
-              <RdpView tab={t} active={app.activeTab === t.key} />
+              {#await rdpView()}
+                <div class="viewloading"></div>
+              {:then m}
+                <m.default tab={t} active={app.activeTab === t.key} />
+              {/await}
             {:else if t.protocol === "vnc"}
-              <VncView tab={t} active={app.activeTab === t.key} />
+              {#await vncView()}
+                <div class="viewloading"></div>
+              {:then m}
+                <m.default tab={t} active={app.activeTab === t.key} />
+              {/await}
             {:else if t.protocol === "web"}
-              <WebTabView tab={t} active={app.activeTab === t.key} />
+              {#await webView()}
+                <div class="viewloading"></div>
+              {:then m}
+                <m.default tab={t} active={app.activeTab === t.key} />
+              {/await}
             {:else}
-              <TermView tab={t} active={app.activeTab === t.key} />
+              {#await termView()}
+                <div class="viewloading"></div>
+              {:then m}
+                <m.default tab={t} active={app.activeTab === t.key} />
+              {/await}
             {/if}
           {/each}
           {#if !app.activeTab}<Home />{/if}
@@ -321,8 +350,13 @@
       <span class="faint">{app.status.email}</span>
       <span class="sp"></span>
       {#if app.freerdpUpdate}
-        <button class="upd" onclick={() => freerdpUpdateInfo()} title="Встроен FreeRDP {app.freerdpUpdate.installed}">
-          <Icon name="alert" size={12} /> Вышел FreeRDP {app.freerdpUpdate.latest} — важно для безопасности
+        <button
+          class="upd"
+          onclick={() => updateFreerdp()}
+          disabled={!!app.freerdpUpdating}
+          title="Встроен FreeRDP {app.freerdpUpdate.installed} — обновление закрывает уязвимости RDP-клиента"
+        >
+          <Icon name="alert" size={12} /> Вышел FreeRDP {app.freerdpUpdate.latest} — обновить
         </button>
       {/if}
       {#if app.winboxUpdate}
@@ -550,6 +584,10 @@
     position: relative;
     min-height: 0;
     background: var(--bg);
+  }
+  .viewloading {
+    position: absolute;
+    inset: 0;
   }
   .status {
     display: flex;

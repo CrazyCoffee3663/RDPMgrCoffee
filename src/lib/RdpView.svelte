@@ -28,15 +28,23 @@
   let retried = false;
 
   async function start(forceNtlm = false) {
-    startedGen = tab.gen;
+    const gen = tab.gen;
+    startedGen = gen;
     try {
       const r = await api.open({ itemId: tab.itemId, quick: tab.quick?.address, quickProtocol: "rdp",
         quickUsername: tab.quick?.username, quickPassword: tab.quick?.password, cols: 0, rows: 0, rect: rect(), rdpLog: app.settings.rdpLog,
         forceNtlm: forceNtlm || ntlmOnly.has(key()) },
         makeChannel<ArrayBuffer>());
+      // Переподключение/закрытие вкладки, пока open был в пути: поздний сеанс закрываем,
+      // иначе окно FreeRDP останется поверх интерфейса без управления
+      if (tab.gen !== gen || !app.tab(tab.key)) {
+        api.close(r.id).catch(() => {});
+        return;
+      }
       app.bindSession(tab.key, r.id);
       place();
     } catch (e) {
+      if (tab.gen !== gen) return;
       tab.state = "error";
       tab.message = errText(e);
     }

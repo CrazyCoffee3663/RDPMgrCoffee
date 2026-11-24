@@ -20,6 +20,8 @@
     notes: string;
     opts: Record<string, string>;
     gateway: Gw | null;
+    /** Полный адрес веб-подключения (с путём); у импорта mRemoteNG/Terminals поля нет */
+    uri?: string;
   };
   type Parsed = { conns: Conn[]; folders: string[][]; skipped: string[] };
 
@@ -91,19 +93,22 @@
   let keepTree = $state(true);
   let skipDupes = $state(true);
   let busy = $state(false);
+  let cancelImport = $state(false);
   let progress = $state({ done: 0, total: 0 });
-  let finished = $state<{ conns: number; gws: number; failed: string[]; skipped: number } | null>(null);
+  let finished = $state<{ conns: number; gws: number; failed: string[]; skipped: number; cancelled: boolean } | null>(null);
 
-  /** Ключ дубля: протокол + адрес + порт (порт по умолчанию нормализуется) */
-  function connKey(protocol: string, host: string, port: number | null): string {
+  /** Ключ дубля: протокол + адрес + порт (порт по умолчанию нормализуется).
+   *  Веб-страницы одного хоста с разными путями — разные подключения. */
+  function connKey(protocol: string, host: string, port: number | null, uri = ""): string {
     const h = host.trim().toLowerCase().replace(/^\[|\]$/g, "");
-    return `${protocol}|${h}|${port ?? DEFAULT_PORTS[protocol as Protocol] ?? ""}`;
+    const path = protocol === "web" ? `|${uri.trim().toLowerCase()}` : "";
+    return `${protocol}|${h}|${port ?? DEFAULT_PORTS[protocol as Protocol] ?? ""}${path}`;
   }
   const existingKeys = $derived(
     new Map(
       app.connections.flatMap((i) => {
         const c = parseConn(i);
-        return c ? [[connKey(c.protocol, c.host, c.port), i.name] as [string, string]] : [];
+        return c ? [[connKey(c.protocol, c.host, c.port, c.uri), i.name] as [string, string]] : [];
       }),
     ),
   );
@@ -113,7 +118,7 @@
     const seen = new Set<string>();
     const out: string[] = [];
     for (const c of parsed.conns) {
-      const k = connKey(c.protocol, c.host, c.port);
+      const k = connKey(c.protocol, c.host, c.port, c.uri);
       const ex = existingKeys.get(k);
       if (ex !== undefined) out.push(`${c.name} — уже есть «${ex}»`);
       else if (seen.has(k)) out.push(`${c.name} — повторяется в файле`);
@@ -199,6 +204,8 @@
       else if (termFiles) parsed = await api.importTerminals(termFiles.config, termFiles.favorites, termFiles.credentials, pw);
       else parsed = filePath ? await api.importMremotengFile(filePath, pw) : await api.importMremoteng(xml, pw);
       needPw = false;
+      // Пароль файла больше не нужен — не держим его в памяти до закрытия диалога
+      filePw = "";
     } catch (e) {
       const t = errText(e);
       if (t === "MREMOTENG_PASSWORD" || t === "TERMINALS_PASSWORD") needPw = true;
@@ -210,6 +217,7 @@
   async function run() {
     if (!parsed) return;
     busy = true;
+    cancelImport = false;
     error = "";
     const failed: string[] = [];
     let conns = 0;
@@ -217,7 +225,7 @@
     let skipped = 0;
     const seen = new Set<string>(skipDupes ? existingKeys.keys() : []);
     const list = parsed.conns.filter((c) => {
-      const k = connKey(c.protocol, c.host, c.port);
+      const k = connKey(c.protocol, c.host, c.port, c.uri);
       if (skipDupes && seen.has(k)) return (skipped++, false);
       seen.add(k);
       return true;
@@ -250,6 +258,7 @@
       }
       let rdgId: string | null = null;
       for (const c of list) {
+        if (cancelImport) break;
         if (!c.gateway) continue;
         const k = connGwKey(c);
         if (gwIds.has(k)) continue;
@@ -274,6 +283,8 @@
       }
 
       for (const c of list) {
+        // Отмена проверяется между записями: импорт не должен запирать диалог на минуты
+        if (cancelImport) break;
         try {
           const fields: Field[] = [];
           if (c.domain) fields.push({ name: "domain", value: c.domain, kind: 0 });
@@ -282,7 +293,8 @@
           const saved = await api.save({
             id: null, kind: 1, orgId: null, collectionIds: [], folderId: await folderFor(c.path),
             name: c.name, notes: c.notes, username: c.username, password: c.password || null,
-            uris: [buildUri(c.protocol as never, c.host, c.port)], fields, favorite: false,
+            // Веб-подключение восстанавливаем по полному адресу — иначе теряется путь страницы
+            uris: [c.protocol === "web" && c.uri ? c.uri : buildUri(c.protocol as never, c.host, c.port)], fields, favorite: false,
           });
           app.upsert(saved);
           conns++;
@@ -291,7 +303,7 @@
         }
         progress.done++;
       }
-      finished = { conns, gws, failed, skipped };
+      finished = { conns, gws, failed, skipped, cancelled: cancelImport };
       for (const rel of folderIds.keys()) app.toggleExpanded("f:" + app.relName([base, rel].filter(Boolean).join("/")), true);
     } catch (e) {
       error = errText(e);
@@ -310,7 +322,7 @@
     <div class="body">
       {#if finished}
         <p>
-          Импортировано подключений: <b>{finished.conns}</b>{#if finished.gws}, создано RD-шлюзов: <b>{finished.gws}</b>{/if}{#if finished.skipped}, пропущено дублей: <b>{finished.skipped}</b>{/if}.
+          {#if finished.cancelled}Импорт отменён. {/if}Импортировано подключений: <b>{finished.conns}</b>{#if finished.gws}, создано RD-шлюзов: <b>{finished.gws}</b>{/if}{#if finished.skipped}, пропущено дублей: <b>{finished.skipped}</b>{/if}.
         </p>
         {#if finished.failed.length}
           <p class="err">Не удалось импортировать:</p>
@@ -389,7 +401,11 @@
             <div class="faint">{progress.done} из {progress.total}…</div>
           {/if}
           <div class="actions">
-            <button class="btn" onclick={onclose} disabled={busy}>Отмена</button>
+            {#if busy}
+              <button class="btn" onclick={() => (cancelImport = true)}>Отменить импорт</button>
+            {:else}
+              <button class="btn" onclick={onclose}>Отмена</button>
+            {/if}
             <button class="btn primary" onclick={run} disabled={busy || !toImport}>
               Импортировать {toImport}
             </button>

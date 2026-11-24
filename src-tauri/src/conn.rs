@@ -38,11 +38,14 @@ impl ConnParams {
         self.opts.get(k).map(|s| s.as_str()).unwrap_or("")
     }
     pub fn flag(&self, k: &str) -> bool {
-        matches!(
-            self.opt(k).to_lowercase().as_str(),
-            "1" | "true" | "yes" | "да" | "on"
-        )
+        is_truthy(self.opt(k))
     }
+}
+
+/// Единый список «истинных» значений флажков для всей программы (фронтенд зеркалит его
+/// в flagValue): записи приходят из импорта и общих коллекций с разным написанием
+pub fn is_truthy(v: &str) -> bool {
+    matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes" | "да" | "on")
 }
 
 pub struct ParsedUri {
@@ -63,15 +66,23 @@ pub fn parse_uri(uri: &str) -> Option<ParsedUri> {
     };
     let (host, port) = if let Some(r) = hp.strip_prefix('[') {
         let (h, after) = r.split_once(']')?;
-        let port = after.strip_prefix(':').and_then(|p| p.parse().ok());
+        let port = match after.strip_prefix(':') {
+            Some(p) if !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) => Some(p.parse::<u16>().ok()?),
+            _ => None,
+        };
         (h.to_string(), port)
     } else if scheme == "serial" {
         // serial://COM3 — порт как «хост», без номера порта
         (hp.to_string(), None)
+    } else if hp.matches(':').count() >= 2 {
+        // Голый IPv6: разбор по последнему двоеточию отрезал бы часть адреса
+        // (fe80::1 → fe80: + порт 1). Порт у IPv6 возможен только в скобках
+        (hp.to_string(), None)
     } else {
         match hp.rsplit_once(':') {
-            Some((h, p)) if p.chars().all(|c| c.is_ascii_digit()) && !p.is_empty() => {
-                (h.to_string(), p.parse().ok())
+            Some((h, p)) if !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) => {
+                // Порт вне u16 — отказ, а не молчаливый порт по умолчанию
+                (h.to_string(), Some(p.parse::<u16>().ok()?))
             }
             _ => (hp.to_string(), None),
         }
@@ -82,7 +93,8 @@ pub fn parse_uri(uri: &str) -> Option<ParsedUri> {
     Some(ParsedUri { scheme, user, host, port })
 }
 
-/// "ДОМЕН\логин" или "логин@домен" → (домен, логин).
+/// "ДОМЕН\логин" → (домен, логин). «логин@домен» (UPN) намеренно остаётся логином целиком:
+/// FreeRDP сам понимает UPN при NLA, а разделение по @ сломало бы такие входы.
 pub fn split_user(raw: &str) -> (String, String) {
     let raw = raw.trim();
     if let Some((d, u)) = raw.split_once('\\') {
@@ -118,7 +130,7 @@ async fn from_vault_depth(vault: &Vault, id: &str, depth: u8) -> Result<ConnPara
         .uris
         .iter()
         .find_map(|u| parse_uri(u).filter(|p| PROTOCOLS.contains(&p.scheme.as_str())))
-        .ok_or("У записи нет адреса вида rdp://, ssh://, telnet://, serial:// или winbox://")?;
+        .ok_or_else(|| format!("У записи нет адреса подключения (поддерживаются схемы: {})", PROTOCOLS.join(", ")))?;
     let opts = fields_map(&cs.fields);
 
     let mut username = if cs.item.username.is_empty() { uri.user.clone() } else { cs.item.username.clone() };
@@ -173,9 +185,20 @@ async fn from_vault_depth(vault: &Vault, id: &str, depth: u8) -> Result<ConnPara
                 .first()
                 .map(|u| {
                     parse_uri(u)
-                        .map(|p| match p.port {
-                            Some(port) => format!("{}:{}", p.host, port),
-                            None => p.host,
+                        .map(|p| {
+                            // IPv6 с портом — в скобках: freerdp_parse_hostname сохраняет скобки,
+                            // потребители адреса шлюза используют его как есть
+                            if p.host.contains(':') {
+                                match p.port {
+                                    Some(port) => format!("[{}]:{}", p.host, port),
+                                    None => p.host,
+                                }
+                            } else {
+                                match p.port {
+                                    Some(port) => format!("{}:{}", p.host, port),
+                                    None => p.host,
+                                }
+                            }
                         })
                         .unwrap_or_else(|| u.clone())
                 })
@@ -184,10 +207,7 @@ async fn from_vault_depth(vault: &Vault, id: &str, depth: u8) -> Result<ConnPara
                 return Err(format!("У записи шлюза «{}» не указан адрес", gw.item.name));
             }
             let gf = fields_map(&gw.fields);
-            let same = matches!(
-                gf.get("samecreds").map(|v| v.to_lowercase()).as_deref(),
-                Some("1" | "true" | "yes" | "да" | "on")
-            );
+            let same = gf.get("samecreds").map(|v| is_truthy(v)).unwrap_or(false);
             // «Те же данные»: шлюз авторизуется учёткой самого подключения.
             // Так же поступаем, если у записи шлюза нет ни логина, ни пароля.
             if same || (gw.item.username.trim().is_empty() && gw.password.is_empty()) {
@@ -276,5 +296,109 @@ mod tests {
         let c = from_quick("admin@srv", "ssh").unwrap();
         assert_eq!((c.protocol.as_str(), c.username.as_str(), c.host.as_str()), ("ssh", "admin", "srv"));
         assert!(from_quick("ftp://x", "ssh").is_err());
+    }
+
+    /// v33: голый IPv6 не режется по двоеточию; порт вне u16 — отказ; userinfo с @
+    #[test]
+    fn uri_ipv6_ports_userinfo() {
+        let p = parse_uri("rdp://fe80::1").unwrap();
+        assert_eq!((p.host.as_str(), p.port), ("fe80::1", None));
+        let p = parse_uri("rdp://[fe80::1]").unwrap();
+        assert_eq!((p.host.as_str(), p.port), ("fe80::1", None));
+        let p = parse_uri("rdp://[fe80::1]:3390").unwrap();
+        assert_eq!((p.host.as_str(), p.port), ("fe80::1", Some(3390)));
+        assert!(parse_uri("rdp://h:99999").is_none(), "порт вне u16 принят");
+        assert!(parse_uri("rdp://[::1]:99999").is_none(), "порт вне u16 в скобках принят");
+        let p = parse_uri("ssh://u@d@h:22").unwrap();
+        assert_eq!((p.user.as_str(), p.host.as_str(), p.port), ("u@d", "h", Some(22)));
+        assert_eq!(parse_uri("ssh://h:022").unwrap().port, Some(22));
+        assert_eq!(parse_uri("ssh://h:").unwrap().host, "h:");
+        // serial не режется даже с двоеточиями
+        assert_eq!(parse_uri("serial://COM3").unwrap().host, "COM3");
+    }
+
+    /// v37: единый список истинных значений
+    #[test]
+    fn truthy_list() {
+        for v in ["1", "true", "TRUE", "yes", "да", "on", " true "] {
+            assert!(is_truthy(v), "{} не истинно", v);
+        }
+        for v in ["", "0", "false", "no", "нет", "off", "2"] {
+            assert!(!is_truthy(v), "{} истинно", v);
+        }
+    }
+}
+
+/// v79а: from_vault на настоящем локальном хранилище (учётки, шлюз, ключ, jump)
+#[cfg(test)]
+mod vault_tests {
+    use super::*;
+    use crate::bw::ItemInput;
+
+    fn input(name: &str, uris: Vec<String>, fields: Vec<FieldV>, username: &str, password: Option<&str>) -> ItemInput {
+        ItemInput {
+            id: None,
+            kind: Some(1),
+            org_id: None,
+            collection_ids: vec![],
+            folder_id: None,
+            name: name.into(),
+            notes: String::new(),
+            username: username.into(),
+            password: password.map(String::from),
+            uris,
+            fields,
+            favorite: false,
+        }
+    }
+
+    fn field(name: &str, value: &str) -> FieldV {
+        FieldV { name: name.into(), value: Some(value.into()), kind: 0 }
+    }
+
+    #[tokio::test]
+    async fn from_vault_credential_gateway_key_jump() {
+        let dir = std::env::temp_dir().join(format!("connmgr-fromvault-{}", uuid::Uuid::new_v4()));
+        let v = Vault::new(dir.clone());
+        v.create_local("correct horse battery").await.unwrap();
+
+        let cred = v.save_item(input("Учётка", vec![], vec![], "CORP\\svc", Some("cred-pw"))).await.unwrap();
+        // samecreds=1 — истинно по общему списку (v37), шлюз берёт учётку подключения
+        let _gw = v.save_item(input("Шлюз", vec!["rdgw://gw.corp:443".into()], vec![field("samecreds", "1")], "", None)).await.unwrap();
+        let conn = v.save_item(input(
+            "Сервер",
+            vec!["rdp://srv:3390".into()],
+            vec![field("credential", &cred.id), field("gateway", "Шлюз")],
+            "",
+            None,
+        )).await.unwrap();
+        let p = from_vault(&v, &conn.id).await.unwrap();
+        assert_eq!((p.host.as_str(), p.port), ("srv", Some(3390)));
+        assert_eq!((p.username.as_str(), p.domain.as_str(), p.password.as_str()), ("svc", "CORP", "cred-pw"));
+        let (addr, gu, gd, gp) = p.gateway.expect("шлюз должен раскрыться");
+        assert_eq!((addr.as_str(), gu.as_str(), gd.as_str(), gp.as_str()), ("gw.corp:443", "svc", "CORP", "cred-pw"));
+
+        // SSH-ключ из заметки записи kind=5
+        let mut key_input = input("Ключ", vec![], vec![], "", None);
+        key_input.kind = Some(5);
+        key_input.notes = "-----BEGIN OPENSSH PRIVATE KEY-----\ntest\n-----END OPENSSH PRIVATE KEY-----".into();
+        let _key = v.save_item(key_input).await.unwrap();
+        let sshconn = v.save_item(input("SSH", vec!["ssh://host".into()], vec![field("sshkey", "Ключ")], "root", None)).await.unwrap();
+        let sp = from_vault(&v, &sshconn.id).await.unwrap();
+        assert!(sp.ssh_private_key.contains("PRIVATE KEY"));
+
+        // jump раскрывается, собственный jump промежуточного хоста — нет
+        let jump = v.save_item(input("Jump", vec!["ssh://jump.host:2222".into()], vec![], "juser", Some("jpw"))).await.unwrap();
+        let jc = v.save_item(input("Through", vec!["ssh://final".into()], vec![field("jump", &jump.id)], "", None)).await.unwrap();
+        let jp = from_vault(&v, &jc.id).await.unwrap();
+        let j = jp.jump.expect("jump должен раскрыться");
+        assert_eq!((j.host.as_str(), j.port, j.username.as_str()), ("jump.host", Some(2222), "juser"));
+        assert!(j.jump.is_none());
+
+        // Сам себе промежуточный хост — отказ
+        let selfj2 = v.save_item(input("Self2", vec!["ssh://self2".into()], vec![field("jump", "Self2")], "", None)).await.unwrap();
+        assert!(from_vault(&v, &selfj2.id).await.is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

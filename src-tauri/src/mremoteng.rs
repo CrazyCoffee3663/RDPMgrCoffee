@@ -65,6 +65,18 @@ enum Mode {
 struct Crypto {
     mode: Mode,
     password: String,
+    /// Ключ PBKDF2 по соли: mRemoteNG кладёт свою соль в каждый атрибут, но повторная
+    /// расшифровка того же блоба не должна снова гонять KDF. Ключи стираются при Drop.
+    keys: std::sync::Mutex<HashMap<[u8; 16], [u8; 32]>>,
+}
+
+impl Drop for Crypto {
+    fn drop(&mut self) {
+        for (_, mut k) in self.keys.lock().unwrap().drain() {
+            zeroize::Zeroize::zeroize(&mut k);
+        }
+        zeroize::Zeroize::zeroize(&mut self.password);
+    }
 }
 
 impl Crypto {
@@ -82,9 +94,14 @@ impl Crypto {
                 }
                 let (salt, rest) = data.split_at(16);
                 let (nonce, ct) = rest.split_at(16);
-                let mut key = [0u8; 32];
-                pbkdf2::pbkdf2_hmac::<sha1::Sha1>(self.password.as_bytes(), salt, iterations, &mut key);
-                let c = AesGcm::<Aes256, U16>::new_from_slice(&key).map_err(|_| ())?;
+                let salt_arr: [u8; 16] = salt.try_into().map_err(|_| ())?;
+                let mut keys = self.keys.lock().unwrap();
+                let key = keys.entry(salt_arr).or_insert_with(|| {
+                    let mut key = [0u8; 32];
+                    pbkdf2::pbkdf2_hmac::<sha1::Sha1>(self.password.as_bytes(), salt, iterations, &mut key);
+                    key
+                });
+                let c = AesGcm::<Aes256, U16>::new_from_slice(key).map_err(|_| ())?;
                 c.decrypt(nonce.into(), Payload { msg: ct, aad: salt }).map_err(|_| ())?
             }
             Mode::Cbc => {
@@ -148,8 +165,14 @@ struct Walker<'a> {
 }
 
 impl Walker<'_> {
-    fn dec(&self, v: Option<&String>) -> String {
-        v.map(|v| self.crypto.decrypt(v).unwrap_or_default()).unwrap_or_default()
+    /// Пустой атрибут → пустая строка; непустой, но не расшифровавшийся → ошибка:
+    /// молчаливый пустой пароль выдавал бы повреждённую запись за рабочую
+    fn dec(&self, v: Option<&String>) -> Result<String, ()> {
+        match v {
+            None => Ok(String::new()),
+            Some(v) if v.trim().is_empty() => Ok(String::new()),
+            Some(v) => self.crypto.decrypt(v),
+        }
     }
 
     fn walk(&mut self, parent_node: roxmltree::Node, parent: &HashMap<String, String>, path: &[String]) {
@@ -221,15 +244,34 @@ impl Walker<'_> {
             }
         }
 
+        let password = match self.dec(a.get("Password")) {
+            Ok(p) => p,
+            Err(_) => {
+                self.out.skipped.push(format!("{} (пароль не расшифрован)", name));
+                return;
+            }
+        };
+
         let gateway = if protocol == "rdp"
             && matches!(get("RDGatewayUsageMethod").as_str(), "Always" | "Detect")
             && !get("RDGatewayHostname").trim().is_empty()
         {
             let same = get("RDGatewayUseConnectionCredentials") != "No";
+            let gpassword = if same {
+                String::new()
+            } else {
+                match self.dec(a.get("RDGatewayPassword")) {
+                    Ok(p) => p,
+                    Err(_) => {
+                        self.out.skipped.push(format!("{} (пароль шлюза не расшифрован)", name));
+                        return;
+                    }
+                }
+            };
             Some(Gateway {
                 host: get("RDGatewayHostname").trim().to_string(),
                 username: if same { String::new() } else { get("RDGatewayUsername") },
-                password: if same { String::new() } else { self.dec(a.get("RDGatewayPassword")) },
+                password: gpassword,
                 domain: if same { String::new() } else { get("RDGatewayDomain") },
                 same,
             })
@@ -249,7 +291,7 @@ impl Walker<'_> {
             host,
             port,
             username: get("Username"),
-            password: self.dec(a.get("Password")),
+            password,
             domain: get("Domain"),
             notes: get("Descr"),
             opts,
@@ -266,14 +308,20 @@ pub fn parse(xml: &str, password: Option<&str>) -> Result<Import, String> {
         return Err("Это не файл подключений mRemoteNG (ожидается confCons.xml)".into());
     }
     let mode = match root.attribute("BlockCipherMode") {
-        Some(m) if m.eq_ignore_ascii_case("GCM") => Mode::Gcm {
-            iterations: root.attribute("KdfIterations").and_then(|v| v.parse().ok()).unwrap_or(1000),
-        },
+        Some(m) if m.eq_ignore_ascii_case("GCM") => {
+            let iterations: u32 = root.attribute("KdfIterations").and_then(|v| v.parse().ok()).unwrap_or(1000);
+            // Итерации приходят из файла: без потолка специально подготовленный confCons.xml
+            // держал бы CPU минутами (DoS через импорт). mRemoteNG по умолчанию — 1000.
+            if !(1..=10_000_000).contains(&iterations) {
+                return Err(format!("Недопустимое число итераций KDF: {}", iterations));
+            }
+            Mode::Gcm { iterations }
+        }
         Some(m) => return Err(format!("Режим шифрования {} не поддерживается", m)),
         None => Mode::Cbc,
     };
     let pw = password.filter(|p| !p.is_empty()).unwrap_or(DEFAULT_PASSWORD).to_string();
-    let crypto = Crypto { mode, password: pw };
+    let crypto = Crypto { mode, password: pw, keys: Default::default() };
 
     // Проверка пароля по атрибуту Protected
     if let Some(prot) = root.attribute("Protected") {
@@ -383,5 +431,56 @@ mod tests {
         let xml = format!(r#"<Connections Name="C"><Node Name="x" Type="Connection" Protocol="RDP" Hostname="h" Password="{b}"/></Connections>"#);
         let r = parse(&xml, None).unwrap();
         assert_eq!(r.conns[0].password, "pass");
+    }
+
+    /// v28: непустой, но битый пароль — запись в skipped, а не молчаливый пустой пароль
+    #[test]
+    fn corrupt_password_is_skipped_not_empty() {
+        let prot = enc_gcm("ThisIsNotProtected", "mR3m", 1000);
+        let xml = format!(
+            r#"<Connections Name="C" BlockCipherMode="GCM" KdfIterations="1000" Protected="{prot}"><Node Name="x" Type="Connection" Protocol="RDP" Hostname="h" Password="!!!not-base64!!!"/></Connections>"#
+        );
+        let r = parse(&xml, None).unwrap();
+        assert!(r.conns.is_empty(), "битый пароль не должен давать пустой пароль");
+        assert_eq!(r.skipped, vec!["x (пароль не расшифрован)".to_string()]);
+        // Пустой атрибут пароля — по-прежнему допустим (пароля просто нет)
+        let xml2 = format!(
+            r#"<Connections Name="C" BlockCipherMode="GCM" KdfIterations="1000" Protected="{prot}"><Node Name="y" Type="Connection" Protocol="RDP" Hostname="h" Password=""/></Connections>"#
+        );
+        let r2 = parse(&xml2, None).unwrap();
+        assert_eq!(r2.conns.len(), 1);
+        assert_eq!(r2.conns[0].password, "");
+    }
+
+    /// v30: итерации KDF из файла ограничены (0 и миллиарды — отказ)
+    #[test]
+    fn kdf_iterations_capped() {
+        for it in ["0", "4000000000", "10000001"] {
+            let xml = format!(
+                r#"<Connections Name="C" BlockCipherMode="GCM" KdfIterations="{it}"><Node Name="x" Type="Connection" Protocol="RDP" Hostname="h"/></Connections>"#
+            );
+            assert!(parse(&xml, None).is_err(), "итерации {} приняты", it);
+        }
+    }
+
+    /// v79ж: InheritPassword без собственного Password; UseConnectionCredentials=Yes → same
+    #[test]
+    fn inherit_password_without_own_and_gateway_yes() {
+        let pw = enc_gcm("parent-pw", "mR3m", 1000);
+        let prot = enc_gcm("ThisIsNotProtected", "mR3m", 1000);
+        let xml = format!(
+            r#"<Connections Name="C" BlockCipherMode="GCM" KdfIterations="1000" Protected="{prot}">
+  <Node Name="F" Type="Container" Password="{pw}">
+    <Node Name="c" Type="Connection" Protocol="RDP" Hostname="h" InheritPassword="true"
+      RDGatewayUsageMethod="Always" RDGatewayHostname="gw" RDGatewayUseConnectionCredentials="Yes"/>
+  </Node>
+</Connections>"#
+        );
+        let r = parse(&xml, None).unwrap();
+        assert_eq!(r.conns.len(), 1);
+        assert_eq!(r.conns[0].password, "parent-pw");
+        let g = r.conns[0].gateway.as_ref().unwrap();
+        assert!(g.same);
+        assert_eq!(g.password, "");
     }
 }

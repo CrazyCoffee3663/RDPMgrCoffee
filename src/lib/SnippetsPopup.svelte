@@ -17,8 +17,11 @@
     const all = app.settings.snippets;
     return s ? all.filter((x) => x.name.toLowerCase().includes(s) || x.cmd.toLowerCase().includes(s)) : all;
   });
-  /** Терминальные вкладки с живой сессией */
-  const terms = $derived(app.tabs.filter((t) => t.protocol !== "rdp" && t.sessionId !== null && t.state === "connected"));
+  /** Терминальные вкладки с живой сессией: текст понимают только SSH/Telnet/COM.
+      VNC получил бы мусор в потоке RFB, RDP и веб-вкладки не принимают session_input. */
+  const terms = $derived(
+    app.tabs.filter((t) => ["ssh", "telnet", "serial"].includes(t.protocol) && t.sessionId !== null && t.state === "connected"),
+  );
   const activeTerm = $derived(terms.find((t) => t.key === app.activeTab));
 
   $effect(() => {

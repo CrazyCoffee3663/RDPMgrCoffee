@@ -32,7 +32,14 @@ fi
 # Исправления из рецепта MSYS2 (scripts/freerdp-patches), один раз
 if [ ! -f "$SRC/.rdpmgr-patched" ]; then
   for p in "$HERE"/scripts/freerdp-patches/*.patch; do
-    [ -f "$p" ] && patch -d "$SRC" -p1 --forward < "$p"
+    [ -f "$p" ] || continue
+    if patch -d "$SRC" -p1 --forward --dry-run < "$p" >/dev/null 2>&1; then
+      patch -d "$SRC" -p1 --forward < "$p"
+    elif ! patch -d "$SRC" -p1 -R --dry-run < "$p" >/dev/null 2>&1; then
+      # уже применён в этой версии upstream — пропускаем; иначе патч обязателен
+      echo "Патч не применился к $VER: $p" >&2
+      exit 1
+    fi
   done
   touch "$SRC/.rdpmgr-patched"
 fi
@@ -61,6 +68,10 @@ cmake --install "$BUILD"
 # Собрать wfreerdp.exe и его зависимости (только DLL из /ucrt64/bin и установки FreeRDP)
 rm -rf "$OUT.new" && mkdir -p "$OUT.new"
 cp "$PREFIX/bin/wfreerdp.exe" "$OUT.new/"
+# cmake --install кладёт в bin не все библиотеки (libwfreerdp-client3.dll остаётся
+# только в дереве сборки) — индекс DLL дерева сборки как запасной источник
+declare -A BUILT
+while IFS= read -r p; do BUILT["${p##*/}"]="$p"; done < <(find "$BUILD" -type f -name '*.dll')
 seen=""
 queue="$OUT.new/wfreerdp.exe"
 while [ -n "$queue" ]; do
@@ -75,11 +86,19 @@ while [ -n "$queue" ]; do
         break
       fi
     done
+    if [ ! -f "$OUT.new/$dll" ] && [ -n "${BUILT[$dll]:-}" ]; then
+      cp "${BUILT[$dll]}" "$OUT.new/"
+      queue="$queue"$'\n'"$OUT.new/$dll"
+    fi
   done
   queue="${queue#$'\n'}"
 done
 # Плагины каналов FreeRDP (если собраны отдельными DLL)
 if [ -d "$PREFIX/lib/freerdp3" ]; then cp -r "$PREFIX/lib/freerdp3" "$OUT.new/"; fi
+# Провайдер OpenSSL legacy (MD4) нужен для NTLM; грузится через OPENSSL_MODULES,
+# а не импортом — objdump-обход его не видит
+mkdir -p "$OUT.new/ossl-modules"
+cp /ucrt64/lib/ossl-modules/legacy.dll "$OUT.new/ossl-modules/"
 # Версия — для проверки обновлений в программе
 echo "$VER" > "$OUT.new/version.txt"
 rm -rf "$OUT.old"; [ -d "$OUT" ] && mv "$OUT" "$OUT.old"

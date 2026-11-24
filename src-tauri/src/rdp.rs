@@ -172,12 +172,26 @@ mod win {
     /// Страховка: окно FreeRDP должно быть видимым и занимать всю область хоста.
     /// FreeRDP иногда создаёт/пересоздаёт своё окно (после переподключения, через шлюз)
     /// уже после нашего последнего WM_SIZE, и оно остаётся крошечным или скрытым.
-    pub fn fixup(hwnd: isize, pid: u32) {
+    pub fn fixup(hwnd: isize, pid: u32, full: bool) {
         unsafe {
             let host = HWND(hwnd as _);
-            adopt(host, pid);
             if !IsWindowVisible(host).as_bool() {
                 return;
+            }
+            // Быстрый путь: дочернее окно уже встроено и занимает всю клиентскую область —
+            // не перечисляем все окна системы (EnumWindows на UI-потоке каждые 400 мс на сеанс).
+            // adopt нужен при отсутствии дочернего окна (фаза подключения) и на полном тике (диалоги)
+            let settled = GetWindow(host, GW_CHILD).ok().is_some_and(|c| {
+                let mut rc = Default::default();
+                let mut cr = Default::default();
+                GetClientRect(host, &mut rc).is_ok()
+                    && GetWindowRect(c, &mut cr).is_ok()
+                    && cr.right - cr.left == rc.right
+                    && cr.bottom - cr.top == rc.bottom
+                    && IsWindowVisible(c).as_bool()
+            });
+            if full || !settled {
+                adopt(host, pid);
             }
             let mut rc = Default::default();
             if GetClientRect(host, &mut rc).is_err() {
@@ -418,13 +432,18 @@ fn use_kerberos(p: &ConnParams) -> bool {
     !p.opt("auth").eq_ignore_ascii_case("ntlm")
 }
 
-/// Ключи FreeRDP, которые нельзя задать через поле «freerdp» записи: они ослабляют защиту
-/// (отключают проверку сертификата или NLA/TLS, подключают диски, пишут учётные данные в лог)
-/// или подменяют то, чем управляет программа. Запись может прийти из общей коллекции.
-const DENY_EXTRA: [&str; 24] = [
-    "cert", "drive", "drives", "home-drive", "redirect-prefer", "proxy", "log-level", "log-filters",
-    "args-from", "p", "password", "u", "d", "v", "gateway", "g", "gp", "gu", "gd", "sec", "tls",
-    "auth-pkg-list", "sspi-module", "pth",
+/// Безвредные ключи FreeRDP для поля «freerdp» записи: только изображение, звук и
+/// производительность. Список разрешительный (fail-closed): запись может прийти из общей
+/// коллекции, а пространство ключей FreeRDP не ограничено — запретительный список обходится
+/// алиасами и ключами вроде /port (подменяет порт из /v) или /usb (проброс токенов).
+/// Ключи, которыми управляет программа (адрес, учётные данные, сертификат, буфер обмена,
+/// диски, размер окна, шлюз), сюда не входят.
+const ALLOW_EXTRA: [&str; 24] = [
+    "network", "fonts", "bpp", "compression", "gfx", "video", "audio-mode",
+    "rfx", "nscodec", "nsc", "jpeg", "jpeg-quality",
+    "bitmap-cache", "offscreen-cache", "glyph-cache", "gdi",
+    "wallpaper", "window-drag", "menu-anims", "themes",
+    "tcp-keepalive", "heartbeat", "timeout", "kbd",
 ];
 
 /// Имя ключа FreeRDP: «/cert:ignore» → «cert», «+drives» → «drives», «-sec-nla» → «sec-nla»
@@ -434,10 +453,15 @@ fn extra_key(a: &str) -> String {
 
 fn check_extra(a: &str) -> Result<(), String> {
     let k = extra_key(a);
-    let base = k.split('-').next().unwrap_or("");
-    if DENY_EXTRA.contains(&k.as_str()) || ["sec", "tls", "cert", "auth"].contains(&base) || k.starts_with("drive") {
+    // Алиасы FreeRDP приводим к каноническому имени, чтобы проверка не зависела от написания
+    let k = match k.as_str() {
+        "gw" => "gateway",
+        "pass-the-hash" => "pth",
+        _ => k.as_str(),
+    };
+    if !ALLOW_EXTRA.contains(&k) {
         return Err(format!(
-            "Параметр FreeRDP «{}» нельзя задать в поле «Дополнительно»: он ослабляет защиту подключения или управляется программой",
+            "Параметр FreeRDP «{}» нельзя задать в поле «Дополнительно»: разрешены только безвредные ключи изображения и производительности (network, fonts, bpp, compression, gfx, video, кодеки, кеши)",
             a
         ));
     }
@@ -466,14 +490,21 @@ fn build_args(p: &ConnParams, hwnd: isize, w: i32, h: i32, pin: Option<&str>) ->
             no_newlines(label, v)?;
         }
     }
-    let host = match p.port {
-        Some(port) => format!("{}:{}", p.host, port),
-        None => p.host.clone(),
+    // IPv6 без скобок неотличим от host:port (fe80::1:3389) — /v: всегда со скобками и портом
+    let host = if p.host.contains(':') {
+        format!("[{}]:{}", p.host, p.port.unwrap_or(3389))
+    } else {
+        match p.port {
+            Some(port) => format!("{}:{}", p.host, port),
+            None => p.host.clone(),
+        }
     };
-    // Сертификат: отпечаток, подтверждённый пользователем (rdpcert), иначе запоминание при первом входе
-    let cert = match p.opt("cert") {
-        "ignore" => "ignore".to_string(),
-        _ => pin.unwrap_or("").to_string(),
+    // Сертификат: отпечаток, подтверждённый пользователем (rdpcert), иначе запоминание при первом входе.
+    // cert_check сравнивает без учёта регистра — здесь тоже, иначе «Ignore» молча стал бы tofu
+    let cert = if p.opt("cert").eq_ignore_ascii_case("ignore") {
+        "ignore".to_string()
+    } else {
+        pin.unwrap_or("").to_string()
     };
     let cert = if cert.is_empty() { "tofu".to_string() } else { cert };
     let mut a: Vec<String> = vec![
@@ -502,6 +533,14 @@ fn build_args(p: &ConnParams, hwnd: isize, w: i32, h: i32, pin: Option<&str>) ->
             a.push("/dynamic-resolution".into());
         }
         r => {
+            // Только ШИРИНАxВЫСОТА: свободная строка ушла бы в /size как есть и могла
+            // содержать перевод строки с чужим ключом
+            let valid = r.split_once('x').is_some_and(|(rw, rh)| {
+                !rw.is_empty() && !rh.is_empty() && rw.bytes().all(|b| b.is_ascii_digit()) && rh.bytes().all(|b| b.is_ascii_digit())
+            });
+            if !valid {
+                return Err(format!("Неверное разрешение «{}»: ожидается ШИРИНАxВЫСОТА, например 1280x720", r));
+            }
             a.push(format!("/size:{}", r));
             a.push("/smart-sizing".into());
         }
@@ -526,7 +565,7 @@ fn build_args(p: &ConnParams, hwnd: isize, w: i32, h: i32, pin: Option<&str>) ->
     }
     match p.opt("drives") {
         "" | "0" | "false" | "no" => {}
-        "1" | "true" | "yes" | "all" | "да" => a.push("/drives".into()),
+        v if crate::conn::is_truthy(v) || v.eq_ignore_ascii_case("all") => a.push("/drives".into()),
         path => a.push(format!("/drive:share,{}", path)),
     }
     if p.flag("printers") {
@@ -565,6 +604,11 @@ fn build_args(p: &ConnParams, hwnd: isize, w: i32, h: i32, pin: Option<&str>) ->
     for extra in p.opt("freerdp").split_whitespace() {
         check_extra(extra)?;
         a.push(extra.to_string());
+    }
+    // Параметры уходят в FreeRDP построчно: ни один собранный аргумент (путь диска,
+    // разрешение, заголовок) не вправе содержать перевод строки — это был бы чужой ключ
+    for arg in &a {
+        no_newlines("Параметр FreeRDP", arg)?;
     }
     Ok(a)
 }
@@ -623,6 +667,9 @@ async fn cert_check(app: &AppHandle, id: u32, p: &ConnParams) -> Result<Option<S
             if known.as_deref() == Some(fp.as_str()) {
                 return Ok(());
             }
+            // UNCHECKED — метка «проверить заранее не удалось», а не отпечаток: впервые
+            // полученный настоящий отпечаток — это новый сервер, а не «смена» (UNCHECKED в «Был» бессмыслен)
+            let known = known.filter(|k| k != "UNCHECKED");
             let (title, msg, danger) = match &known {
                 Some(old) => (
                     "СЕРТИФИКАТ ИЗМЕНИЛСЯ",
@@ -659,18 +706,15 @@ async fn cert_check(app: &AppHandle, id: u32, p: &ConnParams) -> Result<Option<S
             if crate::sessions::ask(app, id, "confirm", title, &msg, danger).await.is_none() {
                 return Err("Сертификат не принят — подключение отменено".to_string());
             }
-            crate::rdpcert::remember(&path, &host_id, &fp);
+            crate::rdpcert::remember(&path, &host_id, &fp)?;
             Ok::<(), String>(())
         }
     };
     if let Some((addr, ..)) = &p.gateway {
         // Шлюз проверяем сами; сервер за шлюзом напрямую недоступен — для него FreeRDP запомнит
         // сертификат при первом входе (tofu)
-        let (h, port) = match addr.rsplit_once(':') {
-            Some((h, pt)) if !h.ends_with(':') && pt.parse::<u16>().is_ok() => (h.to_string(), pt.parse().unwrap()),
-            _ => (addr.clone(), 443u16),
-        };
-        let host_id = format!("{}:{}", h, port);
+        let (h, port) = split_host_port(addr, 443);
+        let host_id = if h.contains(':') { format!("[{}]:{}", h, port) } else { format!("{}:{}", h, port) };
         match crate::rdpcert::fetch(&h, port, false).await {
             Ok(fp) => confirm("RD-шлюза".into(), host_id, fp).await?,
             Err(e) if e.starts_with(crate::rdpcert::TLS_UNSUPPORTED) => {
@@ -681,7 +725,7 @@ async fn cert_check(app: &AppHandle, id: u32, p: &ConnParams) -> Result<Option<S
         return Ok(None);
     }
     let port = p.port.unwrap_or(3389);
-    let host_id = format!("{}:{}", p.host, port);
+    let host_id = if p.host.contains(':') { format!("[{}]:{}", p.host, port) } else { format!("{}:{}", p.host, port) };
     match crate::rdpcert::fetch(&p.host, port, true).await {
         Ok(fp) => {
             confirm("RDP-сервера".into(), host_id, fp.clone()).await?;
@@ -695,21 +739,38 @@ async fn cert_check(app: &AppHandle, id: u32, p: &ConnParams) -> Result<Option<S
     }
 }
 
+/// host:port с поддержкой IPv6: [адрес]:port, голый IPv6 (порт только в скобках), host:port.
+fn split_host_port(addr: &str, default_port: u16) -> (String, u16) {
+    if let Some(rest) = addr.strip_prefix('[') {
+        if let Some((h, tail)) = rest.split_once(']') {
+            let port = tail.strip_prefix(':').and_then(|p| p.parse().ok()).unwrap_or(default_port);
+            return (h.to_string(), port);
+        }
+    }
+    if addr.matches(':').count() >= 2 {
+        return (addr.to_string(), default_port);
+    }
+    match addr.rsplit_once(':') {
+        Some((h, pt)) if !h.is_empty() && pt.parse::<u16>().is_ok() => (h.to_string(), pt.parse().unwrap()),
+        _ => (addr.to_string(), default_port),
+    }
+}
+
 /// Сервер говорит только на старых версиях TLS/шифрах, сертификат заранее не получить.
-/// Один раз спросить и дальше доверить проверку FreeRDP (хранилище сертификатов Windows,
-/// иначе — запоминание при первом входе).
+/// Один раз спросить и дальше доверить FreeRDP режим tofu: сертификат запоминается при
+/// первом входе автоматически, без проверки центра сертификации.
 async fn unchecked(app: &AppHandle, id: u32, path: &std::path::Path, what: &str, host_id: &str) -> Result<(), String> {
     if crate::rdpcert::known(path, host_id).as_deref() == Some("UNCHECKED") {
         return Ok(());
     }
     let msg = format!(
-        "Не удалось заранее проверить сертификат {} {}: сервер использует устаревшие параметры TLS.\n\nСертификат проверит сам FreeRDP — по доверенным центрам сертификации Windows, а самоподписанный запомнит при первом входе.\n\nПодключиться? Вопрос больше не появится для этого адреса.",
+        "Не удалось заранее проверить сертификат {} {}: сервер использует устаревшие параметры TLS.\n\nFreeRDP доверит сертификату сервера при первом входе автоматически (режим «доверие при первом подключении», без проверки центра сертификации). Перехват в момент первого подключения остался бы незамеченным.\n\nПодключиться? Вопрос больше не появится для этого адреса.",
         what, host_id
     );
     if crate::sessions::ask(app, id, "confirm", "Сертификат не проверен заранее", &msg, false).await.is_none() {
         return Err("Подключение отменено".into());
     }
-    crate::rdpcert::remember(path, host_id, "UNCHECKED");
+    crate::rdpcert::remember(path, host_id, "UNCHECKED")?;
     Ok(())
 }
 
@@ -726,138 +787,162 @@ pub async fn open(app: &AppHandle, id: u32, p: ConnParams, x: i32, y: i32, w: i3
     #[cfg(windows)]
     {
         let hwnd = on_main(app, move || win::create(parent, id)).await??;
-        on_main(app, move || {
-            win::place(hwnd, parent, x, y, w, h, true);
-            win::focus(hwnd);
-        })
-        .await?;
-        let args = build_args(&p, hwnd, w, h, pin.as_deref())?;
+        // Всё после создания окна — под единой обработкой ошибок: любой отказ обязан
+        // уничтожить hwnd и убить уже запущенный процесс, иначе окно/процесс осиротеют
+        let res = async {
+            on_main(app, move || {
+                win::place(hwnd, parent, x, y, w, h, true);
+                win::focus(hwnd);
+            })
+            .await?;
+            let args = build_args(&p, hwnd, w, h, pin.as_deref())?;
 
-        // Журнал на диск — только если включён в настройках (там адреса и логины).
-        // Без журнала вывод FreeRDP (только ошибки) держим в памяти — для сообщения об ошибке.
-        let last_log = std::env::temp_dir().join("connmgr-rdp-last.log");
-        let log_path = std::env::temp_dir().join(format!("connmgr-rdp-{}-{}.log", std::process::id(), id));
-        if !log_enabled {
-            let _ = std::fs::remove_file(&last_log);
-        }
-        let exe = FREERDP_EXE.get().cloned().unwrap_or_else(|| PathBuf::from("wfreerdp.exe"));
-        let mut cmd = Command::new(&exe);
-        // Провайдер OpenSSL legacy (MD4) нужен для NTLM — без него не проходит
-        // вход на RD-шлюз и NLA по паролю
-        if let Some(dir) = exe.parent().map(|d| d.join("ossl-modules")).filter(|d| d.is_dir()) {
-            cmd.env("OPENSSL_MODULES", dir);
-        }
-        // С журналом — этапы подключения (видно, где задержка); без — только ошибки
-        cmd.env("WLOG_LEVEL", if log_enabled { "INFO" } else { "ERROR" });
-        // Встроенный NTLM FreeRDP вместо системного SSPI — без задержек на поиск KDC
-        if !use_kerberos(&p) {
-            cmd.env("WINPR_NATIVE_SSPI", "0");
-        }
-        cmd.arg("/args-from:stdin").stdin(Stdio::piped());
-        if log_enabled {
-            let log = std::fs::File::create(&log_path).map_err(|e| e.to_string())?;
-            let log2 = log.try_clone().map_err(|e| e.to_string())?;
-            cmd.stdout(Stdio::from(log)).stderr(Stdio::from(log2));
-        } else {
-            cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-        }
-        {
-            use std::os::windows::process::CommandExt;
-            cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
-        }
-        let mut child = match cmd.spawn() {
-            Ok(c) => c,
-            Err(e) => {
-                let _ = on_main(app, move || win::destroy(hwnd)).await;
-                return Err(format!("Не удалось запустить FreeRDP ({}): {}", exe.display(), e));
+            // Журнал на диск — только если включён в настройках (там адреса и логины).
+            // Без журнала вывод FreeRDP (только ошибки) держим в памяти — для сообщения об ошибке.
+            let last_log = std::env::temp_dir().join("connmgr-rdp-last.log");
+            let log_path = std::env::temp_dir().join(format!("connmgr-rdp-{}-{}.log", std::process::id(), id));
+            if !log_enabled {
+                let _ = std::fs::remove_file(&last_log);
             }
-        };
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin
-                .write_all(args.join("\n").as_bytes())
-                .map_err(|e| format!("Не удалось передать параметры FreeRDP: {}", e))?;
-        }
-        let pid = child.id();
-        let job = {
-            use std::os::windows::io::AsRawHandle;
-            win::job_new(child.as_raw_handle() as isize)
-        };
-        // Вывод FreeRDP без журнала: последние строки — в памяти
-        let mem_log: Arc<Mutex<std::collections::VecDeque<String>>> = Default::default();
-        for pipe in [
-            child.stdout.take().map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
-            child.stderr.take().map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            let buf = mem_log.clone();
-            std::thread::spawn(move || {
-                use std::io::BufRead;
-                for line in std::io::BufReader::new(pipe).lines().map_while(Result::ok) {
-                    let mut b = buf.lock().unwrap();
-                    b.push_back(line);
-                    if b.len() > 200 {
-                        b.pop_front();
+            // Только существующий файл: относительный запасной путь искался бы в текущем
+            // каталоге, куда можно подложить чужой wfreerdp.exe
+            let exe = FREERDP_EXE
+                .get()
+                .filter(|p| p.is_file())
+                .cloned()
+                .ok_or("FreeRDP не найден — выполните scripts/build-freerdp.sh (см. README)")?;
+            let mut cmd = Command::new(&exe);
+            // Провайдер OpenSSL legacy (MD4) нужен для NTLM — без него не проходит
+            // вход на RD-шлюз и NLA по паролю
+            if let Some(dir) = exe.parent().map(|d| d.join("ossl-modules")).filter(|d| d.is_dir()) {
+                cmd.env("OPENSSL_MODULES", dir);
+            }
+            // С журналом — этапы подключения (видно, где задержка); без — только ошибки
+            cmd.env("WLOG_LEVEL", if log_enabled { "INFO" } else { "ERROR" });
+            // Встроенный NTLM FreeRDP вместо системного SSPI — без задержек на поиск KDC
+            if !use_kerberos(&p) {
+                cmd.env("WINPR_NATIVE_SSPI", "0");
+            }
+            cmd.arg("/args-from:stdin").stdin(Stdio::piped());
+            if log_enabled {
+                let log = std::fs::File::create(&log_path).map_err(|e| e.to_string())?;
+                let log2 = log.try_clone().map_err(|e| e.to_string())?;
+                cmd.stdout(Stdio::from(log)).stderr(Stdio::from(log2));
+            } else {
+                cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+            }
+            {
+                use std::os::windows::process::CommandExt;
+                cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+            }
+            let mut child = cmd
+                .spawn()
+                .map_err(|e| format!("Не удалось запустить FreeRDP ({}): {}", exe.display(), e))?;
+            if let Some(mut stdin) = child.stdin.take() {
+                if let Err(e) = stdin.write_all(args.join("\n").as_bytes()) {
+                    let _ = child.kill();
+                    return Err(format!("Не удалось передать параметры FreeRDP: {}", e));
+                }
+            }
+            let pid = child.id();
+            let job = {
+                use std::os::windows::io::AsRawHandle;
+                win::job_new(child.as_raw_handle() as isize)
+            };
+            // Без объекта задания не работает ни изоляция буфера обмена, ни гарантированное
+            // завершение процесса при закрытии вкладки — отказ, а не сеанс с ложными гарантиями
+            if job == 0 {
+                let _ = child.kill();
+                return Err("Не удалось создать объект задания Windows — изоляция сеанса невозможна".into());
+            }
+            // Вывод FreeRDP без журнала: последние строки — в памяти
+            let mem_log: Arc<Mutex<std::collections::VecDeque<String>>> = Default::default();
+            for pipe in [
+                child.stdout.take().map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
+                child.stderr.take().map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                let buf = mem_log.clone();
+                std::thread::spawn(move || {
+                    use std::io::BufRead;
+                    for line in std::io::BufReader::new(pipe).lines().map_while(Result::ok) {
+                        let mut b = buf.lock().unwrap();
+                        b.push_back(line);
+                        if b.len() > 200 {
+                            b.pop_front();
+                        }
                     }
+                });
+            }
+            let clip = !p.opt("clipboard").eq_ignore_ascii_case("off");
+            let locked = *app.state::<Rdp>().locked.lock().unwrap();
+            let child = Arc::new(Mutex::new(child));
+            app.state::<Rdp>().sessions.lock().unwrap().insert(
+                id,
+                RdpSession { hwnd, child: child.clone(), pid, job, clip, clip_on: true, rect: (x, y, w, h, !locked), detached: false },
+            );
+            // Новая вкладка активна; если хранилище уже заблокировано — сразу скрыть
+            sync_clipboard(app);
+            if locked {
+                let _ = on_main(app, move || win::show(hwnd, false)).await;
+            }
+            emit_status(app, id, "connected", "");
+
+            let app2 = app.clone();
+            let p_auth = p.clone();
+            std::thread::spawn(move || {
+                let mut tick = 0u32;
+                let code = loop {
+                    if let Ok(Some(st)) = child.lock().unwrap().try_wait() {
+                        break st.code().unwrap_or(-1);
+                    }
+                    // Полный обход окон системы — не чаще раза в 2 с в установившемся режиме;
+                    // пока окно сеанса не встроено, fixup сам делает adopt каждый вызов
+                    let full = tick % 5 == 0;
+                    let _ = app2.run_on_main_thread(move || win::fixup(hwnd, pid, full));
+                    tick = tick.wrapping_add(1);
+                    std::thread::sleep(Duration::from_millis(400));
+                };
+                let removed = app2.state::<Rdp>().sessions.lock().unwrap().remove(&id);
+                let killed = removed.is_none();
+                if let Some(s) = &removed {
+                    win::job_close(s.job);
+                }
+                // Потоки чтения успевают дочитать вывод завершившегося процесса
+                std::thread::sleep(Duration::from_millis(150));
+                let text = if log_enabled {
+                    let t = std::fs::read_to_string(&log_path).unwrap_or_default();
+                    // Журнал последнего сеанса оставляем для диагностики (включён в настройках)
+                    let _ = std::fs::rename(&log_path, &last_log);
+                    t
+                } else {
+                    mem_log.lock().unwrap().iter().cloned().collect::<Vec<_>>().join("\n")
+                };
+                let mut errors = log_errors(&text);
+                // Kerberos не договорился (сервер вне домена, нет KDC) — интерфейс повторит через NTLM,
+                // как делает mstsc. Только если Kerberos не выбран в записи явно.
+                if use_kerberos(&p_auth) && !p_auth.opt("auth").eq_ignore_ascii_case("kerberos") && !errors.is_empty()
+                    && (errors.contains("SECURITY_NEGO_CONNECT_FAILED") || errors.contains("NEGO_FAILURE")
+                        || errors.to_ascii_lowercase().contains("kerberos"))
+                {
+                    errors = format!("RDP_RETRY_NTLM\n{}", errors);
+                }
+                let _ = app2.run_on_main_thread(move || win::destroy(hwnd));
+                if killed || code == 0 || errors.is_empty() {
+                    emit_status(&app2, id, "closed", "");
+                } else {
+                    emit_status(&app2, id, "error", errors);
                 }
             });
+            Ok::<(), String>(())
         }
-        let clip = !p.opt("clipboard").eq_ignore_ascii_case("off");
-        let locked = *app.state::<Rdp>().locked.lock().unwrap();
-        let child = Arc::new(Mutex::new(child));
-        app.state::<Rdp>().sessions.lock().unwrap().insert(
-            id,
-            RdpSession { hwnd, child: child.clone(), pid, job, clip, clip_on: true, rect: (x, y, w, h, !locked), detached: false },
-        );
-        // Новая вкладка активна; если хранилище уже заблокировано — сразу скрыть
-        sync_clipboard(app);
-        if locked {
-            let _ = on_main(app, move || win::show(hwnd, false)).await;
+        .await;
+        if let Err(e) = res {
+            let _ = on_main(app, move || win::destroy(hwnd)).await;
+            return Err(e);
         }
-        emit_status(app, id, "connected", "");
-
-        let app2 = app.clone();
-        let p_auth = p.clone();
-        std::thread::spawn(move || {
-            let code = loop {
-                if let Ok(Some(st)) = child.lock().unwrap().try_wait() {
-                    break st.code().unwrap_or(-1);
-                }
-                let _ = app2.run_on_main_thread(move || win::fixup(hwnd, pid));
-                std::thread::sleep(Duration::from_millis(400));
-            };
-            let removed = app2.state::<Rdp>().sessions.lock().unwrap().remove(&id);
-            let killed = removed.is_none();
-            if let Some(s) = &removed {
-                win::job_close(s.job);
-            }
-            // Потоки чтения успевают дочитать вывод завершившегося процесса
-            std::thread::sleep(Duration::from_millis(150));
-            let text = if log_enabled {
-                let t = std::fs::read_to_string(&log_path).unwrap_or_default();
-                // Журнал последнего сеанса оставляем для диагностики (включён в настройках)
-                let _ = std::fs::rename(&log_path, &last_log);
-                t
-            } else {
-                mem_log.lock().unwrap().iter().cloned().collect::<Vec<_>>().join("\n")
-            };
-            let mut errors = log_errors(&text);
-            // Kerberos не договорился (сервер вне домена, нет KDC) — интерфейс повторит через NTLM,
-            // как делает mstsc. Только если Kerberos не выбран в записи явно.
-            if use_kerberos(&p_auth) && !p_auth.opt("auth").eq_ignore_ascii_case("kerberos") && !errors.is_empty()
-                && (errors.contains("SECURITY_NEGO_CONNECT_FAILED") || errors.contains("NEGO_FAILURE")
-                    || errors.to_ascii_lowercase().contains("kerberos"))
-            {
-                errors = format!("RDP_RETRY_NTLM\n{}", errors);
-            }
-            let _ = app2.run_on_main_thread(move || win::destroy(hwnd));
-            if killed || code == 0 || errors.is_empty() {
-                emit_status(&app2, id, "closed", "");
-            } else {
-                emit_status(&app2, id, "error", errors);
-            }
-        });
         Ok(())
     }
 }
@@ -902,12 +987,19 @@ fn sync_clipboard(app: &AppHandle) {
         if allow != s.clip_on {
             #[cfg(windows)]
             {
-                win::job_clip(s.job, allow);
-                if allow {
-                    win::nudge_clipboard(s.pid);
+                // Состояние меняем только при успехе: при отказе job_clip следующий sync
+                // повторит попытку, а clip_on не соврёт об изоляции буфера
+                if win::job_clip(s.job, allow) {
+                    if allow {
+                        win::nudge_clipboard(s.pid);
+                    }
+                    s.clip_on = allow;
                 }
             }
-            s.clip_on = allow;
+            #[cfg(not(windows))]
+            {
+                s.clip_on = allow;
+            }
         }
     }
 }
@@ -1025,6 +1117,9 @@ pub fn close(app: &AppHandle, id: u32) -> bool {
     match s {
         Some(s) => {
             let _ = s.child.lock().unwrap().kill();
+            // Закрыть и объект задания: иначе handle утекает до выхода программы,
+            // а KILL_ON_JOB_CLOSE не срабатывает для возможных дочерних процессов
+            win::job_close(s.job);
             true
         }
         None => false,
@@ -1035,6 +1130,7 @@ pub fn close_all(app: &AppHandle) {
     let all: Vec<RdpSession> = app.state::<Rdp>().sessions.lock().unwrap().drain().map(|(_, s)| s).collect();
     for s in all {
         let _ = s.child.lock().unwrap().kill();
+        win::job_close(s.job);
     }
 }
 
@@ -1070,6 +1166,44 @@ mod tests {
     }
 
     #[test]
+    fn newline_injection_via_resolution_and_drives_rejected() {
+        let base = ConnParams { name: "a".into(), protocol: "rdp".into(), host: "h".into(), ..Default::default() };
+        let mut p = base.clone();
+        p.opts.insert("resolution".into(), "800x600\n/cert:ignore".into());
+        assert!(build_args(&p, 1, 800, 600, None).is_err(), "resolution с инъекцией пропущен");
+        let mut p = base.clone();
+        p.opts.insert("drives".into(), "C:\\share\n/cert:ignore\n/drives".into());
+        assert!(build_args(&p, 1, 800, 600, None).is_err(), "drives с инъекцией пропущен");
+        let mut p = base.clone();
+        p.opts.insert("resolution".into(), "1280x720".into());
+        assert!(build_args(&p, 1, 800, 600, None).is_ok(), "обычное разрешение отклонено");
+    }
+
+    #[test]
+    fn extras_allowlist_is_fail_closed() {
+        let base = ConnParams { name: "a".into(), protocol: "rdp".into(), host: "h".into(), ..Default::default() };
+        // Обходы запретительного списка: /port подменяет порт из /v, проброс устройств,
+        // ключи под управлением программы, алиасы шлюза и pass-the-hash
+        for bad in [
+            "/port:13389", "/usb:auto", "/serial:COM1", "/parallel:LPT1", "/smartcard", "/printer",
+            "/microphone:sys:winmm", "/clipboard:direction-to:all", "/size:640x480", "/parent-window:1",
+            "/gw:g:evil:443", "/pass-the-hash:00000000000000000000000000000000", "/pth:hash",
+            "/args-from:evil.txt", "/v:evil", "/g:evil", "/gu:x", "/gd:x", "/gp:x", "/u:x", "/d:x",
+            "/home-drive", "/redirect-prefer:rdp", "/sspi-module:evil", "/auth-pkg-list:!kerberos",
+            "/encryption:low", "/tls-seclevel:0", "/cert-tofu", "/kbd-list",
+        ] {
+            let mut p = base.clone();
+            p.opts.insert("freerdp".into(), bad.into());
+            assert!(build_args(&p, 1, 800, 600, None).is_err(), "{} пропущен", bad);
+        }
+        for good in ["/network:lan", "+fonts", "-fonts", "/bpp:32", "/gfx:RFX", "/compression", "-glyph-cache", "/jpeg-quality:80"] {
+            let mut p = base.clone();
+            p.opts.insert("freerdp".into(), good.into());
+            assert!(build_args(&p, 1, 800, 600, None).is_ok(), "{} отклонён", good);
+        }
+    }
+
+    #[test]
     fn logoff_is_not_an_error() {
         let logoff = "[ERROR][com.freerdp.core] - [rdp_set_error_info]: ERRINFO_LOGOFF_BY_USER [0x0001000C]";
         assert_eq!(log_errors(logoff), "");
@@ -1102,5 +1236,101 @@ mod tests {
         assert!(a.contains(&"/admin".to_string()));
         assert!(a.contains(&"/gateway:g:gw.corp:443,u:g,p:gp,type:http,no-websockets".to_string()));
         assert!(a.contains(&"/dynamic-resolution".to_string()));
+        // v78: учётные данные и сертификат закреплены тестом
+        assert!(a.contains(&"/u:ivan".to_string()));
+        assert!(a.contains(&"/d:CORP".to_string()));
+        assert!(a.contains(&"/p:secret".to_string()));
+        assert!(a.contains(&"/cert:tofu".to_string()));
+        assert!(a.contains(&"/clipboard:direction-to:all,files-to:all".to_string()));
+    }
+
+    /// v78: буфер обмена, фиксированное разрешение, диски, cert=ignore в любом регистре (v3)
+    #[test]
+    fn clipboard_resolution_drives_cert_cases() {
+        let base = ConnParams { name: "a".into(), protocol: "rdp".into(), host: "h".into(), ..Default::default() };
+        let mut p = base.clone();
+        p.opts.insert("clipboard".into(), "off".into());
+        let a = build_args(&p, 1, 800, 600, None).unwrap();
+        assert!(a.contains(&"-clipboard".to_string()));
+        assert!(!a.iter().any(|x| x.starts_with("/clipboard:")));
+
+        let mut p = base.clone();
+        p.opts.insert("resolution".into(), "1280x720".into());
+        let a = build_args(&p, 1, 800, 600, None).unwrap();
+        assert!(a.contains(&"/size:1280x720".to_string()));
+        assert!(a.contains(&"/smart-sizing".to_string()));
+        assert!(!a.contains(&"/dynamic-resolution".to_string()));
+
+        let mut p = base.clone();
+        p.opts.insert("drives".into(), "C:\\share".into());
+        let a = build_args(&p, 1, 800, 600, None).unwrap();
+        assert!(a.contains(&"/drive:share,C:\\share".to_string()));
+        for v in ["1", "true", "yes", "all", "да", "on", "TRUE"] {
+            let mut p = base.clone();
+            p.opts.insert("drives".into(), v.into());
+            assert!(build_args(&p, 1, 800, 600, None).unwrap().contains(&"/drives".to_string()), "drives={}", v);
+        }
+
+        // cert=ignore сравнивается без учёта регистра — как в cert_check
+        for v in ["ignore", "Ignore", "IGNORE"] {
+            let mut p = base.clone();
+            p.opts.insert("cert".into(), v.into());
+            let a = build_args(&p, 1, 800, 600, None).unwrap();
+            assert!(a.contains(&"/cert:ignore".to_string()), "cert={}", v);
+        }
+        // Подтверждённый отпечаток важнее tofu
+        let a = build_args(&base, 1, 800, 600, Some("deny,fingerprint:sha256:AB")).unwrap();
+        assert!(a.contains(&"/cert:deny,fingerprint:sha256:AB".to_string()));
+    }
+
+    /// v33: IPv6 в /v: всегда в скобках с портом; split_host_port разбирает все формы
+    #[test]
+    fn ipv6_host_bracketed() {
+        let mut p = ConnParams { name: "a".into(), protocol: "rdp".into(), host: "fe80::1".into(), ..Default::default() };
+        let a = build_args(&p, 1, 800, 600, None).unwrap();
+        assert!(a.contains(&"/v:[fe80::1]:3389".to_string()));
+        p.port = Some(3390);
+        let a = build_args(&p, 1, 800, 600, None).unwrap();
+        assert!(a.contains(&"/v:[fe80::1]:3390".to_string()));
+        assert_eq!(split_host_port("[fe80::1]:444", 443), ("fe80::1".to_string(), 444));
+        assert_eq!(split_host_port("[fe80::1]", 443), ("fe80::1".to_string(), 443));
+        assert_eq!(split_host_port("fe80::1", 443), ("fe80::1".to_string(), 443));
+        assert_eq!(split_host_port("gw.corp:443", 443), ("gw.corp".to_string(), 443));
+        assert_eq!(split_host_port("gw.corp", 443), ("gw.corp".to_string(), 443));
+        assert_eq!(split_host_port("gw.corp:99999", 443), ("gw.corp:99999".to_string(), 443));
+    }
+
+    /// v78: запятая в адресе шлюза и переводы строк в домене/шлюзе/gwtransport отвергаются
+    #[test]
+    fn gateway_comma_and_newlines_rejected() {
+        let base = ConnParams { name: "a".into(), protocol: "rdp".into(), host: "h".into(), ..Default::default() };
+        let mut p = base.clone();
+        p.gateway = Some(("gw:443,evil".into(), "u".into(), "".into(), "".into()));
+        assert!(build_args(&p, 1, 800, 600, None).is_err());
+        let mut p = base.clone();
+        p.domain = "CORP\n/cert:ignore".into();
+        assert!(build_args(&p, 1, 800, 600, None).is_err());
+        let mut p = base.clone();
+        p.gateway = Some(("gw:443".into(), "u\n/x".into(), "".into(), "".into()));
+        assert!(build_args(&p, 1, 800, 600, None).is_err());
+        let mut p = base.clone();
+        p.gateway = Some(("gw:443".into(), "u".into(), "".into(), "".into()));
+        p.opts.insert("gwtransport".into(), "rpc\n/cert:ignore".into());
+        // gwtransport сопоставляется, а не подставляется как есть: перевод строки
+        // не попадает в аргументы, значение уходит в безопасную ветку по умолчанию
+        let a = build_args(&p, 1, 800, 600, None).unwrap();
+        assert!(a.iter().all(|x| !x.contains('\n')));
+        assert!(a.iter().any(|x| x.contains("type:http,no-websockets")));
+    }
+
+    /// v78: каждый разрешённый ключ действительно проходит (цикл по всему ALLOW_EXTRA)
+    #[test]
+    fn every_allowed_extra_key_passes() {
+        let base = ConnParams { name: "a".into(), protocol: "rdp".into(), host: "h".into(), ..Default::default() };
+        for k in ALLOW_EXTRA {
+            let mut p = base.clone();
+            p.opts.insert("freerdp".into(), format!("/{}:x", k));
+            assert!(build_args(&p, 1, 800, 600, None).is_ok(), "/{}:x отклонён", k);
+        }
     }
 }

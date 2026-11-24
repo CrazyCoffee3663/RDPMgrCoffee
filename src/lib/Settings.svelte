@@ -1,7 +1,7 @@
 <script lang="ts">
   import { app, applyTheme, findTheme } from "./state.svelte";
   import { PRESETS, newThemeId, type CustomTheme } from "./themes";
-  import { createRootFolder, migrateToRoot, needsMigration, tidyGateways, exportAll, checkWinbox, checkFreerdp, freerdpUpdateInfo, installWinbox, newerVersion } from "./actions";
+  import { createRootFolder, migrateToRoot, needsMigration, tidyGateways, exportAll, checkWinbox, checkFreerdp, updateFreerdp, installWinbox, newerVersion } from "./actions";
   import { DEFAULT_TOOLS, type Tool } from "./state.svelte";
   import { api, errText, PROTOCOLS, PROTOCOL_LABEL } from "./api";
   import Icon from "./Icon.svelte";
@@ -56,7 +56,11 @@
     frBusy = true;
     fr = (await checkFreerdp(true)) ?? null;
     frBusy = false;
-    if (app.freerdpUpdate) freerdpUpdateInfo();
+  }
+  async function frUpdate() {
+    frBusy = true;
+    if (await updateFreerdp(fr?.latest ?? undefined)) fr = (await checkFreerdp(true)) ?? null;
+    frBusy = false;
   }
 
   // ---- Внешние инструменты и WinBox ----
@@ -304,10 +308,20 @@
         <div class="row">
           <span
             >FreeRDP: <b>{fr?.installed ?? "?"}</b>{#if fr}, последняя: <b>{fr.latest ?? "не удалось узнать"}</b>{/if}
-            <small>(обновления FreeRDP закрывают уязвимости RDP-клиента — важно для безопасности; FreeRDP обновляется вместе с программой)</small></span
+            <small>(обновления FreeRDP закрывают уязвимости RDP-клиента — важно для безопасности)</small></span
           >
-          <span class="btns"><button class="btn" onclick={frCheck} disabled={frBusy}>Проверить</button></span>
+          <span class="btns">
+            <button class="btn" onclick={frCheck} disabled={frBusy}>Проверить</button>
+            <button class="btn" onclick={frUpdate} disabled={frBusy || !!app.freerdpUpdating}>Обновить</button>
+          </span>
         </div>
+        {#if app.freerdpUpdating}
+          <div class="row">
+            <span>
+              {#if app.freerdpUpdating.phase === "download"}Загрузка обновления… {app.freerdpUpdating.percent}%{:else if app.freerdpUpdating.phase === "install"}Проверка и установка…{:else}Обновление FreeRDP…{/if}
+            </span>
+          </div>
+        {/if}
         <label class="row">
           <span>Проверять выход новых версий FreeRDP <small>(раз в сутки, только уведомление)</small></span>
           <span><input type="checkbox" bind:checked={s.freerdpAutoCheck} onchange={changed} /></span>
